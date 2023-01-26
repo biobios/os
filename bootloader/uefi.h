@@ -18,6 +18,13 @@
 {0xbc,0x22,0x00,0x80,0xc7,0x3c,0x88,0x81}}
 
 typedef enum {
+    AllocateAnyPages,
+    AllocateMaxAddress,
+    AllocateAddress,
+    MaxAllocateType
+} EFI_ALLOCATE_TYPE;
+
+typedef enum {
     EfiReservedMemoryType,
     EfiLoaderCode,
     EfiLoaderData,
@@ -299,6 +306,7 @@ struct _EFI_SIMPLE_TEXT_OUTPUT_PROTOCOL
     EFI_TEXT_CLEAR_SCREEN ClearScreen;
 };
 
+typedef EFI_STATUS (*EFI_ALLOCATE_PAGES)(EFI_ALLOCATE_TYPE Type, EFI_MEMORY_TYPE MemoryType, UINTN Pages, EFI_PHYSICAL_ADDRESS* Memory);
 typedef EFI_STATUS (*EFI_GET_MEMORY_MAP)(UINTN* MemoryMapSize, EFI_MEMORY_DESCRIPTOR* MemoryMap, UINTN* MapKey, UINTN* DescriptorSize, UINT32* DescriptorVersion);
 typedef EFI_STATUS (*EFI_WAIT_FOR_EVENT)(UINTN NumberOfvents, EFI_EVENT* Event, UINTN* Index);
 typedef EFI_STATUS (*EFI_EXIT_BOOT_SERVICES)(EFI_HANDLE ImageHandle, UINTN MapKey);
@@ -311,7 +319,8 @@ struct _EFI_BOOT_SERVICES
 {
     char _buf1[24];
     unsigned long long _buf2[2];
-    unsigned long long _buf3[2];
+    EFI_ALLOCATE_PAGES AllocatePages;
+    unsigned long long _buf3[1];
     EFI_GET_MEMORY_MAP GetMemoryMap;
     unsigned long long _buf3_2[2];
     unsigned long long _buf4[2];
