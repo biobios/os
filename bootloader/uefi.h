@@ -3,6 +3,7 @@
 
 #define TRUE 1
 #define FALSE 0
+#define NULL 0
 
 #define EFI_SUCCESS 0
 
