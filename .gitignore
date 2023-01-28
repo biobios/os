@@ -1,3 +1,5 @@
 hdd.img
 .vscode/settings.json
 bootloader/BOOTX64.EFI
+kernel/build/
+kernel/obj/
