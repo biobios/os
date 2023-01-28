@@ -17,7 +17,7 @@ $(TARGET): $(OBJECTS)
 $(OBJROOT)%.o: $(SRCROOT)%.cpp
 	$(COMPILER) $(CFLAGS) -I$(INCDIR) -o $@ -c $<
 
-.PHONY: clean load run
+.PHONY: clean load run setup
 
 run:
 	$(MAKE) -C ../
@@ -34,3 +34,8 @@ load:
 clean:
 	rm $(OBJROOT)*
 	rm $(BUILDDIR)*
+
+setup:
+	mkdir src
+	mkdir obj
+	mkdir build
