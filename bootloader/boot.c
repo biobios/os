@@ -31,7 +31,7 @@ int equalsEFI_GUID(EFI_GUID* guid1, EFI_GUID* guid2){
 
 unsigned char mem_desc[MEM_DESC_SIZE];
 
-EFI_STATUS efi_main(EFI_HANDLE imageHandle, EFI_SYSTEM_TABLE* systemTable)
+EFI_STATUS uefi_main(EFI_HANDLE imageHandle, EFI_SYSTEM_TABLE* systemTable)
 {
 
     EFI_STATUS status;
