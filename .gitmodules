@@ -1,0 +1,3 @@
+[submodule "kernel/dependencies/ozlib"]
+	path = kernel/dependencies/ozlib
+	url = https://github.com/biobios/ozlib.git
