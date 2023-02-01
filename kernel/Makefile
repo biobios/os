@@ -1,6 +1,6 @@
 COMPILER = clang++
 LINKER = ld.lld
-CFLAGS = -O2 -Wall -g --target=x86_64-elf -ffreestanding -mno-red-zone -fno-exceptions -fno-rtti -std=c++17 -c
+CFLAGS = -v -O2 -Wall -g --target=x86_64-unknown-none-elf -ffreestanding -mno-red-zone -fno-exceptions -fno-rtti -std=c++20 -stdlib=libc++ -c
 LFLAGS = --entry $(ENTRYPOINT) -z norelro --image-base 0x100000 --static
 SRCROOT = ./src/
 OBJROOT = ./obj/
@@ -15,7 +15,7 @@ $(TARGET): $(OBJECTS)
 	$(LINKER) $(LFLAGS) -o $(BUILDDIR)$@ $^
 
 $(OBJROOT)%.o: $(SRCROOT)%.cpp
-	$(COMPILER) $(CFLAGS) -I$(INCDIR) -o $@ -c $<
+	$(COMPILER) $(CFLAGS) -o $@ -c $<
 
 .PHONY: clean load run setup
 
