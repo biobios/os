@@ -1,7 +1,8 @@
 #include "uefi.h"
+#include "elf.h"
 
 #define FILE_INFO_BUF_SIZE 180
-#define MEM_DESC_SIZE 0x4000
+#define MEM_DESC_SIZE 0x8000
 
 typedef struct
 {
@@ -88,7 +89,7 @@ EFI_STATUS uefi_main(EFI_HANDLE imageHandle, EFI_SYSTEM_TABLE* systemTable)
     status = os_dir->Open(os_dir, &kernel_file, L"kernel.bin", EFI_FILE_MODE_READ, 0);
     if(status != EFI_SUCCESS){
         systemTable->ConOut->OutputString(systemTable->ConOut, L"kernel.bin is not found!\n\r");
-        while(1)__asm__ volatile("hlt");
+        while(TRUE)__asm__ volatile("hlt");
     }
 
     UINTN file_info_size = FILE_INFO_BUF_SIZE;
@@ -100,21 +101,46 @@ EFI_STATUS uefi_main(EFI_HANDLE imageHandle, EFI_SYSTEM_TABLE* systemTable)
     fi_ptr = (EFI_FILE_INFO*)fi_buf;
     UINT64 KernelSize = fi_ptr->FileSize;
 
-    void* load_address = (void*)0x0000000000100000;
-    status = systemTable->BootServices->AllocatePages(
-        AllocateAddress,
-        EfiLoaderData,
-        (KernelSize + 0xfff) / 0x1000,
-        &load_address);
+    //バッファにカーネルをロードする
+    void* loaderBuffer;
+    status = systemTable->BootServices->AllocatePool(EfiLoaderData, KernelSize, &loaderBuffer);
     if(status != EFI_SUCCESS){
-        systemTable->ConOut->OutputString(systemTable->ConOut, L"Failed Memory Allocate For Kernel!\n\r");
-        while(1)__asm__ volatile("hlt");
+        systemTable->ConOut->OutputString(systemTable->ConOut, L"Buffer can't be allocated!\n\r");
+        while(TRUE)__asm__ volatile("hlt");
     }
-    status = kernel_file->Read(kernel_file, &KernelSize, load_address);
+    status = kernel_file->Read(kernel_file, &KernelSize, loaderBuffer);
+    if(status != EFI_SUCCESS){
+        systemTable->ConOut->OutputString(systemTable->ConOut, L"Failed To Load Kernel!\n\r");
+        while(TRUE)__asm__ volatile("hlt");
+    }
 
     kernel_file->Close(kernel_file);
 
-    systemTable->ConOut->OutputString(systemTable->ConOut, L"Exit Boot\n\r");
+    //ProgramHeaderをもとにメモリを確保しバッファから移す
+    Elf64_Ehdr* efiHeader = (Elf64_Ehdr*)loaderBuffer;
+    Elf64_Phdr* progHeader = (Elf64_Phdr*)((char*)efiHeader + efiHeader->e_phoff);
+    for(Elf64_Half i = 0; i < efiHeader->e_phnum; i++){
+        if(progHeader[i].p_type != PT_LOAD)continue;
+
+        UINT64 allocateSize = (progHeader[i].p_memsz + 0xfff) / 0x1000;//Page数に換算
+        void* allocateAddress = (void*)(progHeader[i].p_vaddr & ~0xfff);//Page境界にAlignment
+
+        status = systemTable->BootServices->AllocatePages(
+            AllocateAddress,
+            EfiLoaderData,
+            allocateSize,
+            (void*)&allocateAddress);
+
+        if(status != EFI_SUCCESS){
+            systemTable->ConOut->OutputString(systemTable->ConOut, L"Failed To Allocate Memory For Kernel!\n\r");
+            while(TRUE)__asm__ volatile("hlt");
+        }
+
+        systemTable->BootServices->CopyMem((void*)progHeader[i].p_vaddr, loaderBuffer + progHeader[i].p_offset, progHeader[i].p_filesz);
+        //確保するメモリ領域のうちファイルにデータのない部分は０クリアする
+        UINTN clearSize = progHeader[i].p_memsz - progHeader[i].p_filesz;
+        systemTable->BootServices->SetMem((void*)(progHeader[i].p_vaddr + progHeader[i].p_filesz), clearSize, 0);
+    }
 
     unsigned long long mem_desc_num;
     unsigned long long mem_desc_unit_size;
@@ -122,18 +148,26 @@ EFI_STATUS uefi_main(EFI_HANDLE imageHandle, EFI_SYSTEM_TABLE* systemTable)
     unsigned long long mmap_size;
     unsigned int desc_ver;
 
-    do{
-        mmap_size = MEM_DESC_SIZE;
-        status = systemTable->BootServices->GetMemoryMap(&mmap_size, (EFI_MEMORY_DESCRIPTOR*)mem_desc, &map_key, &mem_desc_unit_size, &desc_ver);
-    }while(status != EFI_SUCCESS);
+
+    mmap_size = MEM_DESC_SIZE;
+    status = systemTable->BootServices->GetMemoryMap(&mmap_size, (EFI_MEMORY_DESCRIPTOR*)mem_desc, &map_key, &mem_desc_unit_size, &desc_ver);
+
+    if(status != EFI_SUCCESS){
+        systemTable->ConOut->OutputString(systemTable->ConOut, L"Failed Get Memory Map\n\r");
+        while(TRUE)__asm__ volatile("hlt");
+    }
     
     status = systemTable->BootServices->ExitBootServices(imageHandle, map_key);
-    while(status != EFI_SUCCESS)__asm__ volatile("hlt");
+    if(status != EFI_SUCCESS){
+        systemTable->ConOut->OutputString(systemTable->ConOut, L"Failed Exit Boot\n\r");
+        while(TRUE)__asm__ volatile("hlt");
+    }
 
     unsigned long long arg1 = (unsigned long long)&info;
     unsigned long long _sb = 0x0000000000210000;
-    unsigned long long _ep = (unsigned long long*)((char*)load_address + 24);
-    __asm__("   mov %0, %%rdi\n"
+    unsigned long long _ep = efiHeader->e_entry;
+    // unsigned long long _ep = *(unsigned long long*)((char*)load_address + 24);
+    __asm__ volatile("   mov %0, %%rdi\n"
             "   mov %1, %%rsp\n"
             "   jmp *%2\n"
             ::"m"(arg1), "m"(_sb), "m"(_ep));
