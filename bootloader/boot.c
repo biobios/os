@@ -36,7 +36,7 @@ EFI_STATUS uefi_main(EFI_HANDLE imageHandle, EFI_SYSTEM_TABLE* systemTable)
 {
 
     EFI_STATUS status;
-
+    //ウォッチドッグタイマーをオフにする
     systemTable->BootServices->SetWatchdogTimer(0, 0, 0, NULL);
 
     systemTable->ConOut->ClearScreen(systemTable->ConOut);
@@ -45,8 +45,8 @@ EFI_STATUS uefi_main(EFI_HANDLE imageHandle, EFI_SYSTEM_TABLE* systemTable)
     EFI_GUID gop_guid = EFI_GRAPHICS_OUTPUT_PROTOCOL_GUID;
     EFI_GRAPHICS_OUTPUT_PROTOCOL* gop;
 
+    //カーネルに伝える情報を収集する
     PlatformInfo info;
-    
     status = systemTable->BootServices->LocateProtocol(&gop_guid, NULL, (void**)&gop);
 
     info.frame_buffer_base = gop->Mode->FrameBufferBase;
@@ -71,6 +71,7 @@ EFI_STATUS uefi_main(EFI_HANDLE imageHandle, EFI_SYSTEM_TABLE* systemTable)
         info.RootSytemDescriptionPointer = (uint64_t)rsdp;
     }
 
+    //カーネルファイルを探す
     EFI_GUID sfsp_guid = EFI_SIMPLE_FILE_SYSTEM_PROTOCOL_GUID;
     EFI_SIMPLE_FILE_SYSTEM_PROTOCOL* sfsp;
     
@@ -142,6 +143,7 @@ EFI_STATUS uefi_main(EFI_HANDLE imageHandle, EFI_SYSTEM_TABLE* systemTable)
         systemTable->BootServices->SetMem((void*)(progHeader[i].p_vaddr + progHeader[i].p_filesz), clearSize, 0);
     }
 
+    //ブートサービスを終了する
     unsigned long long mem_desc_num;
     unsigned long long mem_desc_unit_size;
     unsigned long long map_key;
@@ -163,10 +165,12 @@ EFI_STATUS uefi_main(EFI_HANDLE imageHandle, EFI_SYSTEM_TABLE* systemTable)
         while(TRUE)__asm__ volatile("hlt");
     }
 
+    //カーネルのエントリポイントへジャンプする
+    //UEFIの呼び出し規約ms_abi
+    //Kernelの呼び出し規約SystemV ABI
     unsigned long long arg1 = (unsigned long long)&info;
     unsigned long long _sb = 0x0000000000210000;
     unsigned long long _ep = efiHeader->e_entry;
-    // unsigned long long _ep = *(unsigned long long*)((char*)load_address + 24);
     __asm__ volatile("   mov %0, %%rdi\n"
             "   mov %1, %%rsp\n"
             "   jmp *%2\n"
