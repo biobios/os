@@ -33,15 +33,6 @@ namespace {
 
     FreeChunk* freeListHead;
 
-    void setUpMemoryManager(){
-        FreeChunk* freeChunk = reinterpret_cast<FreeChunk*>(&heap);
-        freeChunk->size = (sizeof(heap) - sizeof(std::uint64_t)) | 0b01;
-        freeChunk->back = freeChunk;
-        freeChunk->forward = freeChunk;
-
-        freeListHead = freeChunk;
-    }
-
     void* ozmalloc(std::uint64_t size){
         //サイズを8バイト単位に切り上げる
         size = (size + 0b111) & ~0b111;
@@ -126,6 +117,17 @@ namespace {
             nextChunk->size = nextChunk->size & ~0b1;
             nextChunk->prev_size_or_prev_user_data = releasingChunk->size;
         }
+    }
+        
+    void setUpMemoryManager(){
+        FreeChunk* freeChunk = reinterpret_cast<FreeChunk*>(&heap);
+        freeChunk->size = (sizeof(heap) - sizeof(std::uint64_t)) | 0b01;
+        freeChunk->back = freeChunk;
+        freeChunk->forward = freeChunk;
+
+        freeListHead = freeChunk;
+
+        ozmalloc(0);//番兵を設置
     }
 }
 
