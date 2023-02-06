@@ -118,17 +118,17 @@ namespace {
             nextChunk->prev_size_or_prev_user_data = releasingChunk->size;
         }
     }
-        
-    void setUpMemoryManager(){
-        FreeChunk* freeChunk = reinterpret_cast<FreeChunk*>(&heap);
-        freeChunk->size = (sizeof(heap) - sizeof(std::uint64_t)) | 0b01;
-        freeChunk->back = freeChunk;
-        freeChunk->forward = freeChunk;
+}
 
-        freeListHead = freeChunk;
+void oz::setUpMemoryManager(){
+    FreeChunk* freeChunk = reinterpret_cast<FreeChunk*>(&heap);
+    freeChunk->size = (sizeof(heap) - sizeof(std::uint64_t)) | 0b01;
+    freeChunk->back = freeChunk;
+    freeChunk->forward = freeChunk;
 
-        ozmalloc(0);//番兵を設置
-    }
+    freeListHead = freeChunk;
+
+    ozmalloc(0);//番兵を設置
 }
 
 [[nodiscard]] void* operator new(std::size_t size)

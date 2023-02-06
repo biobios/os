@@ -10,6 +10,10 @@ namespace ozstd
     extern const nothrow_t nothrow;
 }
 
+namespace oz{
+    void setUpMemoryManager();
+}
+
 [[nodiscard]] void* operator new(std::size_t size);
 [[nodiscard]] void* operator new(std::size_t size, std::align_val_t alignment);
 [[nodiscard]] void* operator new(std::size_t size, const ozstd::nothrow_t&)noexcept;
