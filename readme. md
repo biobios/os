@@ -1,0 +1,12 @@
+## 環境構築
+
+### WSL2のインストール
+
+管理者モードのPowershell上で次のコマンドを実行する
+    wsl --install
+
+### qemuのインストール
+
+ubuntu上で次のコマンドを実行する
+    sudo apt install qemu-system-x86
+    sudo apt install ovmf
