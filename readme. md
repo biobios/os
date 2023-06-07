@@ -10,3 +10,9 @@
 ubuntu上で次のコマンドを実行する
     sudo apt install qemu-system-x86
     sudo apt install ovmf
+
+### clangのインストール
+
+ubuntu上で次のコマンドを実行する
+    sudo apt install clang
+
