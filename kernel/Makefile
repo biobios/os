@@ -1,6 +1,6 @@
 COMPILER = clang++
 LINKER = ld.lld
-CFLAGS = -v -O2 -Wall -g --target=x86_64-unknown-none-elf -g -ffreestanding -mno-red-zone -fno-exceptions -fno-rtti -std=c++20 -I $(INCLUDEDIR) -c
+CFLAGS = -O2 -Wall -g --target=x86_64-unknown-none-elf -g -ffreestanding -mno-red-zone -fno-exceptions -fno-rtti -std=c++20 -I $(INCLUDEDIR) -c
 LFLAGS = --entry $(ENTRYPOINT) -z norelro --image-base 0x100000 -g --static
 INCLUDEDIR = ./dependencies/ozlib/include/
 LIBDIR = ./dependencies/ozlib/lib/
@@ -38,6 +38,6 @@ clean:
 	rm $(BUILDDIR)*
 
 setup:
-	mkdir src
-	mkdir obj
-	mkdir build
+	mkdir -p src
+	mkdir -p obj
+	mkdir -p build
