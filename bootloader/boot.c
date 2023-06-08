@@ -6,11 +6,22 @@
 
 typedef struct
 {
+    UINTN buffer_size;
+    void* buffer;
+    UINTN map_size;
+    UINTN map_key;
+    UINTN descriptor_size;
+    UINT32 descriptor_version;
+} BootMemoryMap;
+
+typedef struct
+{
     uint64_t frame_buffer_base;
     uint64_t frame_buffer_size;
     uint32_t frame_buffer_horizontal;
     uint32_t frame_buffer_vertical;
     uint64_t RootSytemDescriptionPointer;
+    BootMemoryMap memory_map;
 } PlatformInfo;
 
 int equalsEFI_GUID(EFI_GUID* guid1, EFI_GUID* guid2){
@@ -144,22 +155,23 @@ EFI_STATUS uefi_main(EFI_HANDLE imageHandle, EFI_SYSTEM_TABLE* systemTable)
     }
 
     //ブートサービスを終了する
-    unsigned long long mem_desc_num;
-    unsigned long long mem_desc_unit_size;
-    unsigned long long map_key;
-    unsigned long long mmap_size;
-    unsigned int desc_ver;
 
-
-    mmap_size = MEM_DESC_SIZE;
-    status = systemTable->BootServices->GetMemoryMap(&mmap_size, (EFI_MEMORY_DESCRIPTOR*)mem_desc, &map_key, &mem_desc_unit_size, &desc_ver);
+    info.memory_map.buffer = (void*)&mem_desc;
+    info.memory_map.buffer_size = MEM_DESC_SIZE;
+    info.memory_map.map_size = MEM_DESC_SIZE;
+    status = systemTable->BootServices->GetMemoryMap(
+        &info.memory_map.map_size,
+        (EFI_MEMORY_DESCRIPTOR*)info.memory_map.buffer,
+        &info.memory_map.map_key,
+        &info.memory_map.descriptor_size,
+        &info.memory_map.descriptor_version);
 
     if(status != EFI_SUCCESS){
         systemTable->ConOut->OutputString(systemTable->ConOut, L"Failed Get Memory Map\n\r");
         while(TRUE)__asm__ volatile("hlt");
     }
     
-    status = systemTable->BootServices->ExitBootServices(imageHandle, map_key);
+    status = systemTable->BootServices->ExitBootServices(imageHandle, info.memory_map.map_key);
     if(status != EFI_SUCCESS){
         systemTable->ConOut->OutputString(systemTable->ConOut, L"Failed Exit Boot\n\r");
         while(TRUE)__asm__ volatile("hlt");
