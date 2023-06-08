@@ -1,13 +1,24 @@
 {
     "C_Cpp.default.cppStandard": "gnu++23",
-    "C_Cpp.default.compilerPath": "C:/cygwin64/bin/g++.exe",
+    "C_Cpp.default.compilerPath": "C:/Program Files/LLVM/bin/clang++.exe",
     "C_Cpp.default.cStandard": "gnu17",
 
     "files.associations": {
         "cstdint": "cpp",
         "cstddef": "cpp",
         "new": "cpp",
+        "functional": "cpp",
+        "type_traits": "cpp",
+        "concepts": "cpp",
+        "utility": "cpp",
+        "memory": "cpp"
     },
     "C_Cpp.clang_format_fallbackStyle": "Google",
     "C_Cpp.clang_format_style": "file",
+    "C_Cpp.default.systemIncludePath": [
+        "kernel/dependencies/ozlib/include"
+    ],
+    "C_Cpp.default.compilerArgs": [
+        "-nostdlibinc"
+    ],
 }
