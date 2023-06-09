@@ -6,7 +6,7 @@ namespace {
     oz::Kernel* kernelPtr;
 }
 
-oz::Kernel::Kernel(PlatformInfo* platformInfo)
+oz::Kernel::Kernel(oz_boot::PlatformInfo* platformInfo)
     : g(static_cast<Pixel*>(platformInfo->frame_buffer_base),
         platformInfo->frame_buffer_size, platformInfo->frame_buffer_horizontal,
         platformInfo->frame_buffer_vertical)
