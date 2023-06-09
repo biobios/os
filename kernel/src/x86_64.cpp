@@ -33,3 +33,11 @@ void oz::x86_64::initGDTR() {
         : [dummy] "=r"(dummy)
         : [selector] "m"(selector));
 }
+
+void oz::x86_64::setPageMap(void* map) {
+    volatile std::uint64_t pBuf = reinterpret_cast<std::uint64_t>(map);
+    __asm__ volatile(
+        "movq %0, %%cr3"
+        ::"r"(pBuf)
+    );
+}
