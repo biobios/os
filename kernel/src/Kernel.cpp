@@ -2,12 +2,18 @@
 #include "utils.hpp"
 #include "x86_64.hpp"
 
+namespace {
+    oz::Kernel* kernelPtr;
+}
+
 oz::Kernel::Kernel(PlatformInfo* platformInfo)
     : g(static_cast<Pixel*>(platformInfo->frame_buffer_base),
         platformInfo->frame_buffer_size, platformInfo->frame_buffer_horizontal,
         platformInfo->frame_buffer_vertical)
     , sh(&g)
+    , pm()
 {
+    kernelPtr = this;
     oz::x86_64::initGDTR();
     // char str[2*sizeof(std::uint64_t) + 1];
     // std::uint8_t* iter = reinterpret_cast<std::uint8_t*>(platformInfo->memory_map.buffer);
@@ -39,8 +45,14 @@ oz::Kernel::Kernel(PlatformInfo* platformInfo)
 void oz::Kernel::run() {
     g.clearScreen();
     sh.printString("Finish init\n\rStart Kernel\n\r");
-
+    sh.repaint();
     while (1) {
         __asm__("hlt");
     }
 }
+
+void setKernelPtr(void* k) {
+    kernelPtr = reinterpret_cast<oz::Kernel*>(k);
+}
+
+void dprint(const char* str) { kernelPtr->sh.printString(str); }

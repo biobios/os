@@ -4,6 +4,7 @@
 
 #include "Graphics.hpp"
 #include "Shell.hpp"
+#include "PageManager.hpp"
 
 struct BootMemoryMap
 {
@@ -53,11 +54,16 @@ struct PlatformInfo {
     BootMemoryMap memory_map;
 };
 
+void setKernelPtr(void* k);
+void dprint(const char* str);
+
 namespace oz {
 class Kernel {
     Graphics g;
+    public:
     Shell sh;
-
+    private:
+    PageManager pm;
    public:
     Kernel(PlatformInfo* platformInfo);
     void run();
