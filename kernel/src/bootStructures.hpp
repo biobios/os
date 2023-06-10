@@ -51,4 +51,9 @@ namespace oz_boot{
         BootMemoryMap memory_map;
     };
 
+    inline bool isAvailable(std::uint32_t type){
+        return  type == static_cast<std::uint32_t>(EFI_MEMORY_TYPE::EfiBootServicesCode) ||
+                type == static_cast<std::uint32_t>(EFI_MEMORY_TYPE::EfiBootServicesData) ||
+                type == static_cast<std::uint32_t>(EFI_MEMORY_TYPE::EfiConventionalMemory);
+    }
 }
