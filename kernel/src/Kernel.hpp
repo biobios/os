@@ -4,22 +4,20 @@
 
 #include "Graphics.hpp"
 #include "Shell.hpp"
-
-struct PlatformInfo {
-    void* frame_buffer_base;
-    std::uint64_t frame_buffer_size;
-    std::uint32_t frame_buffer_horizontal;
-    std::uint32_t frame_buffer_vertical;
-    void* RSDP;
-};
+#include "PageManager.hpp"
+#include "bootStructures.hpp"
+#include "MemoryManager.hpp"
 
 namespace oz {
 class Kernel {
+    public:
     Graphics g;
     Shell sh;
-
+    private:
+    PageManager pm;
+    MemoryManager<binary_units::operator""_Gi(128)> mm;
    public:
-    Kernel(PlatformInfo* platformInfo);
+    Kernel(oz_boot::PlatformInfo* platformInfo);
     void run();
 };
 }  // namespace oz
