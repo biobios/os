@@ -10,7 +10,7 @@ BUILDDIR = ./build/
 INCDIR = ./src/
 SOURCES = $(wildcard $(SRCROOT)*.cpp)
 OBJECTS = $(addprefix $(OBJROOT), $(notdir $(SOURCES:.cpp=.o)))
-ENTRYPOINT = main
+ENTRYPOINT = init
 TARGET = kernel.bin
 
 $(TARGET): $(OBJECTS)
