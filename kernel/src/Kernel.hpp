@@ -6,17 +6,16 @@
 #include "Shell.hpp"
 #include "PageManager.hpp"
 #include "bootStructures.hpp"
-
-void setKernelPtr(void* k);
-void dprint(const char* str);
+#include "MemoryManager.hpp"
 
 namespace oz {
 class Kernel {
-    Graphics g;
     public:
+    Graphics g;
     Shell sh;
     private:
     PageManager pm;
+    MemoryManager<binary_units::operator""_Gi(128)> mm;
    public:
     Kernel(oz_boot::PlatformInfo* platformInfo);
     void run();
