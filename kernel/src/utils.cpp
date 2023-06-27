@@ -46,3 +46,12 @@ void write(const char* str) {
         str++;
     }
 }
+
+void abort() {
+
+    dprint("abort");
+
+    while(true){
+        __asm__ volatile("hlt");
+    }
+}
