@@ -4,6 +4,7 @@
     "C_Cpp.default.cStandard": "gnu17",
 
     "files.associations": {
+        "array": "cpp",
         "cstdint": "cpp",
         "cstddef": "cpp",
         "new": "cpp",
