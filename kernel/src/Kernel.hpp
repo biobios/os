@@ -6,7 +6,8 @@
 #include "Shell.hpp"
 #include "PageManager.hpp"
 #include "bootStructures.hpp"
-#include "MemoryManager.hpp"
+#include "FrameManager.hpp"
+#include "KernelMemoryAllocator.hpp"
 
 namespace oz {
 class Kernel {
@@ -15,7 +16,8 @@ class Kernel {
     Shell sh;
     private:
     PageManager pm;
-    MemoryManager<binary_units::operator""_Gi(128)> mm;
+    x86_64::FrameManager fm;
+    TLSFMemoryAllocator tlsf_malloc;
    public:
     Kernel(oz_boot::PlatformInfo* platformInfo);
     void run();

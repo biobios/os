@@ -1,6 +1,7 @@
 #include "Kernel.hpp"
 #include "utils.hpp"
 #include "x86_64.hpp"
+#include "oznew.hpp"
 
 oz::Kernel::Kernel(oz_boot::PlatformInfo* platformInfo)
     : g(static_cast<Pixel*>(platformInfo->frame_buffer_base),
@@ -8,8 +9,10 @@ oz::Kernel::Kernel(oz_boot::PlatformInfo* platformInfo)
         platformInfo->frame_buffer_vertical)
     , sh(&g)
     , pm()
-    , mm(&platformInfo->memory_map)
+    , fm(&platformInfo->memory_map, oz::paging::x86_64::page_sizes[0])
+    , tlsf_malloc(&fm)
 {
+    setMemoryAllocator(&tlsf_malloc);
     // char str[2*sizeof(std::uint64_t) + 1];
     // std::uint8_t* iter = reinterpret_cast<std::uint8_t*>(platformInfo->memory_map.buffer);
     // std::uint64_t available_page = 0;
