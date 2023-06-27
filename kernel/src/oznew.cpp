@@ -1,3 +1,4 @@
+#include "oznew.hpp"
 // #include "oznew.hpp"
 
 // #include <cstdint>
@@ -171,11 +172,13 @@
 //     ozfree(ptr);
 // }
 
+
 // void operator delete(void* ptr, std::align_val_t alignment)noexcept
 // {
 //     ozfree(ptr);
 // }
-// void operator delete(void* ptr, std::size_t size, std::align_val_t alignment)noexcept
+// void operator delete(void* ptr, std::size_t size, std::align_val_t
+// alignment)noexcept
 // {
 //     ozfree(ptr);
 // }
@@ -183,8 +186,23 @@
 // {
 //     ozfree(ptr);
 // }
-// void operator delete(void* ptr, std::align_val_t alignment, const ozstd::nothrow_t&) noexcept
+// void operator delete(void* ptr, std::align_val_t alignment, const
+// ozstd::nothrow_t&) noexcept
 // {
 //     ozfree(ptr);
 // }
+
+namespace {
+    oz::IKernelMemoryAllocator* allocator;
+}
+
+void* operator new(std::size_t size) {
+    return allocator->malloc(size);    
+}
+void operator delete(void* ptr) noexcept {
+    allocator->free(ptr);
+}
+void setMemoryAllocator(oz::IKernelMemoryAllocator* al) {
+    allocator = al;
+}
 // void operator delete(void* ptr, void*)noexcept{}
