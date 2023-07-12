@@ -14,10 +14,5 @@ oz::PageManager::PageManager()
         }
     }
 
-    char ptrstr[sizeof(std::uint64_t) * 2 + 1];
-
-    oz::utils::to_hex(reinterpret_cast<std::uint64_t>(&pml4_table), ptrstr);
-    dprint(ptrstr);
-
     oz::x86_64::setPageMap(&pml4_table);
 }
