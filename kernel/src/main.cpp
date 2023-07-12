@@ -1,5 +1,6 @@
 #include "Kernel.hpp"
 #include "x86_64.hpp"
+#include "utils.hpp"
 #include <cstdint>
 #include <new>
 
