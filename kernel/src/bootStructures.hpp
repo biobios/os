@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include "ACPI.hpp"
 
 namespace oz_boot{
     struct BootMemoryMap
@@ -47,7 +48,7 @@ namespace oz_boot{
         std::uint64_t frame_buffer_size;
         std::uint32_t frame_buffer_horizontal;
         std::uint32_t frame_buffer_vertical;
-        void* RSDP;
+        ACPI::RootSystemDescriptionPointer* RSDP;
         BootMemoryMap memory_map;
     };
 
