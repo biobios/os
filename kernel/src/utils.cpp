@@ -51,6 +51,8 @@ void abort() {
 
     dprint("abort");
 
+    kernelPtr->sh.repaint();
+
     while(true){
         __asm__ volatile("hlt");
     }
