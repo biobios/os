@@ -4,7 +4,7 @@
 
 #include "Graphics.hpp"
 
-#define LETTERS_NUM 10000
+#define LETTERS_NUM 20000
 #define LINE_SPACING 5
 #define LETTER_SPACING 3
 
