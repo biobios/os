@@ -63,3 +63,51 @@ void oz::x86_64::enableSSE() {
         :"%rax", "%xmm0"
     );
 }
+
+std::uint8_t oz::x86_64::readIO8(std::uint16_t addr) {
+    std::uint8_t value;
+    __asm__ volatile(
+        "inb %%dx, %%al\n"
+        : "=a"(value) : "d"(addr)
+    );
+    return value;
+}
+
+std::uint16_t oz::x86_64::readIO16(std::uint16_t addr) {
+    std::uint16_t value;
+    __asm__ volatile(
+        "inw %%dx, %%ax\n"
+        : "=a"(value) : "d"(addr)
+    );
+    return value;
+}
+
+std::uint32_t oz::x86_64::readIO32(std::uint16_t addr) {
+    std::uint32_t value;
+    __asm__ volatile(
+        "inl %%dx, %%eax\n"
+        : "=a"(value) : "d"(addr)
+    );
+    return value;
+}
+
+void oz::x86_64::writeIO8(std::uint16_t addr, std::uint8_t value) {
+    __asm__ volatile(
+        "outb %[value], %[addr]"
+        :: [value]"a"(value), [addr]"d"(addr)
+    );
+}
+
+void oz::x86_64::writeIO16(std::uint16_t addr, std::uint16_t value) {
+    __asm__ volatile(
+        "outw %[value], %[addr]"
+        :: [value]"a"(value), [addr]"d"(addr)
+    );
+}
+
+void oz::x86_64::writeIO32(std::uint16_t addr, std::uint32_t value) {
+    __asm__ volatile(
+        "outl %[value], %[addr]"
+        :: [value]"a"(value), [addr]"d"(addr)
+    );
+}
