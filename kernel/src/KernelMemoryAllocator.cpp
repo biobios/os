@@ -44,10 +44,15 @@ std::size_t oz::TLSFMemoryAllocator::convertSizeToIndex(std::size_t size) {
 }
 
 oz::TLSFMemoryAllocator::BoundaryTag* oz::TLSFMemoryAllocator::newBlock() {
-    BoundaryTag* ret = reinterpret_cast<BoundaryTag*>(frameManager->allocatePages(framePerChunk));
-    std::size_t size = frameManager->FRAME_SIZE * framePerChunk - (sizeof(BoundaryTag::back_size_and_flags) + sizeof(BoundaryTag::size_and_flags));
+    FrameInfo* frameInfo = frameManager->allocatePages(framePerChunk);
+    BoundaryTag* ret =
+        reinterpret_cast<BoundaryTag*>(frameInfo->physicalAddress);
+    std::size_t size = frameManager->FRAME_SIZE * framePerChunk -
+                       (sizeof(BoundaryTag::back_size_and_flags) +
+                        sizeof(BoundaryTag::size_and_flags));
     ret->setSize(size);
     // 存在しないブロックのマージを防止するために使用中フラグを立てる
+    ret->clearFlags(BoundaryTag::allMask);
     ret->setFlags(BoundaryTag::backIsUsed);
     ret->getForward()->setFlags(BoundaryTag::thisIsUsed);
     return ret;
