@@ -28,6 +28,7 @@ namespace oz{
             static constexpr std::uint64_t thisIsUsed = 0b0001;
             static constexpr std::uint64_t backIsUsed = 0b0010;
             static constexpr std::uint64_t isLarge = 0b0100;
+            static constexpr std::uint64_t allMask = 0b1111;
             /// @brief FreeListに載っていないものに対して呼び出してはダメ
             void removeFromList();
             void setFlags(std::uint64_t flagBits);
