@@ -135,6 +135,9 @@ oz::TLSFMemoryAllocator::TLSFMemoryAllocator(IFrameManager* fm,
 void* oz::TLSFMemoryAllocator::malloc(std::size_t size) {
     size = (size + sizeof(BoundaryTag::size_and_flags) + 15) &
            ~(0b1111);  // 16Byte align
+    if (size < min_size_of_block) {
+        size = min_size_of_block;
+    }
     if (size > max_size_of_block) {
         return &mallocLarge(size)->data;
     }
@@ -153,7 +156,7 @@ void* oz::TLSFMemoryAllocator::malloc(std::size_t size) {
         // ポインタを返す
         return &allocatingBlock->data;
     } else {
-        std::uint64_t mask_sli = ~(0) << tli[1];
+        std::uint64_t mask_sli = ~(0) << (tli[1] + 1);
         std::uint64_t bitMap_isExistsSecond =
             bitMap_not_empty_freelist_second_level[tli[0]] & mask_sli;
 
@@ -161,7 +164,7 @@ void* oz::TLSFMemoryAllocator::malloc(std::size_t size) {
 
         // なかったらFirstLevelから探す
         if (bitMap_isExistsSecond == 0) {
-            std::uint64_t mask_fli = ~(0) << tli[0];
+            std::uint64_t mask_fli = ~(0) << (tli[0] + 1);
             std::uint64_t bitMap_isExistsFirst =
                 bitMap_not_empty_freelist_first_level & mask_fli;
 
@@ -188,16 +191,17 @@ void* oz::TLSFMemoryAllocator::malloc(std::size_t size) {
             BoundaryTag* forkedBlock = reinterpret_cast<BoundaryTag*>(
                 reinterpret_cast<std::uint8_t*>(allocatingBlock) + size);
 
-            std::uint64_t forkedBlockSize =
-                (allocatingBlock->size_and_flags & ~(0b00001111)) - size;
+            std::uint64_t forkedBlockSize = allocatingBlock->getSize() - size;
 
             allocatingBlock->setSize(size);
             forkedBlock->setSize(forkedBlockSize);
-            forkedBlock->clearFlags(BoundaryTag::thisIsUsed);
+            forkedBlock->clearFlags(BoundaryTag::allMask);
             forkedBlock->getForward()->clearFlags(BoundaryTag::backIsUsed);
-            tlsf_table[convertSizeToIndex(forkedBlockSize)].pushFront(
-                forkedBlock);
-            setBitMap(forkedBlockSize);
+            forkedBlock->getForward()->back_size_and_flags =
+                forkedBlock->size_and_flags;
+            std::size_t linear = convertSizeToIndex(forkedBlockSize) - 1;
+            tlsf_table[linear].pushFront(forkedBlock);
+            setBitMap(linear);
         }
 
         allocatingBlock->setFlags(BoundaryTag::thisIsUsed);
