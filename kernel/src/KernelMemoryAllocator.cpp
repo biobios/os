@@ -312,7 +312,7 @@ oz::TLSFMemoryAllocator::BoundaryTag::getBack() {
 }
 
 bool oz::TLSFMemoryAllocator::BoundaryTag::test(std::uint64_t testFlagBits) {
-    return (testFlagBits == (this->size_and_flags && testFlagBits));
+    return (testFlagBits == (this->size_and_flags & testFlagBits));
 }
 
 std::size_t oz::TLSFMemoryAllocator::BoundaryTag::getSize() {
