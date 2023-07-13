@@ -211,6 +211,8 @@ void* oz::TLSFMemoryAllocator::malloc(std::size_t size) {
 }
 
 void oz::TLSFMemoryAllocator::free(void* ptr) {
+    if (ptr == nullptr) return;
+
     // BoundaryTagに変換
     BoundaryTag* retBlock = reinterpret_cast<BoundaryTag*>(
         reinterpret_cast<std::uint8_t*>(ptr) -
@@ -225,6 +227,7 @@ void oz::TLSFMemoryAllocator::free(void* ptr) {
     if (!retBlock->test(BoundaryTag::backIsUsed)) {
         BoundaryTag* back = retBlock->getBack();
         back->removeFromList();
+        checkAndClearBitMap(convertSizeToIndex(back->getSize()) - 1);
         back->size_and_flags += retBlock->size_and_flags & ~(0b1111);
         retBlock = back;
     }
@@ -232,13 +235,16 @@ void oz::TLSFMemoryAllocator::free(void* ptr) {
     BoundaryTag* forward = retBlock->getForward();
     if (!forward->test(BoundaryTag::thisIsUsed)) {
         forward->removeFromList();
+        checkAndClearBitMap(convertSizeToIndex(forward->getSize()) - 1);
         retBlock->size_and_flags += forward->size_and_flags & ~(0b1111);
     }
     // リストに追加
     retBlock->clearFlags(BoundaryTag::thisIsUsed);
     retBlock->getForward()->back_size_and_flags = retBlock->size_and_flags;
     retBlock->getForward()->clearFlags(BoundaryTag::backIsUsed);
-    tlsf_table[convertSizeToIndex(retBlock->getSize())].pushFront(retBlock);
+    std::size_t index = convertSizeToIndex(retBlock->getSize()) - 1;
+    tlsf_table[index].pushFront(retBlock);
+    setBitMap(index);
 }
 
 oz::TLSFMemoryAllocator::BoundaryTag*
