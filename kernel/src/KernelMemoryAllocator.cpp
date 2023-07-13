@@ -58,10 +58,15 @@ oz::TLSFMemoryAllocator::BoundaryTag* oz::TLSFMemoryAllocator::newBlock() {
     return ret;
 }
 
-oz::TLSFMemoryAllocator::BoundaryTag* oz::TLSFMemoryAllocator::mallocLarge(std::size_t size) {
-    std::size_t numFrames = (size + sizeof(BoundaryTag::back_size_and_flags) + frameManager->FRAME_SIZE - 1)/frameManager->FRAME_SIZE - 1;
+oz::TLSFMemoryAllocator::BoundaryTag* oz::TLSFMemoryAllocator::mallocLarge(
+    std::size_t size) {
+    std::size_t numFrames = (size + sizeof(BoundaryTag::back_size_and_flags) +
+                             frameManager->FRAME_SIZE - 1) /
+                                frameManager->FRAME_SIZE -
+                            1;
     FrameInfo* frameInfo = frameManager->allocatePages(numFrames);
-    BoundaryTag* ret = reinterpret_cast<BoundaryTag*>(frameInfo->physicalAddress);
+    BoundaryTag* ret =
+        reinterpret_cast<BoundaryTag*>(frameInfo->physicalAddress);
     ret->frameInfoPtr = frameInfo;
     ret->size_and_flags = (numFrames << 4) | BoundaryTag::isLarge;
     return ret;
