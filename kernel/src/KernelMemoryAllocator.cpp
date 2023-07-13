@@ -6,9 +6,10 @@ std::size_t oz::TLSFMemoryAllocator::convertTLItoLinearIndex(TLI& tli) {
     return (tli[0] << max_log2_SLI) + tli[1];
 }
 
-oz::TLSFMemoryAllocator::TLI oz::TLSFMemoryAllocator::convertLinearIndexToTLI(std::size_t linear) {
+oz::TLSFMemoryAllocator::TLI oz::TLSFMemoryAllocator::convertLinearIndexToTLI(
+    std::size_t linear) {
     std::uint64_t sli_mask = 0;
-    for(std::size_t i = 0; i < max_log2_SLI; i++){
+    for (std::size_t i = 0; i < max_log2_SLI; i++) {
         sli_mask |= (0b1 << i);
     }
 
@@ -46,7 +47,7 @@ oz::TLSFMemoryAllocator::BoundaryTag* oz::TLSFMemoryAllocator::newBlock() {
     BoundaryTag* ret = reinterpret_cast<BoundaryTag*>(frameManager->allocatePages(framePerChunk));
     std::size_t size = frameManager->FRAME_SIZE * framePerChunk - (sizeof(BoundaryTag::back_size_and_flags) + sizeof(BoundaryTag::size_and_flags));
     ret->setSize(size);
-    //存在しないブロックのマージを防止するために使用中フラグを立てる
+    // 存在しないブロックのマージを防止するために使用中フラグを立てる
     ret->setFlags(BoundaryTag::backIsUsed);
     ret->getForward()->setFlags(BoundaryTag::thisIsUsed);
     return ret;
@@ -68,9 +69,9 @@ void oz::TLSFMemoryAllocator::freeLarge(BoundaryTag* returnedBlock) {
 
 void oz::TLSFMemoryAllocator::checkAndClearBitMap(std::size_t linearIndex) {
     TLI tli = convertLinearIndexToTLI(linearIndex);
-    if(tlsf_table[linearIndex].link == nullptr){
+    if (tlsf_table[linearIndex].link == nullptr) {
         bitMap_not_empty_freelist_second_level[tli[0]] &= ~(0b1 << tli[1]);
-        if(bitMap_not_empty_freelist_second_level[tli[0]] == 0){
+        if (bitMap_not_empty_freelist_second_level[tli[0]] == 0) {
             bitMap_not_empty_freelist_first_level &= ~(0b1 << tli[0]);
         }
     }
@@ -78,9 +79,9 @@ void oz::TLSFMemoryAllocator::checkAndClearBitMap(std::size_t linearIndex) {
 
 void oz::TLSFMemoryAllocator::checkAndClearBitMap(TLI& tli) {
     std::size_t linearIndex = convertTLItoLinearIndex(tli);
-    if(tlsf_table[linearIndex].link == nullptr){
+    if (tlsf_table[linearIndex].link == nullptr) {
         bitMap_not_empty_freelist_second_level[tli[0]] &= ~(0b1 << tli[1]);
-        if(bitMap_not_empty_freelist_second_level[tli[0]] == 0){
+        if (bitMap_not_empty_freelist_second_level[tli[0]] == 0) {
             bitMap_not_empty_freelist_first_level &= ~(0b1 << tli[0]);
         }
     }
@@ -234,8 +235,10 @@ oz::TLSFMemoryAllocator::FreeList::popFront() {
     if (this->link != nullptr) {
         this->link->prev_link = ret->prev_link;
     }
+
     ret->next_link = nullptr;
     ret->prev_link = nullptr;
+
     return ret;
 }
 
