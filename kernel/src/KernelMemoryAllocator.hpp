@@ -54,7 +54,7 @@ namespace oz{
         using TLI = std::array<std::size_t, 2>;
         static constexpr std::size_t size_align_2order = 4;
         FreeList* tlsf_table;
-        std::uint8_t bitMap_not_empty_freelist_second_level[64] = {};
+        std::uint32_t bitMap_not_empty_freelist_second_level[64] = {};
         std::uint64_t bitMap_not_empty_freelist_first_level = 0;
         std::size_t max_log2_SLI;
         std::size_t max_FLI;
