@@ -262,13 +262,15 @@ oz::TLSFMemoryAllocator::FreeList::popFront() {
 }
 
 void oz::TLSFMemoryAllocator::FreeList::pushFront(BoundaryTag* target) {
+    target->next_link = nullptr;
+
     if (this->link != nullptr) {
         target->next_link = this->link;
         target->prev_link = this->link->prev_link;
 
         target->next_link->prev_link = target;
     } else {
-        target->next_link->prev_link = reinterpret_cast<BoundaryTag*>(
+        target->prev_link = reinterpret_cast<BoundaryTag*>(
             reinterpret_cast<std::uint8_t*>(this) -
             (sizeof(BoundaryTag::prev_link) +
              sizeof(BoundaryTag::size_and_flags) +
