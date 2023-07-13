@@ -113,9 +113,8 @@ oz::TLSFMemoryAllocator::TLSFMemoryAllocator(IFrameManager* fm,
     : max_log2_SLI{_max_Log2_SLI},
       framePerChunk{_framePerChunk},
       frameManager{fm} {
-    max_FLI = oz::utils::getMSB(fm->FRAME_SIZE * framePerChunk) -
-              (max_log2_SLI + size_align_2order) + 1;
-    std::size_t needTableSize = (1 << max_log2_SLI) * (max_FLI + 1);
+    TLI max_tli = convertSizeToTLI(fm->FRAME_SIZE * framePerChunk);
+    std::size_t needTableSize = convertTLItoLinearIndex(max_tli) + 1;
 
     std::size_t needFrameForTable =
         (needTableSize * sizeof(FreeList) + fm->FRAME_SIZE - 1) /
