@@ -92,6 +92,34 @@ namespace PCI{
         std::uint16_t BridgeControl;
     };
 
+    struct CapabilityHeader{
+        std::uint8_t CapabilityID;
+        std::uint8_t NextCapabilityPointer;
+    };
+
+    struct MSICapability32{
+        std::uint8_t CapabilityID;
+        std::uint8_t NextCapabilityPointer;
+        std::uint16_t MessageControl;
+        std::uint32_t MessageAddress;
+        std::uint16_t MessageData;
+        std::uint16_t Reserved;
+        std::uint32_t MaskBits;
+        std::uint32_t PendingBits;
+    };
+
+    struct MSICapability64{
+        std::uint8_t CapabilityID;
+        std::uint8_t NextCapabilityPointer;
+        std::uint16_t MessageControl;
+        std::uint32_t MessageLowerAddress;
+        std::uint32_t MessageUpperAddress;
+        std::uint16_t MessageData;
+        std::uint16_t Reserved;
+        std::uint32_t MaskBits;
+        std::uint32_t PendingBits;
+    };
+
     constexpr std::uint16_t NON_EXISTENT_DEVICE_VENDER_ID = 0xFFFF;
     constexpr std::uint8_t BUS_NUMBER_MAX = 0xFF;
     constexpr std::uint8_t DEVICE_NUMBER_MAX = 0x1F;
@@ -101,4 +129,17 @@ namespace PCI{
     constexpr std::uint8_t PCI_BASE_CLASS_SERIAL_BUS_CONTROLLER = 0x0C;
     constexpr std::uint8_t PCI_SUB_CLASS_USB_CONTROLLER = 0x03;
     constexpr std::uint8_t PCI_INTERFACE_USB_XHCI = 0x30;
+
+    constexpr std::uint8_t CapabilityID_MSI = 0x05;
+    constexpr std::uint8_t CapabilityID_MSIX = 0x11;
+
+    namespace x86_64{
+        constexpr std::uint32_t makeMSIMessageAddress(std::uint8_t processerID){
+            return 0xFEE00000 | (processerID << 12);
+        }
+
+        constexpr std::uint16_t makeMSIMessageData(std::uint8_t vector, std::uint8_t deliveryMode = 0, std::uint8_t triggerMode = 1, std::uint8_t levelTriggered = 1){
+            return ((triggerMode & 0b1) << 15) | ((levelTriggered & 0b1) << 14) | ((deliveryMode & 0b111) << 8) | vector;
+        }
+    }
 }
