@@ -1,4 +1,5 @@
 #include "PCIUtils.hpp"
+
 #include "utils.hpp"
 
 PCIUtils::PCIFunctionConfigurationSpaceWrapper*
@@ -21,13 +22,14 @@ PCIUtils::MemorymappedConfigurationSpaceWrapper::getFunction(
             break;
         }
     }
-    if (ret == nullptr){
-        dprint("PCIUtils::MemorymappedConfigurationSpaceWrapper::getFunction: ret == nullptr\n\r");
-        while (true)
-        {
+    if (ret == nullptr) {
+        dprint(
+            "PCIUtils::MemorymappedConfigurationSpaceWrapper::getFunction: ret "
+            "== nullptr\n\r");
+        while (true) {
             __asm__ volatile("hlt");
         }
-        
+
         return InvalidFunctionConfigurationSpaceWrapper::getInstance();
     }
     return new MemorymappedFunctionConfigurationSpaceWrapper(ret);
@@ -195,6 +197,24 @@ PCIUtils::MemorymappedFunctionConfigurationSpaceWrapper::clone() {
     return new MemorymappedFunctionConfigurationSpaceWrapper(*this);
 }
 
+bool PCIUtils::MemorymappedFunctionConfigurationSpaceWrapper::findCapability(
+    std::uint8_t capabilityID, std::uint8_t* capabilityOffset) {
+    std::uint8_t capabilityPointer =
+        read8(offsetof(PCI::PCIConfigurationHeaderCommon, CapabilitiesPointer));
+    while (capabilityPointer != 0) {
+        std::uint8_t capabilityIDInHeader = read8(
+            capabilityPointer + offsetof(PCI::CapabilityHeader, CapabilityID));
+        if (capabilityIDInHeader == capabilityID) {
+            *capabilityOffset = capabilityPointer;
+            return true;
+        }
+        capabilityPointer =
+            read8(capabilityPointer +
+                  offsetof(PCI::CapabilityHeader, NextCapabilityPointer));
+    }
+    return false;
+}
+
 PCIUtils::MemorymappedFunctionConfigurationSpaceWrapper::
     MemorymappedFunctionConfigurationSpaceWrapper(
         PCI::PCIConfigurationHeaderCommon* configHeader)
@@ -271,5 +291,78 @@ PCIUtils::InvalidFunctionConfigurationSpaceWrapper::clone() {
     return getInstance();
 }
 
+bool PCIUtils::InvalidFunctionConfigurationSpaceWrapper::findCapability(
+    std::uint8_t capabilityID, std::uint8_t* capabilityOffset) {
+    return false;
+}
+
 void PCIUtils::InvalidFunctionConfigurationSpaceWrapper::operator delete(
     InvalidFunctionConfigurationSpaceWrapper* ptr, std::destroying_delete_t) {}
+
+void PCIUtils::MSICapabilityWrapper::write8(std::uint8_t offset,
+                                            std::uint8_t value) {
+    function->write8(capabilityOffset + offset, value);
+}
+
+void PCIUtils::MSICapabilityWrapper::write16(std::uint8_t offset,
+                                             std::uint16_t value) {
+    function->write16(capabilityOffset + offset, value);
+}
+
+void PCIUtils::MSICapabilityWrapper::write32(std::uint8_t offset,
+                                             std::uint32_t value) {
+    function->write32(capabilityOffset + offset, value);
+}
+
+std::uint8_t PCIUtils::MSICapabilityWrapper::read8(std::uint8_t offset) {
+    return function->read8(capabilityOffset + offset);
+}
+
+std::uint16_t PCIUtils::MSICapabilityWrapper::read16(std::uint8_t offset) {
+    return function->read16(capabilityOffset + offset);
+}
+
+std::uint32_t PCIUtils::MSICapabilityWrapper::read32(std::uint8_t offset) {
+    return function->read32(capabilityOffset + offset);
+}
+
+PCIUtils::MSICapabilityWrapper::MSICapabilityWrapper(
+    PCIFunctionConfigurationSpaceWrapper& function,
+    std::uint8_t capabilityOffset)
+    : capabilityOffset{capabilityOffset} {
+    this->function = function.clone();
+}
+
+bool PCIUtils::MSICapabilityWrapper::is64BitAddress() {
+    return (read16(offsetof(PCI::MSICapability32, MessageControl)) &
+            0b10000000) != 0;
+}
+
+bool PCIUtils::MSICapabilityWrapper::isPerVectorMasking() {
+    return (read16(offsetof(PCI::MSICapability32, MessageControl)) &
+            0b100000000) != 0;
+}
+
+void PCIUtils::MSICapabilityWrapper::enable() {
+    write16(offsetof(PCI::MSICapability32, MessageControl),
+            read16(offsetof(PCI::MSICapability32, MessageControl)) | 0b1);
+}
+
+void PCIUtils::MSICapabilityWrapper::disable() {
+    write16(offsetof(PCI::MSICapability32, MessageControl),
+            read16(offsetof(PCI::MSICapability32, MessageControl)) & ~0b1);
+}
+
+void PCIUtils::MSICapabilityWrapper::setMessageAddress(std::uint64_t address) {
+    write32(offsetof(PCI::MSICapability32, MessageAddress), address);
+}
+
+void PCIUtils::MSICapabilityWrapper::setMessageData(std::uint16_t data) {
+    if(is64BitAddress()) {
+        write16(offsetof(PCI::MSICapability64, MessageData), data);
+    }else{
+        write16(offsetof(PCI::MSICapability32, MessageData), data);
+    }
+}
+
+PCIUtils::MSICapabilityWrapper::~MSICapabilityWrapper() { delete function; }

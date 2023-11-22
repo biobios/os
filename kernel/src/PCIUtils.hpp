@@ -16,6 +16,7 @@ public:
     virtual std::uint32_t read32(std::uint8_t offset) = 0;
     virtual void write32(std::uint8_t offset, std::uint32_t value) = 0;
     virtual PCIFunctionConfigurationSpaceWrapper* clone() = 0;
+    virtual bool findCapability(std::uint8_t capabilityID, std::uint8_t* capabilityOffset) = 0;
     bool isAvailable();
     bool isMultifunction();
     bool isBridge();
@@ -38,6 +39,7 @@ public:
     std::uint32_t read32(std::uint8_t offset) override;
     void write32(std::uint8_t offset, std::uint32_t value) override;
     PCIFunctionConfigurationSpaceWrapper* clone() override;
+    bool findCapability(std::uint8_t capabilityID, std::uint8_t* capabilityOffset) override;
     virtual ~MemorymappedFunctionConfigurationSpaceWrapper() = default;
 };
 
@@ -52,6 +54,7 @@ public:
     std::uint32_t read32(std::uint8_t offset) override;
     void write32(std::uint8_t offset, std::uint32_t value) override;
     PCIFunctionConfigurationSpaceWrapper* clone() override;
+    bool findCapability(std::uint8_t capabilityID, std::uint8_t* capabilityOffset) override;
     virtual ~InvalidFunctionConfigurationSpaceWrapper() = default;
     static void operator delete(InvalidFunctionConfigurationSpaceWrapper* ptr, std::destroying_delete_t);
 };
@@ -74,5 +77,25 @@ class MemorymappedConfigurationSpaceWrapper : public PCIConfigurationSpaceWrappe
         PCIe::MemorymappedConfigurationSpaceDescriptionTable* mcfg);
     PCIFunctionConfigurationSpaceWrapper* getFunction(std::uint8_t busNumber, std::uint8_t deviceNumber, std::uint8_t funcNumber) override;
     virtual ~MemorymappedConfigurationSpaceWrapper() = default;
+};
+
+class MSICapabilityWrapper {
+    PCIFunctionConfigurationSpaceWrapper* function;
+    std::uint8_t capabilityOffset;
+    void write8(std::uint8_t offset, std::uint8_t value);
+    void write16(std::uint8_t offset, std::uint16_t value);
+    void write32(std::uint8_t offset, std::uint32_t value);
+    std::uint8_t read8(std::uint8_t offset);
+    std::uint16_t read16(std::uint8_t offset);
+    std::uint32_t read32(std::uint8_t offset);
+    public:
+    MSICapabilityWrapper(PCIFunctionConfigurationSpaceWrapper& function, std::uint8_t capabilityOffset);
+    bool is64BitAddress();
+    bool isPerVectorMasking();
+    void enable();
+    void disable();
+    void setMessageAddress(std::uint64_t address);
+    void setMessageData(std::uint16_t data);
+    ~MSICapabilityWrapper();
 };
 }  // namespace PCIUtils
