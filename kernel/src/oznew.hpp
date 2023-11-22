@@ -7,6 +7,8 @@
 
 [[nodiscard]] void* operator new(std::size_t size);
 void operator delete(void* ptr) noexcept;//1
+[[nodiscard]] void* operator new[](std::size_t size);
+void operator delete[](void* ptr) noexcept;
 void setMemoryAllocator(oz::IKernelMemoryAllocator* allocator);
 
 // namespace oz{

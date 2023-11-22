@@ -202,7 +202,11 @@ void* operator new(std::size_t size) {
 void operator delete(void* ptr) noexcept {
     allocator->free(ptr);
 }
-void setMemoryAllocator(oz::IKernelMemoryAllocator* al) {
-    allocator = al;
+void* operator new[](std::size_t size) {
+    return allocator->malloc(size);
 }
+void operator delete[](void* ptr) noexcept {
+    allocator->free(ptr);
+}
+void setMemoryAllocator(oz::IKernelMemoryAllocator* al) { allocator = al; }
 // void operator delete(void* ptr, void*)noexcept{}
