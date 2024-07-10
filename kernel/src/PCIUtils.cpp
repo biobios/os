@@ -122,10 +122,10 @@ class FindVisitor {
     FindVisitor(PCIUtils::PCIFunctionConfigurationSpaceWrapper** _out,
                 std::uint8_t _baseClass, std::uint8_t _subClass,
                 std::uint8_t _interface)
-        : baseClass{_baseClass}, subClass{_subClass}, interface {
-        _interface
-    }, out{_out} {
-    }
+        : baseClass{_baseClass},
+          subClass{_subClass},
+          interface{_interface},
+          out{_out} {}
     void operator()(PCIUtils::PCIFunctionConfigurationSpaceWrapper& config) {
         if (*out != nullptr) return;
         if (config.equalsCode(baseClass, subClass, interface)) {
@@ -358,9 +358,9 @@ void PCIUtils::MSICapabilityWrapper::setMessageAddress(std::uint64_t address) {
 }
 
 void PCIUtils::MSICapabilityWrapper::setMessageData(std::uint16_t data) {
-    if(is64BitAddress()) {
+    if (is64BitAddress()) {
         write16(offsetof(PCI::MSICapability64, MessageData), data);
-    }else{
+    } else {
         write16(offsetof(PCI::MSICapability32, MessageData), data);
     }
 }

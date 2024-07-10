@@ -2,22 +2,24 @@
 
 #include <cstdint>
 
-#include "Graphics.hpp"
-#include "Shell.hpp"
-#include "PageManager.hpp"
-#include "bootStructures.hpp"
 #include "FrameManager.hpp"
+#include "Graphics.hpp"
 #include "KernelMemoryAllocator.hpp"
+#include "PageManager.hpp"
+#include "Shell.hpp"
+#include "bootStructures.hpp"
 
 namespace oz {
 class Kernel {
-    public:
+   public:
     Graphics g;
     Shell sh;
-    private:
+
+   private:
     PageManager pm;
     x86_64::FrameManager fm;
     TLSFMemoryAllocator tlsf_malloc;
+
    public:
     Kernel(oz_boot::PlatformInfo* platformInfo);
     void run();
