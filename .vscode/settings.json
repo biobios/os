@@ -1,6 +1,6 @@
 {
     "C_Cpp.default.cppStandard": "gnu++23",
-    "C_Cpp.default.compilerPath": "C:/Program Files/LLVM/bin/clang++.exe",
+    "C_Cpp.default.compilerPath": "C:\\Program Files\\LLVM\\bin\\clang++.exe",
     "C_Cpp.default.cStandard": "gnu17",
 
     "files.associations": {
@@ -17,7 +17,8 @@
     "C_Cpp.clang_format_fallbackStyle": "Google",
     "C_Cpp.clang_format_style": "file",
     "C_Cpp.default.systemIncludePath": [
-        "kernel/dependencies/ozlib/include"
+        "${workspaceFolder}/kernel/dependencies/ozlib/include",
+//        "${workspaceFolder}\\kernel\\dependencies\\ozlib\\include",
     ],
     "C_Cpp.default.compilerArgs": [
         "-nostdlibinc"
