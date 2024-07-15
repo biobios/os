@@ -1,5 +1,5 @@
-COMPILER = clang++-16
-LINKER = ld.lld-16
+COMPILER = clang++
+LINKER = ld.lld
 CFLAGS = -O2 -Wall -Wextra -Wpadded -g --target=x86_64-unknown-none-elf -g -ffreestanding -mno-red-zone -fno-exceptions -fno-rtti -std=c++20 -I $(INCLUDEDIR) -c
 LFLAGS = --entry $(ENTRYPOINT) -z norelro --image-base 0x100000 -g --static -L$(LIBDIR) -lcommonstd -lozstd
 INCLUDEDIR = ./dependencies/ozlib/include/
@@ -25,13 +25,13 @@ run:
 	$(MAKE) -C ../
 
 load:
-	sudo losetup /dev/loop0 ../hdd.img
+	sudo losetup /dev/loop5 ../hdd.img
 	sudo mkdir -p ../mnt
-	sudo mount /dev/loop0 ../mnt
+	sudo mount /dev/loop5 ../mnt
 	sudo mkdir -p ../mnt/os
 	sudo cp ./build/kernel.bin ../mnt/os/kernel.bin
 	sudo umount ../mnt
-	sudo losetup -d /dev/loop0
+	sudo losetup -d /dev/loop5
 
 clean:
 	rm $(OBJROOT)*
