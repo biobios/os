@@ -11,6 +11,7 @@ alignas(16) std::uint8_t stack[1024 * 1024 * 2];
 extern "C" void main(oz_boot::PlatformInfo* platformInfo) {
     oz::x86_64::enableSSE();
     oz::x86_64::initGDTR();
+    oz::x86_64::initIDTR();
     setKernelPtr(static_cast<void*>(&k));
     new (static_cast<void*>(&k)) oz::Kernel{platformInfo};
     reinterpret_cast<oz::Kernel*>(&k)->run();
