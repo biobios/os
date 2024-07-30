@@ -120,6 +120,32 @@ namespace PCI{
         std::uint32_t PendingBits;
     };
 
+    namespace MSIX{
+        struct CapabilityStructure{
+            std::uint8_t CapabilityID;
+            std::uint8_t NextCapabilityPointer;
+            std::uint16_t MessageControl;
+            std::uint32_t TableOffset_TableBIR;
+            std::uint32_t PBAOffset_PBABIR;
+        };
+
+        struct TableEntry{
+            std::uint32_t MessageAddressLower32Bits;
+            std::uint32_t MessageAddressUpper32Bits;
+            std::uint32_t MessageData;
+            std::uint32_t Vector_Control;
+        };
+
+        struct PBAEntry{
+            std::uint32_t Vector_Pending;
+            std::uint32_t Vector_Mask;
+        };
+
+        constexpr std::uint16_t MSIXEnable = 0b1 << 15;
+        constexpr std::uint16_t FunctionMask = 0b1 << 14;
+        constexpr std::uint16_t TableSize = 0b11111111111;
+    }
+
     constexpr std::uint16_t NON_EXISTENT_DEVICE_VENDER_ID = 0xFFFF;
     constexpr std::uint8_t BUS_NUMBER_MAX = 0xFF;
     constexpr std::uint8_t DEVICE_NUMBER_MAX = 0x1F;
@@ -135,7 +161,7 @@ namespace PCI{
 
     namespace x86_64{
         constexpr std::uint32_t makeMSIMessageAddress(std::uint8_t processerID){
-            return 0xFEE00000 | (processerID << 12);
+            return 0xFEE00000 | (static_cast<std::uint32_t>(processerID) << 12);
         }
 
         constexpr std::uint16_t makeMSIMessageData(std::uint8_t vector, std::uint8_t deliveryMode = 0, std::uint8_t triggerMode = 1, std::uint8_t levelTriggered = 1){
