@@ -23,14 +23,7 @@ PCIUtils::MemorymappedConfigurationSpaceWrapper::getFunction(
         }
     }
     if (ret == nullptr) {
-        dprint(
-            "PCIUtils::MemorymappedConfigurationSpaceWrapper::getFunction: ret "
-            "== nullptr\n\r");
-        while (true) {
-            __asm__ volatile("hlt");
-        }
-
-        return InvalidFunctionConfigurationSpaceWrapper::getInstance();
+                return InvalidFunctionConfigurationSpaceWrapper::getInstance();
     }
     return new MemorymappedFunctionConfigurationSpaceWrapper(ret);
 }
