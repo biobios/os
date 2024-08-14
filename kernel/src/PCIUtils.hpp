@@ -98,4 +98,24 @@ class MSICapabilityWrapper {
     void setMessageData(std::uint16_t data);
     ~MSICapabilityWrapper();
 };
+
+class MSIXCapabilityWrapper {
+    PCIFunctionConfigurationSpaceWrapper* function;
+    std::uint8_t capabilityOffset;
+    PCI::MSIX::TableEntry* table;
+    PCI::MSIX::PBAEntry* pba;
+    void write8(std::uint8_t offset, std::uint8_t value);
+    void write16(std::uint8_t offset, std::uint16_t value);
+    void write32(std::uint8_t offset, std::uint32_t value);
+    std::uint8_t read8(std::uint8_t offset);
+    std::uint16_t read16(std::uint8_t offset);
+    std::uint32_t read32(std::uint8_t offset);
+    public:
+    MSIXCapabilityWrapper(PCIFunctionConfigurationSpaceWrapper& function, std::uint8_t capabilityOffset);
+    void enable();
+    void disable();
+    void setEntry(std::uint16_t index, std::uint32_t vectorControl, std::uint32_t messageData, std::uint64_t messageAddress);
+    std::uint16_t getTableSize();
+    ~MSIXCapabilityWrapper();
+};
 }  // namespace PCIUtils

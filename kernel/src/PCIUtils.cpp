@@ -23,7 +23,7 @@ PCIUtils::MemorymappedConfigurationSpaceWrapper::getFunction(
         }
     }
     if (ret == nullptr) {
-                return InvalidFunctionConfigurationSpaceWrapper::getInstance();
+        return InvalidFunctionConfigurationSpaceWrapper::getInstance();
     }
     return new MemorymappedFunctionConfigurationSpaceWrapper(ret);
 }
@@ -359,3 +359,152 @@ void PCIUtils::MSICapabilityWrapper::setMessageData(std::uint16_t data) {
 }
 
 PCIUtils::MSICapabilityWrapper::~MSICapabilityWrapper() { delete function; }
+
+PCIUtils::MSIXCapabilityWrapper::MSIXCapabilityWrapper(
+    PCIFunctionConfigurationSpaceWrapper& function,
+    std::uint8_t capabilityOffset)
+    : capabilityOffset{capabilityOffset} {
+    this->function = function.clone();
+    std::uint32_t tableOffset_TableBIR =
+        read32(offsetof(PCI::MSIX::CapabilityStructure, TableOffset_TableBIR));
+    std::uint32_t pbaOffset_PBABIR =
+        read32(offsetof(PCI::MSIX::CapabilityStructure, PBAOffset_PBABIR));
+
+    std::uint32_t indexBAR = tableOffset_TableBIR & 0b111;
+    std::uint32_t tableOffset = tableOffset_TableBIR & ~0b111;
+
+    std::uint64_t tableBIR =
+        (function.read32(offsetof(PCI::PCIConfigurationHeaderCommon,
+                                  BaseAddressRegister[indexBAR])) &
+         ~0b1111) |
+        (static_cast<std::uint64_t>(
+             function.read32(offsetof(PCI::PCIConfigurationHeaderCommon,
+                                      BaseAddressRegister[indexBAR + 1])))
+         << 32);
+    table = reinterpret_cast<PCI::MSIX::TableEntry*>(tableBIR + tableOffset);
+
+    dprint("tableBIR: ");
+    char str2[sizeof(std::uint64_t) * 2 + 1];
+    str2[sizeof(std::uint64_t) * 2] = '\0';
+    oz::utils::to_hex(tableBIR + tableOffset, str2);
+    dprint(str2);
+    dprint("\n\r");
+
+    std::uint32_t pbaBAR = pbaOffset_PBABIR & 0b111;
+    std::uint32_t pbaOffset = pbaOffset_PBABIR & ~0b111;
+
+    std::uint64_t pbaBIR =
+        (function.read32(offsetof(PCI::PCIConfigurationHeaderCommon,
+                                  BaseAddressRegister[pbaBAR])) &
+         ~0b1111) |
+        (static_cast<std::uint64_t>(
+             function.read32(offsetof(PCI::PCIConfigurationHeaderCommon,
+                                      BaseAddressRegister[pbaBAR + 1])))
+         << 32);
+    pba = reinterpret_cast<PCI::MSIX::PBAEntry*>(pbaBIR + pbaOffset);
+
+    dprint(" pbaBIR: ");
+    oz::utils::to_hex(pbaBIR + pbaOffset, str2);
+    dprint(str2);
+    dprint("\n\r");
+}
+
+void PCIUtils::MSIXCapabilityWrapper::enable() {
+    write16(offsetof(PCI::MSIX::CapabilityStructure, MessageControl),
+            read16(offsetof(PCI::MSIX::CapabilityStructure, MessageControl)) |
+                PCI::MSIX::MSIXEnable);
+}
+
+void PCIUtils::MSIXCapabilityWrapper::disable() {
+    write16(offsetof(PCI::MSIX::CapabilityStructure, MessageControl),
+            read16(offsetof(PCI::MSIX::CapabilityStructure, MessageControl)) &
+                ~PCI::MSIX::MSIXEnable);
+}
+
+void PCIUtils::MSIXCapabilityWrapper::setEntry(std::uint16_t index,
+                                               std::uint32_t vectorControl,
+                                               std::uint32_t messageData,
+                                               std::uint64_t messageAddress) {
+    table[index].MessageAddressLower32Bits = messageAddress;
+    table[index].MessageAddressUpper32Bits = messageAddress >> 32;
+    table[index].MessageData = messageData;
+    table[index].Vector_Control = vectorControl;
+
+    char str1[sizeof(std::uint64_t) * 2 + 1];
+    str1[sizeof(std::uint64_t) * 2] = '\0';
+
+    if (table[index].MessageData != messageData) {
+        dprint(
+            "MSIXCapabilityWrapper::setEntry: table[index].MessageData != "
+            "messageData\n\r");
+
+        oz::utils::to_hex(table[index].MessageData, str1);
+        dprint(str1);
+        dprint("\n\r");
+        oz::utils::to_hex(messageData, str1);
+        dprint(str1);
+        dprint("\n\r");
+    } else if (table[index].MessageAddressLower32Bits |
+               (table[index].MessageAddressUpper32Bits << 32) !=
+                   messageAddress) {
+        dprint(
+            "MSIXCapabilityWrapper::setEntry: "
+            "table[index].MessageAddressLower32Bits | "
+            "(table[index].MessageAddressUpper32Bits << 32) != "
+            "messageAddress\n\r");
+
+        oz::utils::to_hex(table[index].MessageAddressLower32Bits, str1);
+        dprint(str1);
+        dprint("\n\r");
+    } else if (table[index].Vector_Control != vectorControl) {
+        dprint(
+            "MSIXCapabilityWrapper::setEntry: table[index].Vector_Control != "
+            "vectorControl\n\r");
+
+        oz::utils::to_hex(table[index].Vector_Control, str1);
+        dprint(str1);
+        dprint("\n\r");
+    } else {
+        dprint("PRINT PBA");
+        oz::utils::to_hex(pba[index].Vector_Pending, str1);
+        dprint(str1);
+        dprint("\n\r");
+        oz::utils::to_hex(pba[index].Vector_Mask, str1);
+        dprint(str1);
+        dprint("\n\r");
+    }
+}
+
+std::uint16_t PCIUtils::MSIXCapabilityWrapper::getTableSize() {
+    return read16(offsetof(PCI::MSIX::CapabilityStructure, MessageControl)) &
+           PCI::MSIX::TableSize;
+}
+
+PCIUtils::MSIXCapabilityWrapper::~MSIXCapabilityWrapper() { delete function; }
+
+void PCIUtils::MSIXCapabilityWrapper::write8(std::uint8_t offset,
+                                             std::uint8_t value) {
+    function->write8(capabilityOffset + offset, value);
+}
+
+void PCIUtils::MSIXCapabilityWrapper::write16(std::uint8_t offset,
+                                              std::uint16_t value) {
+    function->write16(capabilityOffset + offset, value);
+}
+
+void PCIUtils::MSIXCapabilityWrapper::write32(std::uint8_t offset,
+                                              std::uint32_t value) {
+    function->write32(capabilityOffset + offset, value);
+}
+
+std::uint8_t PCIUtils::MSIXCapabilityWrapper::read8(std::uint8_t offset) {
+    return function->read8(capabilityOffset + offset);
+}
+
+std::uint16_t PCIUtils::MSIXCapabilityWrapper::read16(std::uint8_t offset) {
+    return function->read16(capabilityOffset + offset);
+}
+
+std::uint32_t PCIUtils::MSIXCapabilityWrapper::read32(std::uint8_t offset) {
+    return function->read32(capabilityOffset + offset);
+}
