@@ -181,12 +181,10 @@ EFI_STATUS uefi_main(EFI_HANDLE imageHandle, EFI_SYSTEM_TABLE* systemTable)
     //UEFIの呼び出し規約ms_abi
     //Kernelの呼び出し規約SystemV ABI
     unsigned long long arg1 = (unsigned long long)&info;
-    unsigned long long _sb = 0x0000000000210000;
     unsigned long long _ep = efiHeader->e_entry;
     __asm__ volatile("   mov %0, %%rdi\n"
-            "   mov %1, %%rsp\n"
-            "   jmp *%2\n"
-            ::"m"(arg1), "m"(_sb), "m"(_ep));
+            "   jmp *%1\n"
+            ::"m"(arg1), "m"(_ep));
     
     while(1);
     return EFI_SUCCESS;
