@@ -25,13 +25,14 @@ run:
 	$(MAKE) -C ../
 
 load:
-	sudo losetup /dev/loop5 ../hdd.img
-	sudo mkdir -p ../mnt
-	sudo mount /dev/loop5 ../mnt
-	sudo mkdir -p ../mnt/os
-	sudo cp ./build/kernel.bin ../mnt/os/kernel.bin
-	sudo umount ../mnt
-	sudo losetup -d /dev/loop5
+	using_loopdev=$$(losetup -f); \
+	sudo losetup $$using_loopdev ../hdd.img; \
+	sudo mkdir -p ../mnt; \
+	sudo mount $$using_loopdev ../mnt; \
+	sudo mkdir -p ../mnt/os; \
+	sudo cp ./build/kernel.bin ../mnt/os/kernel.bin; \
+	sudo umount ../mnt; \
+	sudo losetup -d $$using_loopdev;
 
 clean:
 	rm $(OBJROOT)*
