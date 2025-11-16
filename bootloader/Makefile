@@ -1,5 +1,8 @@
-BOOTX64.EFI: boot.c
-	x86_64-w64-mingw32-gcc -Wall -Wextra -e uefi_main -nostdlib -fno-builtin -Wl,--subsystem,10 -o BOOTX64.EFI boot.c
+BOOTX64.EFI: boot.o
+	lld-link /subsystem:efi_application /entry:uefi_main /out:BOOTX64.EFI boot.o
+
+boot.o: boot.c
+	clang -target x86_64-pc-win32-coff -Wall -Wextra -mno-red-zone -fno-stack-protector -fshort-wchar -c boot.c
 
 .PHONY: load
 
