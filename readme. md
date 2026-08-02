@@ -12,8 +12,34 @@ ubuntu上で次のコマンドを実行する
     sudo apt install ovmf
     sudo apt install qemu-utils
 
-### clangのインストール
+### clang / cmake のインストール
 
 ubuntu上で次のコマンドを実行する
-    sudo apt install clang
-    sudo apt install lld
+    sudo apt install clang lld cmake ninja-build python3 mtools
+    sudo apt install qemu-system-x86 ovmf qemu-utils
+
+## ビルドと実行
+
+### 1. CMakeの構成
+```bash
+cmake -B build
+# またはプリセットを使用
+cmake --preset default
+```
+
+### 2. ビルド & ディスクイメージ作成
+```bash
+# 全体ビルド + hdd.img 作成
+cmake --build build --target image
+# またはプリセットを使用
+cmake --build --preset image
+```
+
+### 3. QEMUで実行
+```bash
+# 通常実行
+cmake --build build --target run
+
+# GDBデバッグ待機 (-s -S) で実行
+cmake --build build --target run-debug
+```

@@ -1,3 +1,5 @@
+build/
+CMakeUserPresets.json
 hdd.img
 .vscode/*
 !.vscode/settings.json
