@@ -20,7 +20,9 @@
         "${workspaceFolder}/kernel/dependencies/ozlib/include",
 //        "${workspaceFolder}\\kernel\\dependencies\\ozlib\\include",
     ],
+    "C_Cpp.default.compileCommands": "${workspaceFolder}/build/compile_commands.json",
     "C_Cpp.default.compilerArgs": [
         "-nostdlibinc"
     ],
+    "cmake.sourceDirectory": "${workspaceFolder}"
 }
