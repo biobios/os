@@ -27,6 +27,10 @@ oz::x86_64::FrameManager::FrameManager(oz_boot::BootMemoryMap* memmap,
     for (; itr < itr_end; itr += memmap->descriptor_size) {
         oz_boot::EFI_MEMORY_DESCRIPTOR* desc =
             reinterpret_cast<oz_boot::EFI_MEMORY_DESCRIPTOR*>(itr);
+        
+        if (!oz_boot::isAvailable(desc->Type)) {
+            continue;
+        }
 
         std::uint64_t end_page =
             (desc->PhysicalStart +
