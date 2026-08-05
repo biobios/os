@@ -135,7 +135,8 @@ EFI_STATUS uefi_main(EFI_HANDLE imageHandle, EFI_SYSTEM_TABLE* systemTable)
         if(progHeader[i].p_type != PT_LOAD)continue;
 
         UINT64 allocateSize = (progHeader[i].p_memsz + 0xfff) / 0x1000;//Page数に換算
-        void* allocateAddress = (void*)(progHeader[i].p_vaddr & ~0xfff);//Page境界にAlignment
+        UINT64 targetPhysAddr = (progHeader[i].p_paddr != 0) ? progHeader[i].p_paddr : progHeader[i].p_vaddr;
+        void* allocateAddress = (void*)(targetPhysAddr & ~0xfff);//Page境界にAlignment
 
         status = systemTable->BootServices->AllocatePages(
             AllocateAddress,
@@ -148,10 +149,12 @@ EFI_STATUS uefi_main(EFI_HANDLE imageHandle, EFI_SYSTEM_TABLE* systemTable)
             while(TRUE)__asm__ volatile("hlt");
         }
 
-        systemTable->BootServices->CopyMem((void*)progHeader[i].p_vaddr, loaderBuffer + progHeader[i].p_offset, progHeader[i].p_filesz);
+        systemTable->BootServices->CopyMem((void*)targetPhysAddr, (char*)loaderBuffer + progHeader[i].p_offset, progHeader[i].p_filesz);
         //確保するメモリ領域のうちファイルにデータのない部分は０クリアする
         UINTN clearSize = progHeader[i].p_memsz - progHeader[i].p_filesz;
-        systemTable->BootServices->SetMem((void*)(progHeader[i].p_vaddr + progHeader[i].p_filesz), clearSize, 0);
+        if (clearSize > 0) {
+            systemTable->BootServices->SetMem((void*)(targetPhysAddr + progHeader[i].p_filesz), clearSize, 0);
+        }
     }
 
     //ブートサービスを終了する
@@ -182,6 +185,14 @@ EFI_STATUS uefi_main(EFI_HANDLE imageHandle, EFI_SYSTEM_TABLE* systemTable)
     //Kernelの呼び出し規約SystemV ABI
     unsigned long long arg1 = (unsigned long long)&info;
     unsigned long long _ep = efiHeader->e_entry;
+    for (Elf64_Half i = 0; i < efiHeader->e_phnum; i++) {
+        if (progHeader[i].p_type != PT_LOAD) continue;
+        if (efiHeader->e_entry >= progHeader[i].p_vaddr && 
+            efiHeader->e_entry < progHeader[i].p_vaddr + progHeader[i].p_memsz) {
+            _ep = efiHeader->e_entry - progHeader[i].p_vaddr + (progHeader[i].p_paddr ? progHeader[i].p_paddr : progHeader[i].p_vaddr);
+            break;
+        }
+    }
     __asm__ volatile("   mov %0, %%rdi\n"
             "   jmp *%1\n"
             ::"m"(arg1), "m"(_ep));

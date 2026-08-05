@@ -1,4 +1,5 @@
 #include "FrameManager.hpp"
+#include "Address.hpp"
 
 void oz::x86_64::FrameManager::setAllocateFlag(std::size_t index,
                                                std::size_t length) {
@@ -55,7 +56,7 @@ oz::x86_64::FrameManager::FrameManager(oz_boot::BootMemoryMap* memmap,
 
         if (oz_boot::isAvailable(desc->Type) &&
             desc->NumberOfPages >= required_page_size) {
-            fi_array = reinterpret_cast<FrameInfo*>(desc->PhysicalStart);
+            fi_array = reinterpret_cast<FrameInfo*>(oz::phys_to_virt(createPhysicalAddress<FrameInfo>(desc->PhysicalStart)));
             desc->NumberOfPages -= required_page_size;
             desc->PhysicalStart += paging::uefi_page_size * required_page_size;
 
@@ -69,7 +70,7 @@ oz::x86_64::FrameManager::FrameManager(oz_boot::BootMemoryMap* memmap,
     // fi_array初期化
     for (std::size_t i = 0; i < fi_array_size; i++) {
         fi_array[i].flags = 1;  // isUsed;
-        fi_array[i].physicalAddress = reinterpret_cast<void*>(frame_size * i);
+        fi_array[i].physicalAddress = createPhysicalAddress<void>(frame_size * i);
     }
 
     // 利用可能なFrameInfoのisUsedを下す
@@ -86,6 +87,7 @@ oz::x86_64::FrameManager::FrameManager(oz_boot::BootMemoryMap* memmap,
                  desc->NumberOfPages * paging::uefi_page_size) /
                 frame_size;
             for (std::size_t i = start_page_index; i < end_page_index; i++) {
+                if (i == 0) continue; // Reserve page 0 (0x0000 - 0x0FFF)
                 fi_array[i].flags &= ~(0b1);
             }
         }
@@ -94,21 +96,21 @@ oz::x86_64::FrameManager::FrameManager(oz_boot::BootMemoryMap* memmap,
 
 oz::FrameInfo* oz::x86_64::FrameManager::allocatePages(
     std::size_t frame_length) {
-    FrameInfo* ret = nullptr;
+    if (frame_length == 0) return nullptr;
     std::size_t currentStreak = 0;
     for (std::size_t i = 0; i < fi_array_size; i++) {
-        if (currentStreak >= frame_length) {
-            setAllocateFlag(i - frame_length, frame_length);
-            ret = &fi_array[i - frame_length];
-            break;
-        }
         if ((fi_array[i].flags & 0b1) != 0) {
             currentStreak = 0;
         } else {
             currentStreak++;
+            if (currentStreak == frame_length) {
+                std::size_t start_idx = i - frame_length + 1;
+                setAllocateFlag(start_idx, frame_length);
+                return &fi_array[start_idx];
+            }
         }
     }
-    return ret;
+    return nullptr;
 }
 
 void oz::x86_64::FrameManager::freePages(FrameInfo* returnedFrame,

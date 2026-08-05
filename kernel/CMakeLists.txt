@@ -28,6 +28,7 @@ target_compile_options(kernel PRIVATE
     -g
     -ffreestanding
     -mno-red-zone
+    -mcmodel=kernel
     -fno-exceptions
     -fno-rtti
 )
@@ -42,8 +43,7 @@ target_link_options(kernel PRIVATE
     -static
     -nostdlib
     -fuse-ld=lld
-    -Wl,--entry=init
     -Wl,-z,norelro
-    -Wl,--image-base=0x100000
+    -Wl,-T,${CMAKE_CURRENT_SOURCE_DIR}/linker.ld
     -Wl,-no-pie
 )

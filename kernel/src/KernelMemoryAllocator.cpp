@@ -1,5 +1,6 @@
 #include "KernelMemoryAllocator.hpp"
 
+#include "Address.hpp"
 #include "utils.hpp"
 
 std::size_t oz::TLSFMemoryAllocator::convertTLItoLinearIndex(TLI& tli) {
@@ -46,7 +47,7 @@ std::size_t oz::TLSFMemoryAllocator::convertSizeToIndex(std::size_t size) {
 oz::TLSFMemoryAllocator::BoundaryTag* oz::TLSFMemoryAllocator::newBlock() {
     FrameInfo* frameInfo = frameManager->allocatePages(framePerChunk);
     BoundaryTag* ret =
-        reinterpret_cast<BoundaryTag*>(frameInfo->physicalAddress);
+        reinterpret_cast<BoundaryTag*>(oz::phys_to_virt(frameInfo->physicalAddress));
     std::size_t size = frameManager->FRAME_SIZE * framePerChunk -
                        (sizeof(BoundaryTag::back_size_and_flags) +
                         sizeof(BoundaryTag::size_and_flags));
@@ -66,7 +67,7 @@ oz::TLSFMemoryAllocator::BoundaryTag* oz::TLSFMemoryAllocator::mallocLarge(
                             1;
     FrameInfo* frameInfo = frameManager->allocatePages(numFrames);
     BoundaryTag* ret =
-        reinterpret_cast<BoundaryTag*>(frameInfo->physicalAddress);
+        reinterpret_cast<BoundaryTag*>(oz::phys_to_virt(frameInfo->physicalAddress));
     ret->frameInfoPtr = frameInfo;
     ret->size_and_flags = (numFrames << 4) | BoundaryTag::isLarge;
     return ret;
@@ -120,7 +121,7 @@ oz::TLSFMemoryAllocator::TLSFMemoryAllocator(IFrameManager* fm,
         (needTableSize * sizeof(FreeList) + fm->FRAME_SIZE - 1) /
         fm->FRAME_SIZE;
     FrameInfo* frameInfo = fm->allocatePages(needFrameForTable);
-    tlsf_table = reinterpret_cast<FreeList*>(frameInfo->physicalAddress);
+    tlsf_table = reinterpret_cast<FreeList*>(oz::phys_to_virt(frameInfo->physicalAddress));
 
     for (std::size_t i = 0; i < needTableSize; i++) {
         tlsf_table[i].link = nullptr;
