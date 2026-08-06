@@ -94,7 +94,7 @@ void oz::x86_64::notifyEndOfInterrupt() {
     *reinterpret_cast<std::uint32_t*>(END_OF_INTERRUPT_REGISTER_ADDR) = 0;
 }
 
-void oz::x86_64::setPageMap(void* map) {
+void oz::x86_64::setPageMap(const void* map) {
     volatile std::uint64_t pBuf = reinterpret_cast<std::uint64_t>(map);
     __asm__ volatile(
         "movq %0, %%cr3"

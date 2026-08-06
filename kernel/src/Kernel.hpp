@@ -6,12 +6,13 @@
 #include "FrameManager.hpp"
 #include "Graphics.hpp"
 #include "KernelMemoryAllocator.hpp"
+#include "PageTable.hpp"
 #include "PageTableManager.hpp"
 #include "Shell.hpp"
 #include "bootStructures.hpp"
 
 namespace oz {
-std::uint64_t* getMasterPML4();
+PageTable* getMasterPML4();
 
 class Kernel : public PhysicalAddressProvider {
    public:

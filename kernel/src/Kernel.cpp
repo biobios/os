@@ -12,7 +12,7 @@ oz::Kernel::Kernel(oz_boot::PlatformInfo* platformInfo)
     , fm(&platformInfo->memory_map, oz::paging::x86_64::page_sizes[0])
     , tlsf_malloc(&fm)
     , pt_manager(getMasterPML4(), &fm)
-    , kernel_space(getMasterPML4(), createPhysicalAddress<std::uint64_t>(reinterpret_cast<std::uintptr_t>(getMasterPML4()) - oz::KERNEL_VIRT_OFFSET), &fm)
+    , kernel_space(getMasterPML4(), createPhysicalAddress<PageTable>(reinterpret_cast<std::uintptr_t>(getMasterPML4()) - oz::KERNEL_VIRT_OFFSET), &fm)
 {
     setMemoryAllocator(&tlsf_malloc);
 }

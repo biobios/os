@@ -7,18 +7,18 @@ oz::AddressSpace* oz::AddressSpace::createProcessSpace(IFrameManager* fm, const 
     FrameInfo* pml4_frame = fm->allocatePages(1);
     if (!pml4_frame) return nullptr;
 
-    PhysicalAddress<std::uint64_t> new_pml4_phys = physical_address_cast<std::uint64_t>(pml4_frame->physicalAddress);
-    std::uint64_t* new_pml4_virt = phys_to_virt(new_pml4_phys);
-    const std::uint64_t* k_pml4_virt = kernel_space.getVirtualPML4();
+    PhysicalAddress<PageTable> new_pml4_phys = physical_address_cast<PageTable>(pml4_frame->physicalAddress);
+    PageTable* new_pml4_virt = phys_to_virt(new_pml4_phys);
+    const PageTable* k_pml4_virt = kernel_space.getVirtualPML4();
 
     // 0..255: Lower half (Process-private) -> clear
     for (std::size_t i = 0; i < 256; ++i) {
-        new_pml4_virt[i] = 0;
+        (*new_pml4_virt)[i].clear();
     }
 
     // 256..511: Higher half (Kernel shared) -> copy from kernel master PML4
     for (std::size_t i = 256; i < 512; ++i) {
-        new_pml4_virt[i] = k_pml4_virt[i];
+        (*new_pml4_virt)[i] = (*k_pml4_virt)[i];
     }
 
     // Allocate AddressSpace object structure

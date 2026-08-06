@@ -1,63 +1,63 @@
 #include "PageTableManager.hpp"
 #include "Address.hpp"
 
-oz::PageTableManager::PageTableManager(std::uint64_t* pml4_virt, IFrameManager* fm)
+oz::PageTableManager::PageTableManager(PageTable* pml4_virt, IFrameManager* fm)
     : pml4_table(pml4_virt), frame_manager(fm) {}
 
 bool oz::PageTableManager::mapPage(std::uintptr_t virt_addr, PhysicalAddress<void> phys_addr, PageFlags flags) {
     if (!pml4_table) return false;
 
-    std::uint64_t pml4_idx = (virt_addr >> 39) & 0x1FF;
-    std::uint64_t pdpt_idx = (virt_addr >> 30) & 0x1FF;
-    std::uint64_t pd_idx   = (virt_addr >> 21) & 0x1FF;
-    std::uint64_t pt_idx   = (virt_addr >> 12) & 0x1FF;
+    std::size_t pml4_idx = paging::pml4Index(virt_addr);
+    std::size_t pdpt_idx = paging::pdptIndex(virt_addr);
+    std::size_t pd_idx   = paging::pdIndex(virt_addr);
+    std::size_t pt_idx   = paging::ptIndex(virt_addr);
 
     // PML4 entry
-    if (!(pml4_table[pml4_idx] & 0x1)) {
+    if (!(*pml4_table)[pml4_idx].isPresent()) {
         if (!frame_manager) return false;
         FrameInfo* fi = frame_manager->allocatePages(1);
         if (!fi) return false;
 
-        PhysicalAddress<std::uint64_t> pdpt_phys = physical_address_cast<std::uint64_t>(fi->physicalAddress);
-        std::uint64_t* pdpt_virt = phys_to_virt(pdpt_phys);
-        for (std::size_t i = 0; i < 512; ++i) pdpt_virt[i] = 0;
+        PhysicalAddress<PageTable> pdpt_phys = physical_address_cast<PageTable>(fi->physicalAddress);
+        PageTable* pdpt_virt = phys_to_virt(pdpt_phys);
+        pdpt_virt->clear();
 
-        pml4_table[pml4_idx] = pdpt_phys.get() | 0x07; // Present | R/W | User
+        (*pml4_table)[pml4_idx].set(pdpt_phys, PageFlags::Present | PageFlags::Writable | PageFlags::User);
     }
 
-    std::uint64_t* pdpt = phys_to_virt(createPhysicalAddress<std::uint64_t>(pml4_table[pml4_idx] & ~0xFFFULL));
+    PageTable* pdpt = phys_to_virt(createPhysicalAddress<PageTable>((*pml4_table)[pml4_idx].getAddress()));
 
     // PDPT entry
-    if (!(pdpt[pdpt_idx] & 0x1)) {
+    if (!(*pdpt)[pdpt_idx].isPresent()) {
         if (!frame_manager) return false;
         FrameInfo* fi = frame_manager->allocatePages(1);
         if (!fi) return false;
 
-        PhysicalAddress<std::uint64_t> pd_phys = physical_address_cast<std::uint64_t>(fi->physicalAddress);
-        std::uint64_t* pd_virt = phys_to_virt(pd_phys);
-        for (std::size_t i = 0; i < 512; ++i) pd_virt[i] = 0;
+        PhysicalAddress<PageTable> pd_phys = physical_address_cast<PageTable>(fi->physicalAddress);
+        PageTable* pd_virt = phys_to_virt(pd_phys);
+        pd_virt->clear();
 
-        pdpt[pdpt_idx] = pd_phys.get() | 0x07; // Present | R/W | User
+        (*pdpt)[pdpt_idx].set(pd_phys, PageFlags::Present | PageFlags::Writable | PageFlags::User);
     }
 
-    std::uint64_t* pd = phys_to_virt(createPhysicalAddress<std::uint64_t>(pdpt[pdpt_idx] & ~0xFFFULL));
+    PageTable* pd = phys_to_virt(createPhysicalAddress<PageTable>((*pdpt)[pdpt_idx].getAddress()));
 
     // PD entry
-    if (!(pd[pd_idx] & 0x1)) {
+    if (!(*pd)[pd_idx].isPresent()) {
         if (!frame_manager) return false;
         FrameInfo* fi = frame_manager->allocatePages(1);
         if (!fi) return false;
 
-        PhysicalAddress<std::uint64_t> pt_phys = physical_address_cast<std::uint64_t>(fi->physicalAddress);
-        std::uint64_t* pt_virt = phys_to_virt(pt_phys);
-        for (std::size_t i = 0; i < 512; ++i) pt_virt[i] = 0;
+        PhysicalAddress<PageTable> pt_phys = physical_address_cast<PageTable>(fi->physicalAddress);
+        PageTable* pt_virt = phys_to_virt(pt_phys);
+        pt_virt->clear();
 
-        pd[pd_idx] = pt_phys.get() | 0x07; // Present | R/W | User
+        (*pd)[pd_idx].set(pt_phys, PageFlags::Present | PageFlags::Writable | PageFlags::User);
     }
 
-    std::uint64_t* pt = phys_to_virt(createPhysicalAddress<std::uint64_t>(pd[pd_idx] & ~0xFFFULL));
+    PageTable* pt = phys_to_virt(createPhysicalAddress<PageTable>((*pd)[pd_idx].getAddress()));
 
-    pt[pt_idx] = (phys_addr.get() & ~0xFFFULL) | static_cast<std::uint64_t>(flags) | 0x01;
+    (*pt)[pt_idx].set(phys_addr, flags | PageFlags::Present);
 
     __asm__ volatile("invlpg (%0)" :: "r"(virt_addr) : "memory");
     return true;
@@ -66,52 +66,52 @@ bool oz::PageTableManager::mapPage(std::uintptr_t virt_addr, PhysicalAddress<voi
 bool oz::PageTableManager::unmapPage(std::uintptr_t virt_addr) {
     if (!pml4_table) return false;
 
-    std::uint64_t pml4_idx = (virt_addr >> 39) & 0x1FF;
-    std::uint64_t pdpt_idx = (virt_addr >> 30) & 0x1FF;
-    std::uint64_t pd_idx   = (virt_addr >> 21) & 0x1FF;
-    std::uint64_t pt_idx   = (virt_addr >> 12) & 0x1FF;
+    std::size_t pml4_idx = paging::pml4Index(virt_addr);
+    std::size_t pdpt_idx = paging::pdptIndex(virt_addr);
+    std::size_t pd_idx   = paging::pdIndex(virt_addr);
+    std::size_t pt_idx   = paging::ptIndex(virt_addr);
 
-    if (!(pml4_table[pml4_idx] & 0x1)) return false;
-    std::uint64_t* pdpt = phys_to_virt(createPhysicalAddress<std::uint64_t>(pml4_table[pml4_idx] & ~0xFFFULL));
+    if (!(*pml4_table)[pml4_idx].isPresent()) return false;
+    PageTable* pdpt = phys_to_virt(createPhysicalAddress<PageTable>((*pml4_table)[pml4_idx].getAddress()));
 
-    if (!(pdpt[pdpt_idx] & 0x1)) return false;
-    std::uint64_t* pd = phys_to_virt(createPhysicalAddress<std::uint64_t>(pdpt[pdpt_idx] & ~0xFFFULL));
+    if (!(*pdpt)[pdpt_idx].isPresent()) return false;
+    PageTable* pd = phys_to_virt(createPhysicalAddress<PageTable>((*pdpt)[pdpt_idx].getAddress()));
 
-    if (!(pd[pd_idx] & 0x1)) return false;
-    std::uint64_t* pt = phys_to_virt(createPhysicalAddress<std::uint64_t>(pd[pd_idx] & ~0xFFFULL));
+    if (!(*pd)[pd_idx].isPresent()) return false;
+    PageTable* pt = phys_to_virt(createPhysicalAddress<PageTable>((*pd)[pd_idx].getAddress()));
 
-    pt[pt_idx] = 0;
+    (*pt)[pt_idx].clear();
     __asm__ volatile("invlpg (%0)" :: "r"(virt_addr) : "memory");
     return true;
 }
 
 oz::PageTableManager::TranslateResult oz::PageTableManager::translate(std::uintptr_t virt_addr) {
-    if (!pml4_table) return {nullPhysicalAddress<void>(), false};
+    if (!pml4_table) return {nullPhysicalAddress<void>(), false, {}};
 
-    std::uint64_t pml4_idx = (virt_addr >> 39) & 0x1FF;
-    std::uint64_t pdpt_idx = (virt_addr >> 30) & 0x1FF;
-    std::uint64_t pd_idx   = (virt_addr >> 21) & 0x1FF;
-    std::uint64_t pt_idx   = (virt_addr >> 12) & 0x1FF;
+    std::size_t pml4_idx = paging::pml4Index(virt_addr);
+    std::size_t pdpt_idx = paging::pdptIndex(virt_addr);
+    std::size_t pd_idx   = paging::pdIndex(virt_addr);
+    std::size_t pt_idx   = paging::ptIndex(virt_addr);
 
-    if (!(pml4_table[pml4_idx] & 0x1)) return {nullPhysicalAddress<void>(), false};
-    std::uint64_t* pdpt = phys_to_virt(createPhysicalAddress<std::uint64_t>(pml4_table[pml4_idx] & ~0xFFFULL));
+    if (!(*pml4_table)[pml4_idx].isPresent()) return {nullPhysicalAddress<void>(), false, {}};
+    PageTable* pdpt = phys_to_virt(createPhysicalAddress<PageTable>((*pml4_table)[pml4_idx].getAddress()));
 
-    if (!(pdpt[pdpt_idx] & 0x1)) return {nullPhysicalAddress<void>(), false};
+    if (!(*pdpt)[pdpt_idx].isPresent()) return {nullPhysicalAddress<void>(), false, {}};
     // 1GB huge page check
-    if (pdpt[pdpt_idx] & 0x80) {
-        return {createPhysicalAddress<void>((pdpt[pdpt_idx] & ~0x3FFFFFFFULL) | (virt_addr & 0x3FFFFFFFULL)), true};
+    if ((*pdpt)[pdpt_idx].isHuge()) {
+        return {createPhysicalAddress<void>(((*pdpt)[pdpt_idx].raw() & ~0x3FFFFFFFULL) | (virt_addr & 0x3FFFFFFFULL)), true, {}};
     }
 
-    std::uint64_t* pd = phys_to_virt(createPhysicalAddress<std::uint64_t>(pdpt[pdpt_idx] & ~0xFFFULL));
+    PageTable* pd = phys_to_virt(createPhysicalAddress<PageTable>((*pdpt)[pdpt_idx].getAddress()));
 
-    if (!(pd[pd_idx] & 0x1)) return {nullPhysicalAddress<void>(), false};
+    if (!(*pd)[pd_idx].isPresent()) return {nullPhysicalAddress<void>(), false, {}};
     // 2MB huge page check
-    if (pd[pd_idx] & 0x80) {
-        return {createPhysicalAddress<void>((pd[pd_idx] & ~0x1FFFFFULL) | (virt_addr & 0x1FFFFFULL)), true};
+    if ((*pd)[pd_idx].isHuge()) {
+        return {createPhysicalAddress<void>(((*pd)[pd_idx].raw() & ~0x1FFFFFULL) | (virt_addr & 0x1FFFFFULL)), true, {}};
     }
 
-    std::uint64_t* pt = phys_to_virt(createPhysicalAddress<std::uint64_t>(pd[pd_idx] & ~0xFFFULL));
+    PageTable* pt = phys_to_virt(createPhysicalAddress<PageTable>((*pd)[pd_idx].getAddress()));
 
-    if (!(pt[pt_idx] & 0x1)) return {nullPhysicalAddress<void>(), false};
-    return {createPhysicalAddress<void>((pt[pt_idx] & ~0xFFFULL) | (virt_addr & 0xFFFULL)), true};
+    if (!(*pt)[pt_idx].isPresent()) return {nullPhysicalAddress<void>(), false, {}};
+    return {createPhysicalAddress<void>((*pt)[pt_idx].getAddress() | (virt_addr & 0xFFFULL)), true, {}};
 }

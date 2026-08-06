@@ -3,36 +3,37 @@
 
 #include "Address.hpp"
 #include "Kernel.hpp"
+#include "PageTable.hpp"
 #include "bootStructures.hpp"
 #include "utils.hpp"
 #include "x86_64.hpp"
 
 // Early boot page tables
 extern "C" {
-alignas(4096) volatile std::uint64_t boot_pml4[512];
-alignas(4096) volatile std::uint64_t boot_pdpt_low[512];
-alignas(4096) volatile std::uint64_t boot_pdpt_direct[512];
-alignas(4096) volatile std::uint64_t boot_pdpt_kernel[512];
-alignas(4096) volatile std::uint64_t boot_pd_kernel[512];
+alignas(4096) volatile oz::PageTable boot_pml4;
+alignas(4096) volatile oz::PageTable boot_pdpt_low;
+alignas(4096) volatile oz::PageTable boot_pdpt_direct;
+alignas(4096) volatile oz::PageTable boot_pdpt_kernel;
+alignas(4096) volatile oz::PageTable boot_pd_kernel;
 }
 
 alignas(oz::Kernel) static std::uint8_t k[sizeof(oz::Kernel)];
 alignas(16) static std::uint8_t stack[1024 * 1024 * 2];
 
 namespace oz {
-std::uint64_t* getMasterPML4() {
-    return const_cast<std::uint64_t*>(boot_pml4);
+PageTable* getMasterPML4() {
+    return const_cast<PageTable*>(&boot_pml4);
 }
 }
 
 extern "C" void kernel_main(oz_boot::PlatformInfo* platformInfo);
 
 extern "C" [[gnu::section(".boot")]] void init(oz_boot::PlatformInfo* platformInfo) {
-    volatile std::uint64_t* pml4;
-    volatile std::uint64_t* pdpt_low;
-    volatile std::uint64_t* pdpt_direct;
-    volatile std::uint64_t* pdpt_kernel;
-    volatile std::uint64_t* pd_kernel;
+    volatile oz::PageTable* pml4;
+    volatile oz::PageTable* pdpt_low;
+    volatile oz::PageTable* pdpt_direct;
+    volatile oz::PageTable* pdpt_kernel;
+    volatile oz::PageTable* pd_kernel;
 
     // Obtain the physical addresses of boot page tables using RIP-relative addressing
     __asm__ volatile(
@@ -45,22 +46,22 @@ extern "C" [[gnu::section(".boot")]] void init(oz_boot::PlatformInfo* platformIn
     );
 
     // 1. Low Identity Map (PML4[0]) - First 4GB with 1GB huge pages
-    pml4[0] = reinterpret_cast<std::uint64_t>(pdpt_low) | 0x03; // Present, Writable
+    (*pml4)[0].set(reinterpret_cast<std::uintptr_t>(pdpt_low), oz::PageFlags::Present | oz::PageFlags::Writable);
     for (std::uint64_t i = 0; i < 4; ++i) {
-        pdpt_low[i] = (i * 0x40000000ULL) | 0x83; // Present, Writable, 1GB Huge
+        (*pdpt_low)[i].set(i * 0x40000000ULL, oz::PageFlags::Present | oz::PageFlags::Writable | oz::PageFlags::HugePage);
     }
 
     // 2. Direct Map (PML4[272] = 0xFFFF880000000000) - 64GB with 1GB huge pages
-    pml4[272] = reinterpret_cast<std::uint64_t>(pdpt_direct) | 0x03; // Present, Writable
+    (*pml4)[272].set(reinterpret_cast<std::uintptr_t>(pdpt_direct), oz::PageFlags::Present | oz::PageFlags::Writable);
     for (std::uint64_t i = 0; i < 64; ++i) {
-        pdpt_direct[i] = (i * 0x40000000ULL) | 0x83; // Present, Writable, 1GB Huge
+        (*pdpt_direct)[i].set(i * 0x40000000ULL, oz::PageFlags::Present | oz::PageFlags::Writable | oz::PageFlags::HugePage);
     }
 
     // 3. Higher-Half Kernel Map (PML4[511] = 0xFFFFFFFF80000000) - 1GB with 2MB huge pages
-    pml4[511] = reinterpret_cast<std::uint64_t>(pdpt_kernel) | 0x03;
-    pdpt_kernel[510] = reinterpret_cast<std::uint64_t>(pd_kernel) | 0x03;
+    (*pml4)[511].set(reinterpret_cast<std::uintptr_t>(pdpt_kernel), oz::PageFlags::Present | oz::PageFlags::Writable);
+    (*pdpt_kernel)[510].set(reinterpret_cast<std::uintptr_t>(pd_kernel), oz::PageFlags::Present | oz::PageFlags::Writable);
     for (std::uint64_t i = 0; i < 512; ++i) {
-        pd_kernel[i] = (i * 0x200000ULL) | 0x83; // Present, Writable, 2MB Huge
+        (*pd_kernel)[i].set(i * 0x200000ULL, oz::PageFlags::Present | oz::PageFlags::Writable | oz::PageFlags::HugePage);
     }
 
     // 4. Load CR3 with physical address of boot_pml4
@@ -93,7 +94,7 @@ extern "C" void kernel_main(oz_boot::PlatformInfo* platformInfoPhys) {
     oz_boot::PlatformInfo* platformInfo = oz::phys_to_virt(BootInfoProvider::getPhys(platformInfoPhys));
 
     // 7. Unmap lower identity mapping
-    boot_pml4[0] = 0;
+    boot_pml4[0].clear();
     std::uint64_t cr3;
     __asm__ volatile("movq %%cr3, %0; movq %0, %%cr3" : "=r"(cr3) :: "memory");
 
