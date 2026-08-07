@@ -21,16 +21,16 @@ class Kernel : public PhysicalAddressProvider {
 
    private:
     x86_64::FrameManager fm;
-    TLSFMemoryAllocator tlsf_malloc;
-    PageTableManager pt_manager;
-    AddressSpace kernel_space;
+    TLSFMemoryAllocator<x86_64::FrameManager> tlsf_malloc;
+    PageTableManager<x86_64::FrameManager> pt_manager;
+    AddressSpace<x86_64::FrameManager> kernel_space;
 
    public:
     Kernel(oz_boot::PlatformInfo* platformInfo);
     void run();
 
-    AddressSpace& getKernelSpace() { return kernel_space; }
-    PageTableManager& getPageTableManager() { return pt_manager; }
+    AddressSpace<x86_64::FrameManager>& getKernelSpace() { return kernel_space; }
+    PageTableManager<x86_64::FrameManager>& getPageTableManager() { return pt_manager; }
     x86_64::FrameManager& getFrameManager() { return fm; }
 };
 }  // namespace oz

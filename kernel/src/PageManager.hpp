@@ -2,5 +2,6 @@
 #include "PageTableManager.hpp"
 
 namespace oz {
-    using PageManager = PageTableManager;
+    template <frame_manager FrameManager>
+    using PageManager = PageTableManager<FrameManager>;
 }

@@ -2,6 +2,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <new>
 #include "Address.hpp"
 #include "IFrameManager.hpp"
 #include "PageTable.hpp"
@@ -10,18 +11,51 @@
 
 namespace oz {
 
+template <frame_manager FrameManager>
 class AddressSpace {
 private:
     PageTable* pml4_virt;
     PhysicalAddress<PageTable> pml4_phys;
-    IFrameManager* frame_manager;
-    PageTableManager pt_manager;
+    FrameManager* frame_manager;
+    PageTableManager<FrameManager> pt_manager;
 
 public:
-    AddressSpace(PageTable* pml4_v, PhysicalAddress<PageTable> pml4_p, IFrameManager* fm = nullptr)
+    AddressSpace(PageTable* pml4_v, PhysicalAddress<PageTable> pml4_p, FrameManager* fm = nullptr)
         : pml4_virt(pml4_v), pml4_phys(pml4_p), frame_manager(fm), pt_manager(pml4_v, fm) {}
 
-    static AddressSpace* createProcessSpace(IFrameManager* fm, const AddressSpace& kernel_space);
+    static AddressSpace* createProcessSpace(FrameManager* fm, const AddressSpace& kernel_space) {
+        if (!fm) return nullptr;
+
+        PageBlock pml4_block = fm->allocateBlock(0);
+        if (!pml4_block) return nullptr;
+        pml4_block.setOwner(PageOwnerType::PAGE_TABLE);
+
+        PhysicalAddress<PageTable> new_pml4_phys = physical_address_cast<PageTable>(fm->getPhysicalAddress(pml4_block));
+        PageTable* new_pml4_virt = phys_to_virt(new_pml4_phys);
+        const PageTable* k_pml4_virt = kernel_space.getVirtualPML4();
+
+        // 0..255: Lower half (Process-private) -> clear
+        for (std::size_t i = 0; i < 256; ++i) {
+            (*new_pml4_virt)[i].clear();
+        }
+
+        // 256..511: Higher half (Kernel shared) -> copy from kernel master PML4
+        for (std::size_t i = 256; i < 512; ++i) {
+            (*new_pml4_virt)[i] = (*k_pml4_virt)[i];
+        }
+
+        // Allocate AddressSpace object structure
+        PageBlock as_block = fm->allocateBlock(0);
+        if (!as_block) {
+            fm->freeBlock(pml4_block);
+            return nullptr;
+        }
+        as_block.setOwner(PageOwnerType::OTHER);
+
+        AddressSpace* new_as = reinterpret_cast<AddressSpace*>(phys_to_virt(fm->getPhysicalAddress(as_block)));
+        new (static_cast<void*>(new_as)) AddressSpace(new_pml4_virt, new_pml4_phys, fm);
+        return new_as;
+    }
 
     bool mapUser(std::uintptr_t virt_addr, PhysicalAddress<void> phys_addr, PageFlags flags) {
         // User addresses must be within lower half (0x0000000000000000 ~ 0x00007FFFFFFFFFFF)
@@ -45,8 +79,8 @@ public:
 
     PhysicalAddress<PageTable> getPhysicalPML4() const { return pml4_phys; }
     PageTable* getVirtualPML4() const { return pml4_virt; }
-    PageTableManager& getPageTableManager() { return pt_manager; }
-    void setFrameManager(IFrameManager* fm) {
+    PageTableManager<FrameManager>& getPageTableManager() { return pt_manager; }
+    void setFrameManager(FrameManager* fm) {
         frame_manager = fm;
         pt_manager.setFrameManager(fm);
     }
