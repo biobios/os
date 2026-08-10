@@ -157,4 +157,10 @@ concept frame_manager = requires(FrameManager fm, std::uint8_t level, PageBlock<
     { fm.getDescriptor(phys) } -> std::same_as<PageFrameDescriptor*>;
 };
 
+template <typename Accessor>
+concept frame_manager_accessor = requires() {
+    typename Accessor::Settings::FrameManager;
+    {Accessor::getFrameManager()} -> std::same_as<typename Accessor::Settings::FrameManager&>;
+} && frame_manager<typename Accessor::Settings::FrameManager>;
+
 }  // namespace oz

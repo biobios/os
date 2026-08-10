@@ -31,6 +31,7 @@ target_compile_options(kernel PRIVATE
     -mcmodel=kernel
     -fno-exceptions
     -fno-rtti
+    -fno-use-cxa-atexit
 )
 
 target_link_libraries(kernel PRIVATE

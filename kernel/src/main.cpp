@@ -2,6 +2,7 @@
 #include <new>
 
 #include "Address.hpp"
+#include "FrameManager.hpp"
 #include "Kernel.hpp"
 #include "PageTable.hpp"
 #include "bootStructures.hpp"
@@ -17,7 +18,6 @@ alignas(4096) volatile oz::PageTable boot_pdpt_kernel;
 alignas(4096) volatile oz::PageTable boot_pd_kernel;
 }
 
-alignas(oz::Kernel) static std::uint8_t k[sizeof(oz::Kernel)];
 alignas(16) static std::uint8_t stack[1024 * 1024 * 2];
 
 namespace oz {
@@ -111,9 +111,14 @@ extern "C" void kernel_main(oz_boot::PlatformInfo* platformInfoPhys) {
     oz::x86_64::initIDTR();
 
     // 10. Initialize and run Kernel
-    setKernelPtr(static_cast<void*>(&k));
-    new (static_cast<void*>(&k)) oz::Kernel{platformInfo};
-    reinterpret_cast<oz::Kernel*>(&k)->run();
+    // setKernelPtr(static_cast<void*>(&k));
+    struct Settings {
+        using FrameManager = oz::x86_64::FrameManager;
+    };
+    using KStorage = oz::KernelStorage<Settings>;
+    new (&KStorage::kernel_storage.kernel) KStorage::Kernel{platformInfo};
+    // reinterpret_cast<KStorage::Kernel*>(&k)->run();
+    KStorage::kernel_storage.kernel.run();
 
     while (1) __asm__ volatile("hlt");
 }

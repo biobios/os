@@ -27,7 +27,7 @@ namespace oz {
 // 0xffffffffa0000000 ~ 0xffffffffe0000000 : カーネルモジュール領域 (1GB)
 // 0xffffffffe0000000 ~ 0xffffffffffffffff : reserved (512MB)
 
-template <frame_manager FrameManager>
+template <frame_manager_accessor Accessor>
 class PageTableManager : public PhysicalAddressProvider {
 public:
     struct TranslateResult {
@@ -38,13 +38,13 @@ public:
 
 private:
     PageTable* pml4_table; // Direct-mapped virtual pointer to PML4
-    FrameManager* frame_manager;
 
 public:
-    PageTableManager(PageTable* pml4_virt, FrameManager* fm = nullptr)
-        : pml4_table(pml4_virt), frame_manager(fm) {}
+    PageTableManager(PageTable* pml4_virt)
+        : pml4_table(pml4_virt) {}
 
     bool mapPage(std::uintptr_t virt_addr, PhysicalAddress<void> phys_addr, PageFlags flags) {
+        constexpr auto& frame_manager = Accessor::getFrameManager();
         if (!pml4_table) return false;
 
         std::size_t pml4_idx = paging::pml4Index(virt_addr);
@@ -54,12 +54,11 @@ public:
 
         // PML4 entry
         if (!(*pml4_table)[pml4_idx].isPresent()) {
-            if (!frame_manager) return false;
-            PageBlock block = frame_manager->allocateBlock(0);
+            PageBlock block = frame_manager.allocateBlock(0);
             if (!block) return false;
             block.setOwner(PageOwnerType::PAGE_TABLE);
 
-            PhysicalAddress<PageTable> pdpt_phys = physical_address_cast<PageTable>(frame_manager->getPhysicalAddress(block));
+            PhysicalAddress<PageTable> pdpt_phys = physical_address_cast<PageTable>(frame_manager.getPhysicalAddress(block));
             PageTable* pdpt_virt = phys_to_virt(pdpt_phys);
             pdpt_virt->clear();
 
@@ -70,12 +69,11 @@ public:
 
         // PDPT entry
         if (!(*pdpt)[pdpt_idx].isPresent()) {
-            if (!frame_manager) return false;
-            PageBlock block = frame_manager->allocateBlock(0);
+            PageBlock block = frame_manager.allocateBlock(0);
             if (!block) return false;
             block.setOwner(PageOwnerType::PAGE_TABLE);
 
-            PhysicalAddress<PageTable> pd_phys = physical_address_cast<PageTable>(frame_manager->getPhysicalAddress(block));
+            PhysicalAddress<PageTable> pd_phys = physical_address_cast<PageTable>(frame_manager.getPhysicalAddress(block));
             PageTable* pd_virt = phys_to_virt(pd_phys);
             pd_virt->clear();
 
@@ -86,12 +84,11 @@ public:
 
         // PD entry
         if (!(*pd)[pd_idx].isPresent()) {
-            if (!frame_manager) return false;
-            PageBlock block = frame_manager->allocateBlock(0);
+            PageBlock block = frame_manager.allocateBlock(0);
             if (!block) return false;
             block.setOwner(PageOwnerType::PAGE_TABLE);
 
-            PhysicalAddress<PageTable> pt_phys = physical_address_cast<PageTable>(frame_manager->getPhysicalAddress(block));
+            PhysicalAddress<PageTable> pt_phys = physical_address_cast<PageTable>(frame_manager.getPhysicalAddress(block));
             PageTable* pt_virt = phys_to_virt(pt_phys);
             pt_virt->clear();
 
@@ -172,7 +169,6 @@ public:
     }
 
     PageTable* getPML4() const { return pml4_table; }
-    void setFrameManager(FrameManager* fm) { frame_manager = fm; }
 };
 
 } // namespace oz

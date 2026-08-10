@@ -1,8 +1,8 @@
 #include "utils.hpp"
-#include "Kernel.hpp"
+#include "Shell.hpp"
 
 namespace {
-    oz::Kernel* kernelPtr;
+oz::Shell* sh;
 }
 
 void oz::utils::to_hex(std::uint64_t num, char* str) {
@@ -21,37 +21,37 @@ void oz::utils::to_hex(std::uint64_t num, char* str) {
     str[2*sizeof(num)] = '\0';
 }
 
-void setKernelPtr(void* k) {
-    kernelPtr = reinterpret_cast<oz::Kernel*>(k);
+void setShellPtr(oz::Shell* shell) {
+    sh = shell;
 }
 
-void dprint(const char* str) { kernelPtr->sh.printString(str); }
+void dprint(const char* str) { sh->printString(str); }
 
-void write(const char* str) {
-    kernelPtr->g.clearScreen();
+// void write(const char* str) {
+//     kernelPtr->g.clearScreen();
     
-    std::uint64_t x = 0;
-    while(*str != '\0'){
-        switch (*str)
-        {
-        case '\r':
-        case '\n':
-            break;
-        default:
-            if((*str < ' ') || (*str > '~'))break;
-            kernelPtr->g.drawCharacter(*str, x, 0);
-            x += 8 + LETTER_SPACING;
-            break;
-        }
-        str++;
-    }
-}
+//     std::uint64_t x = 0;
+//     while(*str != '\0'){
+//         switch (*str)
+//         {
+//         case '\r':
+//         case '\n':
+//             break;
+//         default:
+//             if((*str < ' ') || (*str > '~'))break;
+//             kernelPtr->g.drawCharacter(*str, x, 0);
+//             x += 8 + LETTER_SPACING;
+//             break;
+//         }
+//         str++;
+//     }
+// }
 
 void abort() {
 
     dprint("abort");
 
-    kernelPtr->sh.repaint();
+    sh->repaint();
 
     while(true){
         __asm__ volatile("hlt");

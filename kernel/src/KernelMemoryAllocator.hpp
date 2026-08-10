@@ -7,7 +7,7 @@
 
 namespace oz {
 
-template <frame_manager FrameManager>
+template <frame_manager_accessor Accessor>
 class TLSFMemoryAllocator : public IKernelMemoryAllocator {
 private:
     struct BoundaryTag {
@@ -108,7 +108,6 @@ private:
     std::size_t framePerChunk;
     std::size_t max_size_of_block;
     std::size_t min_size_of_block;
-    FrameManager* frameManager;
 
     std::size_t convertTLItoLinearIndex(TLI& tli) {
         return (tli[0] << max_log2_SLI) + tli[1];
@@ -148,17 +147,18 @@ private:
     }
 
     BoundaryTag* newBlock() {
+        constexpr auto& frameManager = Accessor::getFrameManager();
         std::uint8_t level = 0;
         while ((1ULL << level) < framePerChunk) {
             level++;
         }
-        PageBlock block = frameManager->allocateBlock(level);
+        PageBlock block = frameManager.allocateBlock(level);
         if (!block) return nullptr;
         block.setOwner(PageOwnerType::KMALLOCATOR);
 
         BoundaryTag* ret =
-            reinterpret_cast<BoundaryTag*>(oz::phys_to_virt(frameManager->getPhysicalAddress(block)));
-        std::size_t size = (frameManager->FRAME_SIZE << level) -
+            reinterpret_cast<BoundaryTag*>(oz::phys_to_virt(frameManager.getPhysicalAddress(block)));
+        std::size_t size = (frameManager.FRAME_SIZE << level) -
                            (sizeof(BoundaryTag::back_size_and_flags) +
                             sizeof(BoundaryTag::size_and_flags));
         ret->setSize(size);
@@ -169,26 +169,28 @@ private:
     }
 
     BoundaryTag* mallocLarge(std::size_t size) {
+        constexpr auto& frameManager = Accessor::getFrameManager();
         std::size_t totalBytes = size + sizeof(BoundaryTag::back_size_and_flags) + sizeof(BoundaryTag::size_and_flags);
-        std::size_t numFrames = (totalBytes + frameManager->FRAME_SIZE - 1) / frameManager->FRAME_SIZE;
+        std::size_t numFrames = (totalBytes + frameManager.FRAME_SIZE - 1) / frameManager.FRAME_SIZE;
         std::uint8_t level = 0;
         while ((1ULL << level) < numFrames) {
             level++;
         }
-        PageBlock block = frameManager->allocateBlock(level);
+        PageBlock block = frameManager.allocateBlock(level);
         if (!block) return nullptr;
         block.setOwner(PageOwnerType::KMALLOCATOR);
 
         BoundaryTag* ret =
-            reinterpret_cast<BoundaryTag*>(oz::phys_to_virt(frameManager->getPhysicalAddress(block)));
+            reinterpret_cast<BoundaryTag*>(oz::phys_to_virt(frameManager.getPhysicalAddress(block)));
         ret->frameDescriptorPtr = block.getDescriptor();
         ret->size_and_flags = (static_cast<std::uint64_t>(level) << 4) | BoundaryTag::isLarge;
         return ret;
     }
 
     void freeLarge(BoundaryTag* returnedBlock) {
+        constexpr auto& frameManager = Accessor::getFrameManager();
         PageFrameDescriptor* pfd = returnedBlock->frameDescriptorPtr;
-        frameManager->freeBlock(pfd);
+        frameManager.freeBlock(pfd);
     }
 
     void checkAndClearBitMap(std::size_t linearIndex) {
@@ -222,29 +224,29 @@ private:
     }
 
 public:
-    TLSFMemoryAllocator(FrameManager* fm, std::size_t _framePerChunk = 1, std::size_t _max_Log2_SLI = 5)
+    TLSFMemoryAllocator(std::size_t _framePerChunk = 1, std::size_t _max_Log2_SLI = 5)
         : max_log2_SLI{_max_Log2_SLI},
-          framePerChunk{_framePerChunk},
-          frameManager{fm} {
-        TLI max_tli = convertSizeToTLI(fm->FRAME_SIZE * framePerChunk);
+          framePerChunk{_framePerChunk} {
+        constexpr auto& fm = Accessor::getFrameManager();
+        TLI max_tli = convertSizeToTLI(fm.FRAME_SIZE * framePerChunk);
         std::size_t needTableSize = convertTLItoLinearIndex(max_tli) + 1;
 
         std::size_t needTableBytes = needTableSize * sizeof(FreeList);
         std::size_t needFrameForTable =
-            (needTableBytes + fm->FRAME_SIZE - 1) / fm->FRAME_SIZE;
+            (needTableBytes + fm.FRAME_SIZE - 1) / fm.FRAME_SIZE;
         std::uint8_t level = 0;
         while ((1ULL << level) < needFrameForTable) {
             level++;
         }
-        PageBlock block = fm->allocateBlock(level);
+        PageBlock block = fm.allocateBlock(level);
         block.setOwner(PageOwnerType::KMALLOCATOR);
-        tlsf_table = reinterpret_cast<FreeList*>(oz::phys_to_virt(fm->getPhysicalAddress(block)));
+        tlsf_table = reinterpret_cast<FreeList*>(oz::phys_to_virt(fm.getPhysicalAddress(block)));
 
         for (std::size_t i = 0; i < needTableSize; i++) {
             tlsf_table[i].link = nullptr;
         }
 
-        max_size_of_block = fm->FRAME_SIZE * framePerChunk -
+        max_size_of_block = fm.FRAME_SIZE * framePerChunk -
                             (sizeof(BoundaryTag::back_size_and_flags) +
                              sizeof(BoundaryTag::size_and_flags));
         min_size_of_block = sizeof(BoundaryTag);

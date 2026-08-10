@@ -11,26 +11,25 @@
 
 namespace oz {
 
-template <frame_manager FrameManager>
+template <frame_manager_accessor Accessor>
 class AddressSpace {
 private:
     PageTable* pml4_virt;
     PhysicalAddress<PageTable> pml4_phys;
-    FrameManager* frame_manager;
-    PageTableManager<FrameManager> pt_manager;
+    PageTableManager<Accessor> pt_manager;
 
 public:
-    AddressSpace(PageTable* pml4_v, PhysicalAddress<PageTable> pml4_p, FrameManager* fm = nullptr)
-        : pml4_virt(pml4_v), pml4_phys(pml4_p), frame_manager(fm), pt_manager(pml4_v, fm) {}
+    AddressSpace(PageTable* pml4_v, PhysicalAddress<PageTable> pml4_p)
+        : pml4_virt(pml4_v), pml4_phys(pml4_p), pt_manager(pml4_v) {}
 
-    static AddressSpace* createProcessSpace(FrameManager* fm, const AddressSpace& kernel_space) {
-        if (!fm) return nullptr;
+    static AddressSpace* createProcessSpace(const AddressSpace& kernel_space) {
+        constexpr auto& fm = Accessor::getFrameManager();
 
         PageBlock pml4_block = fm->allocateBlock(0);
         if (!pml4_block) return nullptr;
         pml4_block.setOwner(PageOwnerType::PAGE_TABLE);
 
-        PhysicalAddress<PageTable> new_pml4_phys = physical_address_cast<PageTable>(fm->getPhysicalAddress(pml4_block));
+        PhysicalAddress<PageTable> new_pml4_phys = physical_address_cast<PageTable>(fm.getPhysicalAddress(pml4_block));
         PageTable* new_pml4_virt = phys_to_virt(new_pml4_phys);
         const PageTable* k_pml4_virt = kernel_space.getVirtualPML4();
 
@@ -45,15 +44,15 @@ public:
         }
 
         // Allocate AddressSpace object structure
-        PageBlock as_block = fm->allocateBlock(0);
+        PageBlock as_block = fm.allocateBlock(0);
         if (!as_block) {
-            fm->freeBlock(pml4_block);
+            fm.freeBlock(pml4_block);
             return nullptr;
         }
         as_block.setOwner(PageOwnerType::OTHER);
 
         AddressSpace* new_as = reinterpret_cast<AddressSpace*>(phys_to_virt(fm->getPhysicalAddress(as_block)));
-        new (static_cast<void*>(new_as)) AddressSpace(new_pml4_virt, new_pml4_phys, fm);
+        new (static_cast<void*>(new_as)) AddressSpace(new_pml4_virt, new_pml4_phys);
         return new_as;
     }
 
@@ -79,11 +78,7 @@ public:
 
     PhysicalAddress<PageTable> getPhysicalPML4() const { return pml4_phys; }
     PageTable* getVirtualPML4() const { return pml4_virt; }
-    PageTableManager<FrameManager>& getPageTableManager() { return pt_manager; }
-    void setFrameManager(FrameManager* fm) {
-        frame_manager = fm;
-        pt_manager.setFrameManager(fm);
-    }
+    PageTableManager<Accessor>& getPageTableManager() { return pt_manager; }
 };
 
 } // namespace oz
