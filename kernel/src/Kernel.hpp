@@ -6,7 +6,6 @@
 #include "Graphics.hpp"
 #include "KernelMemoryAllocator.hpp"
 #include "IKernelMemoryAllocator.hpp"
-#include "oznew.hpp"
 #include "PageTable.hpp"
 #include "PageTableManager.hpp"
 #include "paging.hpp"
@@ -91,7 +90,6 @@ KernelStorage<KernelSettings>::Kernel::Kernel(oz_boot::PlatformInfo* platformInf
     , pt_manager(getMasterPML4())
     , kernel_space(getMasterPML4(), createPhysicalAddress<PageTable>(reinterpret_cast<std::uintptr_t>(getMasterPML4()) - oz::KERNEL_VIRT_OFFSET))
 {
-    setMemoryAllocator(&k_malloc);
 }
 
 template <typename KernelSettings>
