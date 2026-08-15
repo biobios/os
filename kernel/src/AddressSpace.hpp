@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include <utility>
 #include "Address.hpp"
 #include "IFrameManager.hpp"
 #include "MemoryFlags.hpp"
@@ -9,18 +10,34 @@
 namespace oz {
 
 template <frame_manager_accessor Accessor, typename ArchContext = x86_64AddressSpaceContext<Accessor>>
-class AddressSpace {
+class KernelAddressSpace {
 private:
     ArchContext arch_ctx;
 
 public:
     template <typename... Args>
-    AddressSpace(Args&&... args) : arch_ctx(std::forward<Args>(args)...) {}
+    explicit KernelAddressSpace(Args&&... args) : arch_ctx(std::forward<Args>(args)...) {}
 
-    static AddressSpace* createProcessSpace(const AddressSpace& kernel_space) {
+    void activate() const {
+        arch_ctx.activate();
+    }
+
+    ArchContext& getArchContext() { return arch_ctx; }
+    const ArchContext& getArchContext() const { return arch_ctx; }
+};
+
+template <frame_manager_accessor Accessor, typename ArchContext = x86_64AddressSpaceContext<Accessor>>
+class ProcessAddressSpace {
+private:
+    ArchContext arch_ctx;
+
+public:
+    explicit ProcessAddressSpace(ArchContext ctx) : arch_ctx(std::move(ctx)) {}
+
+    static ProcessAddressSpace* create(const KernelAddressSpace<Accessor, ArchContext>& kernel_space) {
         constexpr auto& fm = Accessor::getFrameManager();
 
-        ArchContext new_ctx = ArchContext::cloneProcessSpace(kernel_space.arch_ctx);
+        ArchContext new_ctx = ArchContext::cloneProcessSpace(kernel_space.getArchContext());
         if (!new_ctx.isValid()) {
             return nullptr;
         }
@@ -33,8 +50,8 @@ public:
         }
         as_block.setOwner(PageOwnerType::OTHER);
 
-        AddressSpace* new_as = reinterpret_cast<AddressSpace*>(phys_to_virt(fm.getPhysicalAddress(as_block)));
-        new (static_cast<void*>(new_as)) AddressSpace(new_ctx);
+        ProcessAddressSpace* new_as = reinterpret_cast<ProcessAddressSpace*>(phys_to_virt(fm.getPhysicalAddress(as_block)));
+        new (static_cast<void*>(new_as)) ProcessAddressSpace(std::move(new_ctx));
         return new_as;
     }
 

@@ -61,12 +61,12 @@ struct KernelStorage {
         Settings::FrameManager fm;
         Settings::KernelMemoryAllocator k_malloc;
         PageTableManager<KernelAccessor> pt_manager;
-        AddressSpace<KernelAccessor> kernel_space;
+        KernelAddressSpace<KernelAccessor> kernel_space;
 
         Kernel(oz_boot::PlatformInfo* platformInfo);
         void run();
 
-        AddressSpace<KernelAccessor>& getKernelSpace() { return kernel_space; }
+        KernelAddressSpace<KernelAccessor>& getKernelSpace() { return kernel_space; }
         PageTableManager<KernelAccessor>& getPageTableManager() { return pt_manager; }
         Settings::FrameManager& getFrameManager() { return fm; }
     };
