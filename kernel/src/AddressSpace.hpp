@@ -6,6 +6,7 @@
 #include "IFrameManager.hpp"
 #include "MemoryFlags.hpp"
 #include "x86_64AddressSpaceContext.hpp"
+#include "IKernelMemoryAllocator.hpp"
 
 namespace oz {
 
@@ -34,24 +35,16 @@ private:
 public:
     explicit ProcessAddressSpace(ArchContext ctx) : arch_ctx(std::move(ctx)) {}
 
-    static ProcessAddressSpace* create(const KernelAddressSpace<Accessor, ArchContext>& kernel_space) {
-        constexpr auto& fm = Accessor::getFrameManager();
-
+    static kmalloc_unique_ptr<ProcessAddressSpace, Accessor> create(const KernelAddressSpace<Accessor, ArchContext>& kernel_space) {
         ArchContext new_ctx = ArchContext::cloneProcessSpace(kernel_space.getArchContext());
         if (!new_ctx.isValid()) {
             return nullptr;
         }
 
-        // Allocate AddressSpace object structure
-        PageBlock as_block = fm.allocateBlock(0);
-        if (!as_block) {
+        auto new_as = make_kmalloc_unique<ProcessAddressSpace, Accessor>(std::move(new_ctx));
+        if (!new_as) {
             new_ctx.destroyProcessSpace();
-            return nullptr;
         }
-        as_block.setOwner(PageOwnerType::OTHER);
-
-        ProcessAddressSpace* new_as = reinterpret_cast<ProcessAddressSpace*>(phys_to_virt(fm.getPhysicalAddress(as_block)));
-        new (static_cast<void*>(new_as)) ProcessAddressSpace(std::move(new_ctx));
         return new_as;
     }
 
