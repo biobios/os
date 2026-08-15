@@ -4,6 +4,7 @@
 #include "Address.hpp"
 #include "FrameManager.hpp"
 #include "Kernel.hpp"
+#include "KernelMemoryAllocator.hpp"
 #include "PageTable.hpp"
 #include "bootStructures.hpp"
 #include "utils.hpp"
@@ -89,6 +90,12 @@ public:
     }
 };
 
+struct Settings {
+    using FrameManager = oz::x86_64::FrameManager;
+    template <typename Accessor>
+    using KernelMemoryAllocatorFunctor = oz::TLSFMemoryAllocator<Accessor>;
+};
+
 extern "C" void kernel_main(oz_boot::PlatformInfo* platformInfoPhys) {
     // 6. Convert PlatformInfo pointer to direct map virtual address
     oz_boot::PlatformInfo* platformInfo = oz::phys_to_virt(BootInfoProvider::getPhys(platformInfoPhys));
@@ -112,9 +119,6 @@ extern "C" void kernel_main(oz_boot::PlatformInfo* platformInfoPhys) {
 
     // 10. Initialize and run Kernel
     // setKernelPtr(static_cast<void*>(&k));
-    struct Settings {
-        using FrameManager = oz::x86_64::FrameManager;
-    };
     using KStorage = oz::KernelStorage<Settings>;
     new (&KStorage::kernel_storage.kernel) KStorage::Kernel{platformInfo};
     // reinterpret_cast<KStorage::Kernel*>(&k)->run();

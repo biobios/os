@@ -9,7 +9,33 @@
 void operator delete(void* ptr) noexcept;//1
 [[nodiscard]] void* operator new[](std::size_t size);
 void operator delete[](void* ptr) noexcept;
-void setMemoryAllocator(oz::IKernelMemoryAllocator* allocator);
+
+class KernelMemoryAllocatorBase {
+public:
+    virtual void* malloc(std::size_t size) = 0;
+    virtual void free(void* ptr) = 0;
+};
+
+template <oz::kernel_memory_allocator T>
+class KernelMemoryAllocator : public KernelMemoryAllocatorBase {
+    T* allocator;
+public:
+    KernelMemoryAllocator(T* alloc) : allocator(alloc) {}
+    void* malloc(std::size_t size) override {
+        return allocator->malloc(size);
+    }
+    void free(void* ptr) override {
+        allocator->free(ptr);
+    }
+};
+
+void setKernelMemoryAllocator(KernelMemoryAllocatorBase* allocator);
+
+template <oz::kernel_memory_allocator T>
+void setMemoryAllocator(T* allocator) {
+    static KernelMemoryAllocator<T> kernelAllocator(allocator);
+    setKernelMemoryAllocator(&kernelAllocator);
+}
 
 // namespace oz{
 //     template<std::size_t page_size, std::size_t pagePerChunk = 1, std::size_t LogBase2OfDivisionNum = 5>

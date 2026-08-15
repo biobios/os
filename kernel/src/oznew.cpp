@@ -193,7 +193,7 @@
 // }
 
 namespace {
-    oz::IKernelMemoryAllocator* allocator;
+    KernelMemoryAllocatorBase* allocator;
 }
 
 void* operator new(std::size_t size) {
@@ -208,5 +208,5 @@ void* operator new[](std::size_t size) {
 void operator delete[](void* ptr) noexcept {
     allocator->free(ptr);
 }
-void setMemoryAllocator(oz::IKernelMemoryAllocator* al) { allocator = al; }
+void setKernelMemoryAllocator(KernelMemoryAllocatorBase* al) { allocator = al; }
 // void operator delete(void* ptr, void*)noexcept{}

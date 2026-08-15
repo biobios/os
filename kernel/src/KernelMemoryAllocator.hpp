@@ -1,14 +1,13 @@
 #pragma once
 #include <array>
 #include "Address.hpp"
-#include "IKernelMemoryAllocator.hpp"
 #include "IFrameManager.hpp"
 #include "utils.hpp"
 
 namespace oz {
 
 template <frame_manager_accessor Accessor>
-class TLSFMemoryAllocator : public IKernelMemoryAllocator {
+class TLSFMemoryAllocator {
 private:
     struct BoundaryTag {
         union {
@@ -252,7 +251,7 @@ public:
         min_size_of_block = sizeof(BoundaryTag);
     }
 
-    void* malloc(std::size_t size) override {
+    void* malloc(std::size_t size) {
         size = (size + sizeof(BoundaryTag::size_and_flags) + 15) &
                ~(0b1111);  // 16Byte align
         if (size < min_size_of_block) {
@@ -324,7 +323,7 @@ public:
         }
     }
 
-    void free(void* ptr) override {
+    void free(void* ptr) {
         if (ptr == nullptr) return;
 
         BoundaryTag* retBlock = reinterpret_cast<BoundaryTag*>(
