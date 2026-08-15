@@ -1,8 +1,25 @@
-.PHONY: run
+# Wrapper Makefile for CMake convenience
 
-run:
-	qemu-system-x86_64 -s -S -m 4G -M q35 -device qemu-xhci,id=xhci -bios /usr/share/ovmf/OVMF.fd -hda ./hdd.img &
+BUILD_DIR ?= build
 
-hdd.img:
-	qemu-img create -f raw hdd.img 200M
-	mkfs.fat -n 'OZ OS' -s 2 -f 2 -R 32 -F 32 hdd.img
+.PHONY: all build image run run-debug clean
+
+all: build
+
+build: $(BUILD_DIR)/CMakeCache.txt
+	cmake --build $(BUILD_DIR)
+
+image: $(BUILD_DIR)/CMakeCache.txt
+	cmake --build $(BUILD_DIR) --target image
+
+run: $(BUILD_DIR)/CMakeCache.txt
+	cmake --build $(BUILD_DIR) --target run
+
+run-debug: $(BUILD_DIR)/CMakeCache.txt
+	cmake --build $(BUILD_DIR) --target run-debug
+
+clean:
+	rm -rf $(BUILD_DIR)
+
+$(BUILD_DIR)/CMakeCache.txt:
+	cmake -S . -B $(BUILD_DIR)
