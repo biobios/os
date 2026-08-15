@@ -11,7 +11,7 @@ void setInterruptDescriptor(std::uint8_t index, void* handler);
 void initIDTR();
 __attribute__((no_caller_saved_registers))
 void notifyEndOfInterrupt();
-void setPageMap(void* map);
+void setPageMap(const void* map);
 void enableSSE();
 std::uint8_t readIO8(std::uint16_t addr);
 std::uint16_t readIO16(std::uint16_t addr);

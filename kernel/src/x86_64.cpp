@@ -3,6 +3,8 @@
 #include <cstdint>
 #include <cstddef>
 
+#include "Address.hpp"
+
 namespace {
 const std::uint64_t gdt[] = {
     0x0000000000000000, /* NULL descriptor */
@@ -31,10 +33,10 @@ void oz::x86_64::initGDTR() {
         "movw $16, %%ax\n"
         "movw %%ax, %%ss\n"
         "pushq %[selector]\n"
-        "movq $ret_label, %[dummy]\n"
+        "leaq 1f(%%rip), %[dummy]\n"
         "pushq %[dummy]\n"
         "lretq\n"
-        "ret_label:"
+        "1:"
         : [dummy] "=r"(dummy)
         : [selector] "m"(selector)
         : "%ax");
@@ -86,13 +88,13 @@ void oz::x86_64::initIDTR() {
     __asm__ volatile("lidt %[idtr]" ::[idtr] "m"(idtr));
 }
 
-constexpr std::uint64_t END_OF_INTERRUPT_REGISTER_ADDR = 0xfee000b0;
+constexpr std::uint64_t END_OF_INTERRUPT_REGISTER_ADDR = oz::DIRECT_MAP_OFFSET + 0xfee000b0ULL;
 __attribute__((no_caller_saved_registers))
 void oz::x86_64::notifyEndOfInterrupt() {
     *reinterpret_cast<std::uint32_t*>(END_OF_INTERRUPT_REGISTER_ADDR) = 0;
 }
 
-void oz::x86_64::setPageMap(void* map) {
+void oz::x86_64::setPageMap(const void* map) {
     volatile std::uint64_t pBuf = reinterpret_cast<std::uint64_t>(map);
     __asm__ volatile(
         "movq %0, %%cr3"
@@ -165,7 +167,7 @@ void oz::x86_64::writeIO32(std::uint16_t addr, std::uint32_t value) {
     );
 }
 
-constexpr std::uint64_t localAPICIDPtr = 0xfee00020;
+constexpr std::uint64_t localAPICIDPtr = oz::DIRECT_MAP_OFFSET + 0xfee00020ULL;
 
 std::uint8_t oz::x86_64::getLocalAPICID() {
     return *reinterpret_cast<std::uint32_t*>(localAPICIDPtr) >> 24;

@@ -1,17 +1,7 @@
 #pragma once
+#include "PageTableManager.hpp"
 
-#include <cstdint>
-
-namespace oz{
-
-    constexpr std::uint64_t PAGE_DIRECTORY_COUNT = 64;
-
-    class alignas(4096) PageManager{
-        alignas(4096) std::uint64_t pml4_table[512];
-        alignas(4096) std::uint64_t pdp_table[512];
-        alignas(4096) std::uint64_t page_directory[PAGE_DIRECTORY_COUNT][512];
-    public:
-        PageManager();
-    };
-
+namespace oz {
+    template <frame_manager FrameManager>
+    using PageManager = PageTableManager<FrameManager>;
 }

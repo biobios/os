@@ -17,12 +17,15 @@ namespace binary_units{
     }
 
 }
+namespace oz {
+    class Shell;
+}
 
-void setKernelPtr(void* k);
+void setShellPtr(oz::Shell* k);
 
 void dprint(const char* str);
 
-void write(const char* str);
+// void write(const char* str);
 
 void abort();
 
