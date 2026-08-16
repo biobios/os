@@ -5,6 +5,7 @@
 #include <utility>
 #include <variant>
 #include "Address.hpp"
+#include "FlagClass.hpp"
 
 namespace oz {
 
@@ -18,18 +19,25 @@ enum class PageOwnerType : std::uint8_t {
     OTHER = 5,
 };
 
-namespace DescriptorFlags {
-    constexpr std::uint8_t NONE     = 0;
-    constexpr std::uint8_t FREE     = 1 << 0;
-    constexpr std::uint8_t HEAD     = 1 << 1;
-    constexpr std::uint8_t RESERVED = 1 << 2;
-}
+class DescriptorFlags : public utils::FlagClass<std::uint8_t, DescriptorFlags> {
+    constexpr explicit DescriptorFlags(std::uint8_t flags) : FlagClass(flags) {}
+public:
+    static const DescriptorFlags NONE;
+    static const DescriptorFlags FREE;
+    static const DescriptorFlags HEAD;
+    static const DescriptorFlags RESERVED;
+};
+
+inline constexpr DescriptorFlags DescriptorFlags::NONE     = DescriptorFlags(0);
+inline constexpr DescriptorFlags DescriptorFlags::FREE     = DescriptorFlags(1 << 0);
+inline constexpr DescriptorFlags DescriptorFlags::HEAD     = DescriptorFlags(1 << 1);
+inline constexpr DescriptorFlags DescriptorFlags::RESERVED = DescriptorFlags(1 << 2);
 
 struct alignas(32) PageFrameDescriptor {
     std::uint8_t ownerData[24];
     std::uint8_t level;
     PageOwnerType ownerType;
-    std::uint8_t flags;
+    DescriptorFlags flags;
     std::uint8_t reserved[5];
 };
 

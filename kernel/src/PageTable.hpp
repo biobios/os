@@ -4,52 +4,38 @@
 #include <cstdint>
 #include "Address.hpp"
 
+#include "FlagClass.hpp"
+
 namespace oz {
 
-enum class PageFlags : std::uint64_t {
-    None         = 0,
-    Present      = 1ULL << 0,
-    Writable     = 1ULL << 1,
-    User         = 1ULL << 2,
-    WriteThrough = 1ULL << 3,
-    CacheDisable = 1ULL << 4,
-    Accessed     = 1ULL << 5,
-    Dirty        = 1ULL << 6,
-    HugePage     = 1ULL << 7,
-    Global       = 1ULL << 8,
-    NoExecute    = 1ULL << 63
+class PageFlags : public utils::FlagClass<std::uint64_t, PageFlags> {
+public:
+    constexpr explicit PageFlags(std::uint64_t flags) : FlagClass(flags) {}
+
+    static const PageFlags None;
+    static const PageFlags Present;
+    static const PageFlags Writable;
+    static const PageFlags User;
+    static const PageFlags WriteThrough;
+    static const PageFlags CacheDisable;
+    static const PageFlags Accessed;
+    static const PageFlags Dirty;
+    static const PageFlags HugePage;
+    static const PageFlags Global;
+    static const PageFlags NoExecute;
 };
 
-constexpr PageFlags operator|(PageFlags a, PageFlags b) {
-    return static_cast<PageFlags>(static_cast<std::uint64_t>(a) | static_cast<std::uint64_t>(b));
-}
-
-constexpr PageFlags operator&(PageFlags a, PageFlags b) {
-    return static_cast<PageFlags>(static_cast<std::uint64_t>(a) & static_cast<std::uint64_t>(b));
-}
-
-constexpr PageFlags operator~(PageFlags a) {
-    return static_cast<PageFlags>(~static_cast<std::uint64_t>(a));
-}
-
-constexpr PageFlags operator^(PageFlags a, PageFlags b) {
-    return static_cast<PageFlags>(static_cast<std::uint64_t>(a) ^ static_cast<std::uint64_t>(b));
-}
-
-constexpr PageFlags& operator|=(PageFlags& a, PageFlags b) {
-    a = a | b;
-    return a;
-}
-
-constexpr PageFlags& operator&=(PageFlags& a, PageFlags b) {
-    a = a & b;
-    return a;
-}
-
-constexpr PageFlags& operator^=(PageFlags& a, PageFlags b) {
-    a = a ^ b;
-    return a;
-}
+inline constexpr PageFlags PageFlags::None         = PageFlags(0);
+inline constexpr PageFlags PageFlags::Present      = PageFlags(1ULL << 0);
+inline constexpr PageFlags PageFlags::Writable     = PageFlags(1ULL << 1);
+inline constexpr PageFlags PageFlags::User         = PageFlags(1ULL << 2);
+inline constexpr PageFlags PageFlags::WriteThrough = PageFlags(1ULL << 3);
+inline constexpr PageFlags PageFlags::CacheDisable = PageFlags(1ULL << 4);
+inline constexpr PageFlags PageFlags::Accessed     = PageFlags(1ULL << 5);
+inline constexpr PageFlags PageFlags::Dirty        = PageFlags(1ULL << 6);
+inline constexpr PageFlags PageFlags::HugePage     = PageFlags(1ULL << 7);
+inline constexpr PageFlags PageFlags::Global       = PageFlags(1ULL << 8);
+inline constexpr PageFlags PageFlags::NoExecute    = PageFlags(1ULL << 63);
 
 struct PageTableEntry {
     std::uint64_t value;
