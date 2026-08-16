@@ -30,31 +30,28 @@ struct SystemDescriptionTableHeader {
     }
 };
 
-struct Byte8AlignedBy4 {
-    std::uint32_t lowerData;
-    std::uint32_t upperData;
-    std::uint64_t getData() {
-        return (static_cast<std::uint64_t>(this->upperData) << 32) |
-               static_cast<std::uint64_t>(this->lowerData);
+struct RootSystemDescriptionTable {
+    SystemDescriptionTableHeader SDTH;
+
+    std::uint32_t getEntry(std::size_t index) const {
+        return reinterpret_cast<const std::uint32_t*>(this + 1)[index];
+    }
+    std::size_t size() const {
+        std::size_t length = SDTH.Length - sizeof(SystemDescriptionTableHeader);
+        return length / sizeof(std::uint32_t);
     }
 };
 
 struct ExtendedSystemDescriptionTable {
     SystemDescriptionTableHeader SDTH;
-    SystemDescriptionTableHeader* getEntry(std::size_t index) {
-        Byte8AlignedBy4* entry = reinterpret_cast<Byte8AlignedBy4*>(
-            reinterpret_cast<std::uint8_t*>(this) +
-            sizeof(SystemDescriptionTableHeader));
-
-        entry += index;
-        return reinterpret_cast<SystemDescriptionTableHeader*>(
-            entry->getData());
+    
+    std::uint64_t getEntry(std::size_t index) const {
+        const std::uint32_t* entries = reinterpret_cast<const std::uint32_t*>(this + 1) + (2 * index);
+        return static_cast<std::uint64_t>(entries[0]) | (static_cast<std::uint64_t>(entries[1]) << 32);
     }
-
-    std::size_t size() {
-        std::uint32_t length =
-            this->SDTH.Length - sizeof(SystemDescriptionTableHeader);
-        return length / sizeof(Byte8AlignedBy4);
+    std::size_t size() const {
+        std::size_t length = SDTH.Length - sizeof(SystemDescriptionTableHeader);
+        return length / (sizeof(std::uint64_t));
     }
 };
 

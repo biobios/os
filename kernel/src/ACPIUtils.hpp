@@ -1,34 +1,26 @@
 #pragma once
 
 #include "ACPI.hpp"
-#include "PCIe.hpp"
+#include "Address.hpp"
 
 namespace ACPIUtils {
-struct ExtendedSystemDescriptionTableWrapper
-    : public ACPI::ExtendedSystemDescriptionTable {
+class ExtendedSystemDescriptionTableWrapper : public oz::PhysicalAddressProvider {
+    ACPI::ExtendedSystemDescriptionTable* table;
    public:
+    ExtendedSystemDescriptionTableWrapper(ACPI::ExtendedSystemDescriptionTable* table) : table(table) {}
     template <typename T>
-    T* getTable();
-
-    template <>
-    PCIe::MemorymappedConfigurationSpaceDescriptionTable*
-    getTable<PCIe::MemorymappedConfigurationSpaceDescriptionTable>() {
-        std::size_t size = this->size();
-        PCIe::MemorymappedConfigurationSpaceDescriptionTable* ret = nullptr;
+    T* getTable() {
+        std::size_t size = table->size();
+        T* ret = nullptr;
         for (std::size_t i = 0; i < size; i++) {
-            ACPI::SystemDescriptionTableHeader* entry = this->getEntry(i);
-            if (entry->sameSignature(
-                    reinterpret_cast<const std::uint8_t*>("MCFG"))) {
-                ret = reinterpret_cast<
-                    PCIe::MemorymappedConfigurationSpaceDescriptionTable*>(
-                    entry);
+            auto entryPhysPtr = createPhysicalAddress<ACPI::SystemDescriptionTableHeader>(table->getEntry(i));
+            ACPI::SystemDescriptionTableHeader* entry = oz::phys_to_virt(entryPhysPtr); 
+            if (entry->sameSignature(T::SIGNATURE)) {
+                ret = reinterpret_cast<T*>(entry);
                 break;
             }
         }
         return ret;
     }
-
-    static ExtendedSystemDescriptionTableWrapper* wrap(
-        ACPI::ExtendedSystemDescriptionTable* src);
 };
 }  // namespace ACPIUtils
