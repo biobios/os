@@ -31,6 +31,76 @@ struct DeviceContext {
     EndpointContext endpointContext[31];
 };
 
+struct InputControlContext {
+    std::uint32_t DropContextFlags;
+    std::uint32_t AddContextFlags;
+    std::uint32_t RsvdZ1[5];
+    std::uint8_t ConfigurationValue;
+    std::uint8_t InterfaceNumber;
+    std::uint8_t AlternateSetting;
+    std::uint8_t RsvdZ2;
+};
+
+struct InputContext {
+    InputControlContext inputControlContext;
+    SlotContext slotContext;
+    EndpointContext endpointContext[31];
+};
+
+enum class SlotState : std::uint8_t {
+    DisabledOrEnabled = 0,
+    Default = 1,
+    Addressed = 2,
+    Configured = 3,
+};
+
+enum class EndpointState : std::uint8_t {
+    Disabled = 0,
+    Running = 1,
+    Halted = 2,
+    Stopped = 3,
+    Error = 4,
+};
+
+enum class CompletionCode : std::uint8_t {
+    Invalid = 0,
+    Success = 1,
+    DataBufferError = 2,
+    BabbleDetectedError = 3,
+    USBTransactionError = 4,
+    TRBError = 5,
+    StallError = 6,
+    ResourceError = 7,
+    BandwidthError = 8,
+    NoSlotsAvailableError = 9,
+    InvalidStreamTypeError = 10,
+    SlotNotEnabledError = 11,
+    EndpointNotEnabledError = 12,
+    ShortPacket = 13,
+    RingUnderrun = 14,
+    RingOverrun = 15,
+    VFEventRingFullError = 16,
+    ParameterError = 17,
+    BandwidthOverrunError = 18,
+    ContextStateError = 19,
+    NoPingResponseError = 20,
+    EventRingFullError = 21,
+    IncompatibleDeviceError = 22,
+    MissedServiceError = 23,
+    CommandRingStopped = 24,
+    CommandAborted = 25,
+    Stopped = 26,
+    StoppedLengthInvalid = 27,
+    StoppedShortPacket = 28,
+    MaxExitLatencyTooLargeError = 29,
+    IsochBufferOverrun = 31,
+    EventLostError = 32,
+    UndefinedError = 33,
+    InvalidStreamIDError = 34,
+    SecondaryBandwidthError = 35,
+    SplitTransactionError = 36,
+};
+
 struct CapabilityRegisters {
     std::uint8_t capLength;
     std::uint8_t reserved;
@@ -44,12 +114,47 @@ struct CapabilityRegisters {
     std::uint32_t hccParams2;
 };
 
+namespace ExtendedCapability {
+constexpr std::uint32_t USBLegacySupport = 1;
+constexpr std::uint32_t SupportedProtocol = 2;
+constexpr std::uint32_t ExtendedPowerManagement = 3;
+constexpr std::uint32_t IOLocalization = 4;
+constexpr std::uint32_t MessageInterrupt = 5;
+constexpr std::uint32_t LocalMemory = 6;
+constexpr std::uint32_t USBDIAC = 7;
+constexpr std::uint32_t xHCIExtendedCapability = 10;
+}  // namespace ExtendedCapability
+
 struct HostControllerUSBPortRegisterSet {
     std::uint32_t PortStatusAndControl;
     std::uint32_t PortPowerManagementStatusAndControl;
     std::uint32_t PortLinkInfo;
     std::uint32_t PortHardwareLPMControl;
 };
+
+namespace PORTSC {
+constexpr std::uint32_t CurrentConnectStatus = 1 << 0;
+constexpr std::uint32_t PortEnabledDisabled = 1 << 1;
+constexpr std::uint32_t PortReset = 1 << 4;
+constexpr std::uint32_t PortLinkStateMask = 0b1111 << 5;
+constexpr std::uint32_t PortPower = 1 << 9;
+constexpr std::uint32_t PortSpeedMask = 0b1111 << 10;
+constexpr std::uint32_t PortIndicatorControlMask = 0b11 << 14;
+constexpr std::uint32_t PortLinkStateWriteStrobe = 1 << 16;
+constexpr std::uint32_t ConnectStatusChange = 1 << 17;
+constexpr std::uint32_t PortEnabledDisabledChange = 1 << 18;
+constexpr std::uint32_t WarmPortResetChange = 1 << 19;
+constexpr std::uint32_t OverCurrentChange = 1 << 20;
+constexpr std::uint32_t PortResetChange = 1 << 21;
+constexpr std::uint32_t PortLinkStateChange = 1 << 22;
+constexpr std::uint32_t PortConfigErrorChange = 1 << 23;
+constexpr std::uint32_t ColdAttachStatus = 1 << 24;
+constexpr std::uint32_t WakeOnConnectEnable = 1 << 25;
+constexpr std::uint32_t WakeOnDisconnectEnable = 1 << 26;
+constexpr std::uint32_t WakeOnOverCurrentEnable = 1 << 27;
+constexpr std::uint32_t DeviceRemovable = 1 << 30;
+constexpr std::uint32_t WarmPortReset = 1u << 31;
+}  // namespace PORTSC
 
 struct OperationalRegisters {
     std::uint32_t usbCommand;
@@ -344,6 +449,80 @@ struct EventData {
     std::uint16_t reserved;
     std::uint16_t InterrupterTarget;
     std::uint32_t TRBControl;
+};
+
+enum class Type : std::uint8_t {
+    Normal = 1,
+    SetupStage = 2,
+    DataStage = 3,
+    StatusStage = 4,
+    Isoch = 5,
+    Link = 6,
+    EventData = 7,
+    NoOp = 8,
+    EnableSlotCommand = 9,
+    DisableSlotCommand = 10,
+    AddressDeviceCommand = 11,
+    ConfigureEndpointCommand = 12,
+    EvaluateContextCommand = 13,
+    ResetEndpointCommand = 14,
+    StopEndpointCommand = 15,
+    SetTRDequeuePointerCommand = 16,
+    ResetDeviceCommand = 17,
+    ForceEventCommand = 18,
+    NegotiateBandwidthCommand = 19,
+    SetLatencyToleranceValueCommand = 20,
+    GetPortBandwidthCommand = 21,
+    ForceHeaderCommand = 22,
+    NoOpCommand = 23,
+    GetExtendedPropertyCommand = 24,
+    SetExtendedPropertyCommand = 25,
+    TransferEvent = 32,
+    CommandCompletionEvent = 33,
+    PortStatusChangeEvent = 34,
+    BandwidthRequestEvent = 35,
+    DoorbellEvent = 36,
+    HostControllerEvent = 37,
+    DeviceNotificationEvent = 38,
+    MFINDEXWrapEvent = 39,
+};
+
+union Any {
+    std::uint32_t data[4];
+    Dummy dummy;
+    Normal normal;
+    SetupStage setup_stage;
+    DataStage data_stage;
+    StatusStage status_stage;
+    Isoch isoch;
+    NoOp no_op;
+    TransferEvent transfer_event;
+    CommandCompletionEvent command_completion_event;
+    PortStatusChangeEvent port_status_change_event;
+    BandwidthRequestEvent bandwidth_request_event;
+    DoorbellEvent doorbell_event;
+    HostControllerEvent host_controller_event;
+    DeviceNotificationEvent device_notification_event;
+    MFINDEXWrapEvent mfindex_wrap_event;
+    NoOpCommand no_op_command;
+    EnableSlotCommand enable_slot_command;
+    DisableSlotCommand disable_slot_command;
+    AddressDeviceCommand address_device_command;
+    ConfigureEndpointCommand configure_endpoint_command;
+    EvaluateContextCommand evaluate_context_command;
+    ResetEndpointCommand reset_endpoint_command;
+    StopEndpointCommand stop_endpoint_command;
+    SetTRDequeuePointerCommand set_tr_dequeue_pointer_command;
+    ResetDeviceCommand reset_device_command;
+    ForceEventCommand force_event_command;
+    NegotiateBandwidthCommand negotiate_bandwidth_command;
+    SetLatencyToleranceValueCommand set_latency_tolerance_value_command;
+    GetPortBandwidthCommand get_port_bandwidth_command;
+    ForceHeaderCommand force_header_command;
+    GetExtendedPropertyCommand get_extended_property_command;
+    SetExtendedPropertyCommand set_extended_property_command;
+    Link link;
+    EventData event_data;
 };
 }  // namespace TRB
 }  // namespace xHCI
