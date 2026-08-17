@@ -56,6 +56,7 @@ if(QEMU_EXECUTABLE)
             -m ${QEMU_MEMORY}
             -M q35
             -device qemu-xhci,id=xhci
+            -device usb-kbd,bus=xhci.0
             -bios "${OVMF_PATH}"
             -hda "${HDD_IMAGE}"
         DEPENDS image
@@ -69,6 +70,7 @@ if(QEMU_EXECUTABLE)
             -m ${QEMU_MEMORY}
             -M q35
             -device qemu-xhci,id=xhci
+            -device usb-kbd,bus=xhci.0
             -bios "${OVMF_PATH}"
             -hda "${HDD_IMAGE}"
         DEPENDS image
