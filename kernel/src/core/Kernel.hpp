@@ -67,8 +67,6 @@ struct KernelStorage {
         PageTableManager<KernelAccessor> pt_manager;
         KernelAddressSpace<KernelAccessor> kernel_space;
         oz_boot::PlatformInfo* platform_info_;
-        void* xhci_{nullptr};
-        std::uint8_t xhci_buffer_[sizeof(xHCIUtils::Controller)];
 
         Kernel(oz_boot::PlatformInfo* platformInfo);
         void run();
@@ -107,6 +105,8 @@ void KernelStorage<KernelSettings>::Kernel::run() {
     g.clearScreen();
     sh.printString("Finish init\n\rStart Kernel in Higher-Half!\n\r");
     sh.repaint();
+
+    kmalloc_unique_ptr<xHCIUtils::Controller, KernelAccessor> xhci;
     
     if (platform_info_->RSDP) {
         ACPI::RootSystemDescriptionPointer* rsdp = reinterpret_cast<ACPI::RootSystemDescriptionPointer*>(platform_info_->RSDP);
@@ -122,8 +122,7 @@ void KernelStorage<KernelSettings>::Kernel::run() {
                 sh.printString("Found xHCI Controller! Initializing...\n\r");
                 sh.repaint();
                 
-                xHCIUtils::Controller* xhci = new (xhci_buffer_) xHCIUtils::Controller(xhci_func);
-                xhci_ = xhci;
+                xhci = make_kmalloc_unique<xHCIUtils::Controller, KernelAccessor>(xhci_func);
                 sh.printString("Initializing xHCI...\n\r");
                 
                 if (xhci->initialize(fm)) {
@@ -137,8 +136,7 @@ void KernelStorage<KernelSettings>::Kernel::run() {
     }
     
     while (1) {
-        if (xhci_) {
-            xHCIUtils::Controller* xhci = reinterpret_cast<xHCIUtils::Controller*>(xhci_);
+        if (xhci) {
             xhci->pollPorts();
             xhci->processEvents();
         }
