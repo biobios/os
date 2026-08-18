@@ -4,7 +4,7 @@
 
 namespace utils {
 template <typename FlagType, typename Derived>
-    requires std::is_integral_v<FlagType> && std::is_unsigned_v<FlagType>
+
 class FlagClass {
     FlagType flags;
     constexpr FlagClass(FlagType flags) : flags(flags) {}

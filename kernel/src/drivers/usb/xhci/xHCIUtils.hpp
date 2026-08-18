@@ -1,14 +1,48 @@
 #pragma once
 
-#include "drivers/usb/xHCI.hpp"
-#include "drivers/usb/xHCIRing.hpp"
+#include "drivers/usb/xhci/xHCI.hpp"
 #include "drivers/pci/PCIUtils.hpp"
 #include "memory/FrameManager.hpp"
 #include "drivers/usb/USB.hpp"
-#include "drivers/keyboard/HIDKeyboard.hpp"
+#include "drivers/usb/class/HIDKeyboardDriver.hpp"
 #include <cstdint>
+#include <cstddef>
 
-namespace xHCI {
+namespace xHCIUtils {
+
+class Ring {
+public:
+    Ring() : buf_(nullptr), ring_size_(0), cycle_bit_(1), enqueue_index_(0) {}
+    
+    void initialize(xHCI::TRB::Any volatile* buf, std::size_t size);
+    void push(const xHCI::TRB::Any& trb);
+    
+    xHCI::TRB::Any volatile* getBuffer() const { return buf_; }
+    std::uint32_t getCycleBit() const { return cycle_bit_; }
+    
+private:
+    xHCI::TRB::Any volatile* buf_;
+    std::size_t ring_size_;
+    std::uint32_t cycle_bit_;
+    std::size_t enqueue_index_;
+};
+
+class EventRing {
+public:
+    EventRing() : buf_(nullptr), ring_size_(0), cycle_bit_(1), dequeue_index_(0) {}
+    
+    void initialize(xHCI::TRB::Any volatile* buf, std::size_t size);
+    bool hasEvent();
+    xHCI::TRB::Any pop();
+    std::size_t getDequeueIndex() const { return dequeue_index_; }
+    xHCI::TRB::Any volatile* getBuffer() const { return buf_; }
+
+private:
+    xHCI::TRB::Any volatile* buf_;
+    std::size_t ring_size_;
+    std::uint32_t cycle_bit_;
+    std::size_t dequeue_index_;
+};
 
 enum class DeviceState : std::uint8_t {
     Blank = 0,
@@ -25,7 +59,7 @@ enum class DeviceState : std::uint8_t {
 struct Device {
     Ring transfer_rings[31];
     void* control_buffer;
-    InputContext* input_context;
+    xHCI::InputContext* input_context;
     std::uint8_t* report_buffer;
     std::uint8_t dci_interrupt_in;
     std::uint8_t config_value;
@@ -36,33 +70,27 @@ class Controller {
 public:
     Controller(PCIUtils::PCIFunction pci_function);
     
-    // コントローラの初期化（MMIOのマッピング、データ構造の割り当て、xHCの起動）
     bool initialize(oz::x86_64::FrameManager& fm);
-    
-    // イベントリングをポーリングし、発生したイベントを処理する
     void processEvents();
-    
-    // ポートの状態変化を監視し、デバイス接続時にリセットを発行する
     void pollPorts();
 
 private:
     PCIUtils::PCIFunction pci_function_;
-    CapabilityRegisters volatile* cap_regs_;
-    OperationalRegisters volatile* op_regs_;
-    RuntimeRegisters volatile* rt_regs_;
+    xHCI::CapabilityRegisters volatile* cap_regs_;
+    xHCI::OperationalRegisters volatile* op_regs_;
+    xHCI::RuntimeRegisters volatile* rt_regs_;
     std::uint32_t volatile* doorbell_regs_;
 
     Ring command_ring_;
     EventRing event_ring_;
 
-    std::uint64_t* dcbaa_; // Device Context Base Address Array
+    std::uint64_t* dcbaa_; 
     std::uint8_t max_ports_;
     oz::x86_64::FrameManager* fm_;
     
     Device devices_[256];
-    HID::Keyboard keyboard_;
+    USBClassDriver::HIDKeyboardDriver keyboard_driver_;
     
-    // ヘルパー関数
     void reset();
     void ringDoorbell(std::uint8_t target, std::uint8_t stream_id = 0);
     void issueEnableSlotCommand();
@@ -74,4 +102,4 @@ private:
     void issueKeyboardTransfer(std::uint8_t slot_id);
 };
 
-} // namespace xHCI
+} // namespace xHCIUtils

@@ -11,7 +11,7 @@
 #include "memory/paging.hpp"
 #include "shell/Shell.hpp"
 #include "core/bootStructures.hpp"
-#include "drivers/usb/xHCIController.hpp"
+#include "drivers/usb/xhci/xHCIUtils.hpp"
 #include "drivers/pci/PCIUtils.hpp"
 #include "hardware/ACPIUtils.hpp"
 #include "utils/utils.hpp"
@@ -68,7 +68,7 @@ struct KernelStorage {
         KernelAddressSpace<KernelAccessor> kernel_space;
         oz_boot::PlatformInfo* platform_info_;
         void* xhci_{nullptr};
-        std::uint8_t xhci_buffer_[sizeof(xHCI::Controller)];
+        std::uint8_t xhci_buffer_[sizeof(xHCIUtils::Controller)];
 
         Kernel(oz_boot::PlatformInfo* platformInfo);
         void run();
@@ -122,7 +122,7 @@ void KernelStorage<KernelSettings>::Kernel::run() {
                 sh.printString("Found xHCI Controller! Initializing...\n\r");
                 sh.repaint();
                 
-                xHCI::Controller* xhci = new (xhci_buffer_) xHCI::Controller(xhci_func);
+                xHCIUtils::Controller* xhci = new (xhci_buffer_) xHCIUtils::Controller(xhci_func);
                 xhci_ = xhci;
                 sh.printString("Initializing xHCI...\n\r");
                 
@@ -138,7 +138,7 @@ void KernelStorage<KernelSettings>::Kernel::run() {
     
     while (1) {
         if (xhci_) {
-            xHCI::Controller* xhci = reinterpret_cast<xHCI::Controller*>(xhci_);
+            xHCIUtils::Controller* xhci = reinterpret_cast<xHCIUtils::Controller*>(xhci_);
             xhci->pollPorts();
             xhci->processEvents();
         }

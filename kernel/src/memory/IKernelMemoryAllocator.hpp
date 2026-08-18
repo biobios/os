@@ -31,7 +31,7 @@ template <typename T, kernel_memory_allocator_accessor Accessor>
 using kmalloc_unique_ptr = std::unique_ptr<T, KMallocDeleter<Accessor>>;
 
 template <typename T, kernel_memory_allocator_accessor Accessor, typename... Args>
-    requires std::constructible_from<T, Args...>
+    requires std::impl::constructible_from<T, Args...>
 kmalloc_unique_ptr<T, Accessor> make_kmalloc_unique(Args&&... args) {
     using Allocator = typename Accessor::Settings::KernelMemoryAllocator;
     Allocator& allocator = Accessor::getKernelMemoryAllocator();
