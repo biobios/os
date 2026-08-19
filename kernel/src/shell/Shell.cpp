@@ -28,6 +28,13 @@ void oz::Shell::printString(const char* str)
             string[nextIndex] = *str;
             nextIndex++;
             break;
+        case '\b':
+            if (nextIndex > 0) {
+                nextIndex--;
+                // Re-calculate cursor positions by just calling repaint
+                repaint();
+            }
+            break;
         default:
             if((*str < ' ') || (*str > '~'))break;
             gc->drawCharacter(*str, currentCursorX, currentCursorY - scissorRectTop);

@@ -145,6 +145,14 @@ void KernelStorage<KernelSettings>::Kernel::run() {
             xhci->processEvents();
         }
         
+        if (kbd_driver) {
+            char c;
+            while (kbd_driver->getKeyboard().pop(c)) {
+                char str[2] = {c, '\0'};
+                dprint(str);
+            }
+        }
+        
         // __asm__("hlt"); // HLTを呼ぶと割り込みが来るまで停止してしまうので、ポーリングの場合はコメントアウトするか、タイマー割り込み等を設定する
     }
 }

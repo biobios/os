@@ -46,9 +46,7 @@ void Keyboard::processReport(const std::uint8_t* report) {
         if (is_new_key) {
             char ascii = keycodeToAscii(key, shift_pressed);
             if (ascii) {
-                // シンプルに dprint で1文字出力する
-                char str[2] = {ascii, '\0'};
-                dprint(str);
+                buffer_.push(ascii);
             }
         }
     }
@@ -59,4 +57,9 @@ void Keyboard::processReport(const std::uint8_t* report) {
     }
 }
 
+bool Keyboard::pop(char& out_char) {
+    return buffer_.pop(out_char);
+}
+
 } // namespace HID
+

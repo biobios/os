@@ -22,6 +22,8 @@ public:
         keyboard_.processReport(report_buffer);
     }
 
+    HID::Keyboard& getKeyboard() { return keyboard_; }
+
 private:
     HID::Keyboard keyboard_;
 };

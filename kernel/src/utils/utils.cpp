@@ -63,6 +63,14 @@ void abort() {
     }
 }
 
+extern "C" void* memset(void* s, int c, std::size_t n) {
+    unsigned char* p = static_cast<unsigned char*>(s);
+    while (n--) {
+        *p++ = static_cast<unsigned char>(c);
+    }
+    return s;
+}
+
 void operator delete(void* p) noexcept { (void)p; }
 void operator delete(void* p, std::size_t) noexcept { (void)p; }
 void operator delete[](void* p) noexcept { (void)p; }
