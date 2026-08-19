@@ -255,10 +255,12 @@ void Controller::processEvents() {
                         parseConfigurationDescriptor(slot_id);
                     } else if (devices_[slot_id].state == DeviceState::SettingConfiguration) {
                         devices_[slot_id].state = DeviceState::Running;
-                        issueKeyboardTransfer(slot_id);
+                        issueInterruptTransfer(slot_id);
                     } else if (devices_[slot_id].state == DeviceState::Running) {
-                        keyboard_driver_.processReport(devices_[slot_id].report_buffer);
-                        issueKeyboardTransfer(slot_id);
+                        if (devices_[slot_id].driver) {
+                            devices_[slot_id].driver->processReport(devices_[slot_id].report_buffer);
+                        }
+                        issueInterruptTransfer(slot_id);
                     }
                 }
             } else {
@@ -427,9 +429,19 @@ void Controller::parseConfigurationDescriptor(std::uint8_t slot_id) {
     
     std::uint16_t target_max_packet_size = 0;
     std::uint8_t target_interval = 0;
-    std::uint8_t target_ep_addr = keyboard_driver_.parseConfiguration(conf_desc, target_max_packet_size, target_interval);
+    std::uint8_t target_ep_addr = 0;
+    USBClassDriver::ClassDriver* matched_driver = nullptr;
+    
+    for (int i = 0; i < num_class_drivers_; ++i) {
+        target_ep_addr = class_drivers_[i]->matchAndParseConfiguration(conf_desc, target_max_packet_size, target_interval);
+        if (target_ep_addr != 0) {
+            matched_driver = class_drivers_[i];
+            break;
+        }
+    }
     
     if (target_ep_addr != 0) {
+        devices_[slot_id].driver = matched_driver;
         issueConfigureEndpointCommand(slot_id, target_ep_addr, target_max_packet_size, target_interval);
     }
 }
@@ -499,7 +511,7 @@ void Controller::issueConfigureEndpointCommand(std::uint8_t slot_id, std::uint8_
     ringDoorbell(0);
 }
 
-void Controller::issueKeyboardTransfer(std::uint8_t slot_id) {
+void Controller::issueInterruptTransfer(std::uint8_t slot_id) {
     if (!fm_) return;
     
     if (!devices_[slot_id].report_buffer) {
@@ -550,6 +562,12 @@ void Controller::issueSetConfiguration(std::uint8_t slot_id) {
     devices_[slot_id].state = DeviceState::SettingConfiguration;
     
     ringDoorbell(slot_id, 1);
+}
+
+void Controller::registerClassDriver(USBClassDriver::ClassDriver* driver) {
+    if (num_class_drivers_ < 16) {
+        class_drivers_[num_class_drivers_++] = driver;
+    }
 }
 
 } // namespace xHCIUtils

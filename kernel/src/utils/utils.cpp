@@ -62,3 +62,8 @@ void abort() {
         __asm__ volatile("hlt");
     }
 }
+
+void operator delete(void* p) noexcept { (void)p; }
+void operator delete(void* p, std::size_t) noexcept { (void)p; }
+void operator delete[](void* p) noexcept { (void)p; }
+void operator delete[](void* p, std::size_t) noexcept { (void)p; }

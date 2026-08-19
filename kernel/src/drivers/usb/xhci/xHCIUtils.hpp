@@ -4,7 +4,7 @@
 #include "drivers/pci/PCIUtils.hpp"
 #include "memory/FrameManager.hpp"
 #include "drivers/usb/USB.hpp"
-#include "drivers/usb/class/HIDKeyboardDriver.hpp"
+#include "drivers/usb/class/ClassDriver.hpp"
 #include <cstdint>
 #include <cstddef>
 
@@ -63,6 +63,7 @@ struct Device {
     std::uint8_t* report_buffer;
     std::uint8_t dci_interrupt_in;
     std::uint8_t config_value;
+    USBClassDriver::ClassDriver* driver{nullptr};
     DeviceState state{DeviceState::Blank};
 };
 
@@ -73,6 +74,7 @@ public:
     bool initialize(oz::x86_64::FrameManager& fm);
     void processEvents();
     void pollPorts();
+    void registerClassDriver(USBClassDriver::ClassDriver* driver);
 
 private:
     PCIUtils::PCIFunction pci_function_;
@@ -89,7 +91,8 @@ private:
     oz::x86_64::FrameManager* fm_;
     
     Device devices_[256];
-    USBClassDriver::HIDKeyboardDriver keyboard_driver_;
+    USBClassDriver::ClassDriver* class_drivers_[16];
+    int num_class_drivers_{0};
     
     void reset();
     void ringDoorbell(std::uint8_t target, std::uint8_t stream_id = 0);
@@ -99,7 +102,7 @@ private:
     void parseConfigurationDescriptor(std::uint8_t slot_id);
     void issueConfigureEndpointCommand(std::uint8_t slot_id, std::uint8_t endpoint_address, std::uint16_t max_packet_size, std::uint8_t interval);
     void issueSetConfiguration(std::uint8_t slot_id);
-    void issueKeyboardTransfer(std::uint8_t slot_id);
+    void issueInterruptTransfer(std::uint8_t slot_id);
 };
 
 } // namespace xHCIUtils

@@ -16,6 +16,7 @@
 #include "hardware/ACPIUtils.hpp"
 #include "utils/utils.hpp"
 #include <new>
+#include "drivers/usb/class/HIDKeyboardDriver.hpp"
 
 namespace oz {
 PageTable* getMasterPML4();
@@ -107,6 +108,7 @@ void KernelStorage<KernelSettings>::Kernel::run() {
     sh.repaint();
 
     kmalloc_unique_ptr<xHCIUtils::Controller, KernelAccessor> xhci;
+    kmalloc_unique_ptr<USBClassDriver::HIDKeyboardDriver, KernelAccessor> kbd_driver;
     
     if (platform_info_->RSDP) {
         ACPI::RootSystemDescriptionPointer* rsdp = reinterpret_cast<ACPI::RootSystemDescriptionPointer*>(platform_info_->RSDP);
@@ -123,6 +125,8 @@ void KernelStorage<KernelSettings>::Kernel::run() {
                 sh.repaint();
                 
                 xhci = make_kmalloc_unique<xHCIUtils::Controller, KernelAccessor>(xhci_func);
+                kbd_driver = make_kmalloc_unique<USBClassDriver::HIDKeyboardDriver, KernelAccessor>();
+                xhci->registerClassDriver(kbd_driver.get());
                 sh.printString("Initializing xHCI...\n\r");
                 
                 if (xhci->initialize(fm)) {
