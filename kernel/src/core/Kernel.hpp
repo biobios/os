@@ -146,10 +146,12 @@ void KernelStorage<KernelSettings>::Kernel::run() {
         }
         
         if (kbd_driver) {
-            char c;
-            while (kbd_driver->getKeyboard().pop(c)) {
-                char str[2] = {c, '\0'};
-                dprint(str);
+            HID::KeyEvent event;
+            while (kbd_driver->getKeyboard().pop(event)) {
+                if (event.state == HID::KeyState::Pressed && event.ascii != 0) {
+                    char str[2] = {event.ascii, '\0'};
+                    dprint(str);
+                }
             }
         }
         

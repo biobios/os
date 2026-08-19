@@ -27,14 +27,24 @@ char Keyboard::keycodeToAscii(std::uint8_t keycode, bool shift) {
 }
 
 void Keyboard::processReport(const std::uint8_t* report) {
-    bool shift_pressed = (report[0] & 0x22) != 0; // LShift (bit 1) or RShift (bit 5)
+    Modifiers mods;
+    std::uint8_t raw_mods = report[0];
+    mods.left_ctrl   = (raw_mods & (1 << 0)) != 0;
+    mods.left_shift  = (raw_mods & (1 << 1)) != 0;
+    mods.left_alt    = (raw_mods & (1 << 2)) != 0;
+    mods.left_gui    = (raw_mods & (1 << 3)) != 0;
+    mods.right_ctrl  = (raw_mods & (1 << 4)) != 0;
+    mods.right_shift = (raw_mods & (1 << 5)) != 0;
+    mods.right_alt   = (raw_mods & (1 << 6)) != 0;
+    mods.right_gui   = (raw_mods & (1 << 7)) != 0;
 
-    // 現在のレポートで押されているキーを探す
+    bool shift_pressed = mods.left_shift || mods.right_shift;
+
+    // Check for newly pressed keys
     for (int i = 2; i < 8; ++i) {
         std::uint8_t key = report[i];
         if (key == 0) continue;
 
-        // 以前のレポートに含まれていないキーのみ処理する（押しっぱなしの連打防止）
         bool is_new_key = true;
         for (int j = 2; j < 8; ++j) {
             if (prev_report_[j] == key) {
@@ -44,21 +54,46 @@ void Keyboard::processReport(const std::uint8_t* report) {
         }
 
         if (is_new_key) {
-            char ascii = keycodeToAscii(key, shift_pressed);
-            if (ascii) {
-                buffer_.push(ascii);
-            }
+            KeyEvent event;
+            event.keycode = key;
+            event.ascii = keycodeToAscii(key, shift_pressed);
+            event.state = KeyState::Pressed;
+            event.modifiers = mods;
+            buffer_.push(event);
         }
     }
 
-    // 前回のレポートを保存
+    // Check for released keys
+    for (int i = 2; i < 8; ++i) {
+        std::uint8_t prev_key = prev_report_[i];
+        if (prev_key == 0) continue;
+
+        bool is_released = true;
+        for (int j = 2; j < 8; ++j) {
+            if (report[j] == prev_key) {
+                is_released = false;
+                break;
+            }
+        }
+
+        if (is_released) {
+            KeyEvent event;
+            event.keycode = prev_key;
+            event.ascii = keycodeToAscii(prev_key, shift_pressed);
+            event.state = KeyState::Released;
+            event.modifiers = mods;
+            buffer_.push(event);
+        }
+    }
+
+    // Save previous report
     for (int i = 0; i < 8; ++i) {
         prev_report_[i] = report[i];
     }
 }
 
-bool Keyboard::pop(char& out_char) {
-    return buffer_.pop(out_char);
+bool Keyboard::pop(KeyEvent& out_event) {
+    return buffer_.pop(out_event);
 }
 
 } // namespace HID
