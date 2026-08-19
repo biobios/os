@@ -1,6 +1,6 @@
 COMPILER = clang++
 LINKER = ld.lld
-CFLAGS = -O2 -Wall -Wextra -Wpadded -g --target=x86_64-unknown-none-elf -g -ffreestanding -mno-red-zone -fno-exceptions -fno-rtti -std=c++20 -I $(INCLUDEDIR) -c
+CFLAGS = -O2 -Wall -Wextra -Wpadded -g --target=x86_64-unknown-none-elf -g -ffreestanding -mno-red-zone -fno-exceptions -fno-rtti -std=c++20 -I $(INCLUDEDIR) -I $(INCDIR) -c
 LFLAGS = --entry $(ENTRYPOINT) -z norelro --image-base 0x100000 -g --static -L$(LIBDIR) -lcommonstd -lozstd
 INCLUDEDIR = ./dependencies/ozlib/include/
 LIBDIR = ./dependencies/ozlib/lib/
@@ -8,8 +8,8 @@ SRCROOT = ./src/
 OBJROOT = ./obj/
 BUILDDIR = ./build/
 INCDIR = ./src/
-SOURCES = $(wildcard $(SRCROOT)*.cpp)
-OBJECTS = $(addprefix $(OBJROOT), $(notdir $(SOURCES:.cpp=.o)))
+SOURCES = $(shell find $(SRCROOT) -name '*.cpp')
+OBJECTS = $(patsubst $(SRCROOT)%.cpp, $(OBJROOT)%.o, $(SOURCES))
 ENTRYPOINT = init
 TARGET = kernel.bin
 
@@ -17,6 +17,7 @@ $(TARGET): $(OBJECTS)
 	$(LINKER) $(LFLAGS) -o $(BUILDDIR)$@ $^
 
 $(OBJROOT)%.o: $(SRCROOT)%.cpp
+	@mkdir -p $(@D)
 	$(COMPILER) $(CFLAGS) -o $@ -c $<
 
 .PHONY: clean load run setup
@@ -35,8 +36,8 @@ load:
 	sudo losetup -d $$using_loopdev;
 
 clean:
-	rm $(OBJROOT)*
-	rm $(BUILDDIR)*
+	rm -rf $(OBJROOT)*
+	rm -rf $(BUILDDIR)*
 
 setup:
 	mkdir -p src
