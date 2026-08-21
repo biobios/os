@@ -1,8 +1,20 @@
 #include "drivers/usb/xhci/xHCIUtils.hpp"
 #include "memory/Address.hpp"
 #include "utils/utils.hpp"
+#include "hardware/x86_64.hpp"
 
 namespace xHCIUtils {
+
+Controller* g_xhci_controller = nullptr;
+
+__attribute__((interrupt))
+void xHCIInterruptHandler(void* frame) {
+    if (g_xhci_controller) {
+        g_xhci_controller->processEvents();
+        g_xhci_controller->clearEventInterruptStatus();
+    }
+    oz::x86_64::notifyEndOfInterrupt();
+}
 
 // --- Ring Implementation ---
 void Ring::initialize(xHCI::TRB::Any volatile* buf, std::size_t size) {
@@ -64,11 +76,29 @@ xHCI::TRB::Any EventRing::pop() {
 Controller::Controller(PCIUtils::PCIFunction pci_function) 
     : pci_function_(pci_function), cap_regs_(nullptr), op_regs_(nullptr), rt_regs_(nullptr), doorbell_regs_(nullptr), dcbaa_(nullptr) {}
 
+void Controller::configureInterrupts() {
+    g_xhci_controller = this;
+    oz::x86_64::setInterruptDescriptor(0x40, reinterpret_cast<void*>(xHCIInterruptHandler));
+
+    std::uint8_t msi_offset;
+    if (pci_function_.findCapability(PCI::CapabilityID_MSI, &msi_offset)) {
+        PCIUtils::MSICapabilityWrapper msi(pci_function_, msi_offset);
+        msi.setMessageAddress(PCI::x86_64::makeMSIMessageAddress(oz::x86_64::getLocalAPICID()));
+        msi.setMessageData(PCI::x86_64::makeMSIMessageData(0x40));
+        msi.enable();
+    } else if (pci_function_.findCapability(PCI::CapabilityID_MSIX, &msi_offset)) {
+        PCIUtils::MSIXCapabilityWrapper msix(pci_function_, msi_offset);
+        msix.setEntry(0, 0, PCI::x86_64::makeMSIMessageData(0x40), PCI::x86_64::makeMSIMessageAddress(oz::x86_64::getLocalAPICID()));
+        msix.enable();
+    }
+}
+
 bool Controller::initialize(oz::x86_64::FrameManager& fm) {
     fm_ = &fm;
     dprint("[xHCI] Starting Init0\r\n");
     
-    pci_function_.header->Command |= 0b110;
+    // Enable Bus Master (bit 2), Memory Space (bit 1), and Disable INTx (bit 10)
+    pci_function_.header->Command |= (1 << 10) | 0b110;
     
     dprint("[xHCI] PCI Command Reg: ");
     char hex_str_cmd[17];
@@ -184,7 +214,9 @@ bool Controller::initialize(oz::x86_64::FrameManager& fm) {
     rt_regs_->IR[0].EventRingSegmentTableBaseAddress = fm.getPhysicalAddress(erst_block).get();
     rt_regs_->IR[0].EventRingDequeuePointer = fm.getPhysicalAddress(event_block).get() | (1 << 3);
 
-    dprint("[xHCI] Running Controller (Polling Mode - but enabling xHC INT just in case)\r\n");
+    configureInterrupts();
+
+    dprint("[xHCI] Running Controller (Interrupt Mode)\r\n");
     rt_regs_->IR[0].InterrupterManagement |= xHCI::IMAN::InterruptEnable;
     op_regs_->usbCommand |= xHCI::USBCommand::InterrupterEnable;
     
@@ -270,6 +302,9 @@ void Controller::processEvents() {
                 dprint(hex_str);
                 dprint("\r\n");
             }
+        } else if (type == static_cast<std::uint8_t>(xHCI::TRB::Type::PortStatusChangeEvent)) {
+            std::uint8_t port_id = (event.data[0] >> 24) & 0xFF;
+            handlePortStatusChange(port_id);
         }
         
         std::uint64_t erdp = reinterpret_cast<std::uint64_t>(const_cast<xHCI::TRB::Any*>(event_ring_.getBuffer())) - oz::DIRECT_MAP_OFFSET + event_ring_.getDequeueIndex() * sizeof(xHCI::TRB::Any);
@@ -277,30 +312,40 @@ void Controller::processEvents() {
     }
 }
 
-void Controller::pollPorts() {
+void Controller::clearEventInterruptStatus() {
+    op_regs_->usbStatus = xHCI::USBStatus::EventInterrupt;
+    rt_regs_->IR[0].InterrupterManagement = xHCI::IMAN::InterruptPending | xHCI::IMAN::InterruptEnable;
+}
+
+void Controller::handlePortStatusChange(std::uint8_t port_id) {
+    if (port_id == 0 || port_id > max_ports_) return;
+    std::uint8_t i = port_id - 1;
+    
+    std::uint32_t portsc = op_regs_->ports[i].PortStatusAndControl;
+    
+    if ((portsc & xHCI::PORTSC::ConnectStatusChange) != 0) {
+        op_regs_->ports[i].PortStatusAndControl = portsc | xHCI::PORTSC::ConnectStatusChange;
+        
+        if ((portsc & xHCI::PORTSC::CurrentConnectStatus) != 0) {
+            std::uint32_t reset_portsc = op_regs_->ports[i].PortStatusAndControl;
+            reset_portsc &= ~(xHCI::PORTSC::ConnectStatusChange | xHCI::PORTSC::PortEnabledDisabledChange | xHCI::PORTSC::OverCurrentChange | xHCI::PORTSC::PortResetChange | xHCI::PORTSC::PortLinkStateChange | xHCI::PORTSC::PortConfigErrorChange);
+            reset_portsc |= xHCI::PORTSC::PortReset;
+            op_regs_->ports[i].PortStatusAndControl = reset_portsc;
+        }
+    }
+    
+    if ((portsc & xHCI::PORTSC::PortResetChange) != 0) {
+        op_regs_->ports[i].PortStatusAndControl = portsc | xHCI::PORTSC::PortResetChange;
+        
+        if ((portsc & xHCI::PORTSC::PortEnabledDisabled) != 0) {
+            issueEnableSlotCommand();
+        }
+    }
+}
+
+void Controller::scanInitialPorts() {
     for (std::uint8_t i = 0; i < max_ports_; ++i) {
-        std::uint32_t portsc = op_regs_->ports[i].PortStatusAndControl;
-        
-        if ((portsc & xHCI::PORTSC::ConnectStatusChange) != 0) {
-            op_regs_->ports[i].PortStatusAndControl = portsc | xHCI::PORTSC::ConnectStatusChange;
-            
-            if ((portsc & xHCI::PORTSC::CurrentConnectStatus) != 0) {
-                std::uint32_t reset_portsc = op_regs_->ports[i].PortStatusAndControl;
-                reset_portsc &= ~(xHCI::PORTSC::ConnectStatusChange | xHCI::PORTSC::PortEnabledDisabledChange | xHCI::PORTSC::OverCurrentChange | xHCI::PORTSC::PortResetChange | xHCI::PORTSC::PortLinkStateChange | xHCI::PORTSC::PortConfigErrorChange);
-                reset_portsc |= xHCI::PORTSC::PortReset;
-                op_regs_->ports[i].PortStatusAndControl = reset_portsc;
-            }
-        }
-        
-        if ((portsc & xHCI::PORTSC::PortResetChange) != 0) {
-            op_regs_->ports[i].PortStatusAndControl = portsc | xHCI::PORTSC::PortResetChange;
-            
-            if ((portsc & xHCI::PORTSC::PortEnabledDisabled) != 0) {
-                dprint("[xHCI] Port Enabled -> Issuing Enable Slot Command\r\n");
-                issueEnableSlotCommand();
-                dprint("[xHCI] Enable Slot Command Issued\r\n");
-            }
-        }
+        handlePortStatusChange(i + 1);
     }
 }
 

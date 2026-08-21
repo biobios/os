@@ -165,6 +165,15 @@ bool PCIUtils::MSICapabilityWrapper::isPerVectorMasking() {
 void PCIUtils::MSICapabilityWrapper::enable() {
     auto cap = reinterpret_cast<PCI::MSICapability32 volatile*>(
         reinterpret_cast<std::uint8_t volatile*>(function.header) + capabilityOffset);
+    if (isPerVectorMasking()) {
+        if (is64BitAddress()) {
+            auto cap64 = reinterpret_cast<PCI::MSICapability64 volatile*>(
+                reinterpret_cast<std::uint8_t volatile*>(function.header) + capabilityOffset);
+            cap64->MaskBits = 0;
+        } else {
+            cap->MaskBits = 0;
+        }
+    }
     cap->MessageControl = cap->MessageControl | 0b1;
 }
 
@@ -203,30 +212,35 @@ PCIUtils::MSIXCapabilityWrapper::MSIXCapabilityWrapper(PCIFunction function, std
     std::uint32_t indexBAR = tableOffset_TableBIR & 0b111;
     std::uint32_t tableOffset = tableOffset_TableBIR & ~0b111;
 
-    std::uint64_t tableBIR =
-        (function.header->BaseAddressRegister[indexBAR] & ~0b1111) |
-        (static_cast<std::uint64_t>(function.header->BaseAddressRegister[indexBAR + 1]) << 32);
-    table = reinterpret_cast<PCI::MSIX::TableEntry volatile*>(tableBIR + tableOffset);
+    std::uint32_t table_bar_low = function.header->BaseAddressRegister[indexBAR];
+    std::uint64_t tableBIR = table_bar_low & ~0xF;
+    if ((table_bar_low & 0b110) == 0b100) {
+        tableBIR |= static_cast<std::uint64_t>(function.header->BaseAddressRegister[indexBAR + 1]) << 32;
+    }
+    table = reinterpret_cast<PCI::MSIX::TableEntry volatile*>(tableBIR + tableOffset + oz::DIRECT_MAP_OFFSET);
 
     std::uint32_t pbaBAR = pbaOffset_PBABIR & 0b111;
     std::uint32_t pbaOffset = pbaOffset_PBABIR & ~0b111;
 
-    std::uint64_t pbaBIR =
-        (function.header->BaseAddressRegister[pbaBAR] & ~0b1111) |
-        (static_cast<std::uint64_t>(function.header->BaseAddressRegister[pbaBAR + 1]) << 32);
-    pba = reinterpret_cast<PCI::MSIX::PBAEntry volatile*>(pbaBIR + pbaOffset);
+    std::uint32_t pba_bar_low = function.header->BaseAddressRegister[pbaBAR];
+    std::uint64_t pbaBIR = pba_bar_low & ~0xF;
+    if ((pba_bar_low & 0b110) == 0b100) {
+        pbaBIR |= static_cast<std::uint64_t>(function.header->BaseAddressRegister[pbaBAR + 1]) << 32;
+    }
+    pba = reinterpret_cast<PCI::MSIX::PBAEntry volatile*>(pbaBIR + pbaOffset + oz::DIRECT_MAP_OFFSET);
 }
 
 void PCIUtils::MSIXCapabilityWrapper::enable() {
     auto cap = reinterpret_cast<PCI::MSIX::CapabilityStructure volatile*>(
         reinterpret_cast<std::uint8_t volatile*>(function.header) + capabilityOffset);
-    cap->MessageControl = cap->MessageControl | PCI::MSIX::MSIXEnable;
+    // Enable MSI-X (bit 15) and clear Function Mask (bit 14)
+    cap->MessageControl = (cap->MessageControl & ~(1 << 14)) | (1 << 15);
 }
 
 void PCIUtils::MSIXCapabilityWrapper::disable() {
     auto cap = reinterpret_cast<PCI::MSIX::CapabilityStructure volatile*>(
         reinterpret_cast<std::uint8_t volatile*>(function.header) + capabilityOffset);
-    cap->MessageControl = cap->MessageControl & ~PCI::MSIX::MSIXEnable;
+    cap->MessageControl = cap->MessageControl & ~(1 << 15);
 }
 
 void PCIUtils::MSIXCapabilityWrapper::setEntry(std::uint16_t index, std::uint32_t vectorControl,

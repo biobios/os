@@ -73,8 +73,10 @@ public:
     
     bool initialize(oz::x86_64::FrameManager& fm);
     void processEvents();
-    void pollPorts();
+    void scanInitialPorts();
+    void handlePortStatusChange(std::uint8_t port_id);
     void registerClassDriver(USBClassDriver::ClassDriver* driver);
+    void clearEventInterruptStatus();
 
 private:
     PCIUtils::PCIFunction pci_function_;
@@ -94,6 +96,7 @@ private:
     USBClassDriver::ClassDriver* class_drivers_[16];
     int num_class_drivers_{0};
     
+    void configureInterrupts();
     void reset();
     void ringDoorbell(std::uint8_t target, std::uint8_t stream_id = 0);
     void issueEnableSlotCommand();

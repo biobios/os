@@ -131,6 +131,8 @@ void KernelStorage<KernelSettings>::Kernel::run() {
                 
                 if (xhci->initialize(fm)) {
                     sh.printString("xHCI Initialized Successfully!\n\r");
+                    xhci->scanInitialPorts();
+                    xhci->processEvents();
                 } else {
                     sh.printString("xHCI Initialization Failed!\n\r");
                 }
@@ -140,22 +142,23 @@ void KernelStorage<KernelSettings>::Kernel::run() {
     }
     
     while (1) {
-        if (xhci) {
-            xhci->pollPorts();
-            xhci->processEvents();
+        __asm__ volatile("cli");
+
+        bool has_event = false;
+        HID::KeyEvent event;
+        if (kbd_driver && kbd_driver->getKeyboard().pop(event)) {
+            has_event = true;
         }
-        
-        if (kbd_driver) {
-            HID::KeyEvent event;
-            while (kbd_driver->getKeyboard().pop(event)) {
-                if (event.state == HID::KeyState::Pressed && event.ascii != 0) {
-                    char str[2] = {event.ascii, '\0'};
-                    dprint(str);
-                }
+
+        if (has_event) {
+            __asm__ volatile("sti");
+            if (event.state == HID::KeyState::Pressed && event.ascii != 0) {
+                char str[2] = {event.ascii, '\0'};
+                dprint(str);
             }
+        } else {
+            __asm__ volatile("sti; hlt");
         }
-        
-        // __asm__("hlt"); // HLTを呼ぶと割り込みが来るまで停止してしまうので、ポーリングの場合はコメントアウトするか、タイマー割り込み等を設定する
     }
 }
 
