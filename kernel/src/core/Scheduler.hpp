@@ -16,6 +16,9 @@ private:
     
     Thread* zombie_queue_head = nullptr;
     Thread* zombie_queue_tail = nullptr;
+    
+    Thread* sleep_queue_head = nullptr;
+    std::uint64_t tick_count = 0;
 
     std::uint64_t next_thread_id = 1;
 
@@ -82,6 +85,59 @@ public:
         } else {
             ready_queue_head = ready_queue_tail = thread;
         }
+    }
+
+    std::uint64_t getTicks() const {
+        return tick_count;
+    }
+
+    void tick() {
+        {
+            InterruptGuard guard;
+            tick_count++;
+            
+            Thread* current_sleep = sleep_queue_head;
+            Thread* prev_sleep = nullptr;
+            
+            while (current_sleep) {
+                if (tick_count >= current_sleep->wake_up_tick) {
+                    Thread* to_wake = current_sleep;
+                    current_sleep = current_sleep->next_sleep;
+                    
+                    if (prev_sleep) {
+                        prev_sleep->next_sleep = current_sleep;
+                    } else {
+                        sleep_queue_head = current_sleep;
+                    }
+                    
+                    // Add back to ready queue
+                    to_wake->state = ThreadState::Ready;
+                    to_wake->next = nullptr;
+                    if (ready_queue_tail) {
+                        ready_queue_tail->next = to_wake;
+                        ready_queue_tail = to_wake;
+                    } else {
+                        ready_queue_head = ready_queue_tail = to_wake;
+                    }
+                } else {
+                    prev_sleep = current_sleep;
+                    current_sleep = current_sleep->next_sleep;
+                }
+            }
+        } // guard destroyed
+        
+        schedule();
+    }
+
+    void sleep(std::uint64_t ticks) {
+        {
+            InterruptGuard guard;
+            current_thread->state = ThreadState::Blocked;
+            current_thread->wake_up_tick = tick_count + ticks;
+            current_thread->next_sleep = sleep_queue_head;
+            sleep_queue_head = current_thread;
+        }
+        schedule();
     }
 
     void schedule() {

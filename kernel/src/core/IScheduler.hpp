@@ -11,6 +11,9 @@ concept scheduler = requires(Scheduler sched, std::uint8_t level, void (*entry)(
     { sched.initMainThread() } -> std::same_as<void>;
     { sched.queueThread(thread) } -> std::same_as<void>;
     { sched.schedule() } -> std::same_as<void>;
+    { sched.tick() } -> std::same_as<void>;
+    { sched.sleep(std::uint64_t(0)) } -> std::same_as<void>;
+    { sched.getTicks() } -> std::same_as<std::uint64_t>;
     { sched.exitThread() } -> std::same_as<void>;
     { sched.getCurrentThread() } -> std::same_as<Thread*>;
     { sched.reapZombies() } -> std::same_as<void>;

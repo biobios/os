@@ -115,7 +115,7 @@ struct Settings {
 __attribute__((interrupt))
 static void timerInterruptHandler(void* frame) {
     oz::x86_64::notifyEndOfInterrupt();
-    oz::KernelStorage<Settings>::kernel_storage.kernel.scheduler.schedule();
+    oz::KernelStorage<Settings>::kernel_storage.kernel.scheduler.tick();
 }
 
 extern "C" void kernel_main(oz_boot::PlatformInfo* platformInfoPhys) {

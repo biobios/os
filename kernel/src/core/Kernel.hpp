@@ -166,6 +166,57 @@ void KernelStorage<KernelSettings>::Kernel::run() {
         }
     }
     
+    // --- Multithreading Demo ---
+    // 1. Create Idle / Reaper thread (level 0 = 4KB stack)
+    Thread* idle_t = scheduler.createThread(0, Settings::Scheduler::idle_reaper_task, &scheduler);
+    scheduler.queueThread(idle_t);
+    
+    // 2. Create Animation thread (level 1 = 8KB stack)
+    Thread* anim_t = scheduler.createThread(1, [](void* arg) {
+        Graphics* g = static_cast<Graphics*>(arg);
+        std::uint32_t x = 0;
+        std::uint32_t y = 0;
+        int dx = 5;
+        int dy = 5;
+        Pixel color = {255, 0, 0, 0}; // Blue
+        Pixel bg = {40, 40, 40, 0};   // Background (Gray)
+        
+        // Let's get our kernel's graphics mutex
+        auto& mutex = KernelStorage<KernelSettings>::kernel_storage.kernel.graphics_mutex;
+        
+        while(1) {
+            mutex.lock();
+            
+            // Erase old square
+            g->setColor(bg);
+            g->fillRect(x, y, 20, 20);
+            
+            // Update position
+            if (x + dx >= g->getWidth() - 20 || x + dx <= 0) dx = -dx;
+            if (y + dy >= g->getHeight() - 20 || y + dy <= 0) dy = -dy;
+            x += dx;
+            y += dy;
+            
+            // Draw new square
+            g->setColor(color);
+            g->fillRect(x, y, 20, 20);
+            
+            mutex.unlock();
+            
+            // Delay to make the animation visible
+            kernel_storage.kernel.scheduler.sleep(10);
+        }
+    }, &g);
+    
+    scheduler.queueThread(anim_t);
+    
+    // 3. Start APIC Timer for preemption
+    scheduler.initMainThread();
+    oz::x86_64::initAPICTimer(32);
+    sh.printString("Started multithreading demo with Reaper!\n\r");
+    sh.repaint();
+    // ---------------------------
+    
     while (1) {
         __asm__ volatile("cli");
 
@@ -179,7 +230,10 @@ void KernelStorage<KernelSettings>::Kernel::run() {
             __asm__ volatile("sti");
             if (event.state == HID::KeyState::Pressed && event.ascii != 0) {
                 char str[2] = {event.ascii, '\0'};
+                graphics_mutex.lock();
+                g.setColor({255, 255, 255, 0}); // White
                 dprint(str);
+                graphics_mutex.unlock();
             }
         } else {
             __asm__ volatile("sti; hlt");

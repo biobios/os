@@ -36,6 +36,8 @@ public:
     Thread* next;              // For Scheduler ready queue
     Thread* next_waiter;       // For Mutex wait queue
     Thread* next_zombie;       // For Reaper cleanup queue
+    Thread* next_sleep;        // For Scheduler sleep queue
+    std::uint64_t wake_up_tick; // Tick count when thread should wake up
 
     Thread(std::uint64_t id, void* stack, std::uint64_t size, PageBlock<> block, std::uint8_t level)
         : id(id), rsp(reinterpret_cast<std::uint8_t*>(stack) + size), 
