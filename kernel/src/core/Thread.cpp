@@ -35,7 +35,8 @@ extern "C" __attribute__((naked)) void oz::thread_stub() {
         "movq %rbx, %rdi\n" // Move arg to first argument register
         "call *%r12\n"      // Call entry function
         // When the thread entry function returns, terminate the thread
-        "call oz_exit_current_thread\n"
+        "movq %r14, %rdi\n" // Pass scheduler pointer as argument
+        "call *%r13\n"
         "1: hlt\n"
         "jmp 1b\n"
     );

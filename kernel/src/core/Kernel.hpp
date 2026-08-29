@@ -4,7 +4,6 @@
 
 #include "memory/AddressSpace.hpp"
 #include "graphics/Graphics.hpp"
-#include "memory/KernelMemoryAllocator.hpp"
 #include "memory/IKernelMemoryAllocator.hpp"
 #include "memory/PageTable.hpp"
 #include "memory/PageTableManager.hpp"
@@ -15,8 +14,9 @@
 #include "drivers/pci/PCIUtils.hpp"
 #include "hardware/ACPIUtils.hpp"
 #include "utils/utils.hpp"
-#include <new>
 #include "drivers/usb/class/HIDKeyboardDriver.hpp"
+#include "core/Mutex.hpp"
+#include "core/IScheduler.hpp"
 
 namespace oz {
 PageTable* getMasterPML4();
@@ -44,17 +44,40 @@ struct KernelStorage {
     };
 
     template <typename... Args>
-        requires(kernel_memory_allocator<typename KernelSettings::template KernelMemoryAllocatorFunctor<typename KernelStorage<KernelSettings>::KernelAccessor1>>)
+        requires(kernel_memory_allocator<typename KernelSettings::template KernelMemoryAllocatorFunctor<KernelAccessor1>>)
     struct KernelAccessor2<Args...> : public KernelAccessor1 {
         struct Settings : public KernelAccessor1::Settings {
             using KernelMemoryAllocator = typename KernelSettings::template KernelMemoryAllocatorFunctor<KernelAccessor1>;
         };
         static consteval auto getKernelMemoryAllocator() -> Settings::KernelMemoryAllocator& {
             return kernel_storage.kernel.k_malloc;
-        }   
+        }
     };
 
-    using KernelAccessor = KernelAccessor2<>;
+    template <typename...>
+    struct KernelAccessor3;
+
+    template <typename... Args>
+        requires(scheduler<typename KernelSettings::Scheduler>)
+    struct KernelAccessor3<Args...> : public KernelAccessor2<> {
+        using Settings = KernelAccessor2<>::Settings;
+        static consteval auto getScheduler() -> Settings::Scheduler& {
+            return kernel_storage.kernel.scheduler;
+        }
+    };
+
+    template <typename... Args>
+        requires(scheduler<typename KernelSettings::template SchedulerFunctor<KernelAccessor2<>>>)
+    struct KernelAccessor3<Args...> : public KernelAccessor2<> {
+        struct Settings : public KernelAccessor2<>::Settings {
+            using Scheduler = typename KernelSettings::template SchedulerFunctor<KernelAccessor2<>>;
+        };
+        static consteval auto getScheduler() -> Settings::Scheduler& {
+            return kernel_storage.kernel.scheduler;
+        }
+    };
+
+    using KernelAccessor = KernelAccessor3<>;
 
     class Kernel : public PhysicalAddressProvider {
         using Settings = KernelAccessor::Settings;
@@ -67,6 +90,8 @@ struct KernelStorage {
         Settings::KernelMemoryAllocator k_malloc;
         PageTableManager<KernelAccessor> pt_manager;
         KernelAddressSpace<KernelAccessor> kernel_space;
+        Settings::Scheduler scheduler;
+        Mutex<KernelAccessor> graphics_mutex;
         oz_boot::PlatformInfo* platform_info_;
 
         Kernel(oz_boot::PlatformInfo* platformInfo);
