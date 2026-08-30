@@ -197,6 +197,38 @@ void KernelStorage<KernelSettings>::Kernel::run() {
                             } else {
                                 sh.printString("os/kernel.bin not found.\n\r");
                             }
+                            
+                            // Test reading and appending to test.txt
+                            auto textFile = vfs.open("test.txt");
+                            if (textFile) {
+                                sh.printString("test.txt opened. Reading content...\n\r");
+                                char buf[128] = {0};
+                                std::size_t size = textFile->getSize();
+                                std::size_t readSize = size < sizeof(buf) - 1 ? size : sizeof(buf) - 1;
+                                textFile->read(buf, readSize);
+                                
+                                sh.printString("Content: ");
+                                sh.printString(buf);
+                                sh.printString("\n\r");
+                                
+                                const char* appendStr = "\nAppended data!";
+                                textFile->seek(textFile->getSize());
+                                std::size_t written = textFile->write(appendStr, sizeof("\nAppended data!") - 1);
+                                
+                                if (written > 0) {
+                                    sh.printString("Appended successfully.\n\r");
+                                } else {
+                                    sh.printString("Append failed.\n\r");
+                                }
+                                
+                                // Explicitly close to flush metadata (will also be called on destruction, but explicit is good)
+                                textFile->close();
+                                // To avoid double free since unique_ptr will try to delete it too, release it.
+                                textFile.release();
+                            } else {
+                                sh.printString("test.txt not found.\n\r");
+                            }
+
                         } else {
                             sh.printString("FAT32 Mount Failed.\n\r");
                         }

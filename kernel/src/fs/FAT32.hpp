@@ -64,9 +64,14 @@ private:
     std::size_t size;
     std::size_t current_offset;
 
+    // Meta data for write-back
+    std::uint32_t dir_cluster;
+    std::uint32_t dir_entry_offset;
+    bool is_dirty;
+
 public:
-    FAT32File(FAT32FileSystem* fs, std::uint32_t first_cluster, std::size_t size);
-    ~FAT32File() override = default;
+    FAT32File(FAT32FileSystem* fs, std::uint32_t first_cluster, std::size_t size, std::uint32_t dir_cluster = 0, std::uint32_t dir_entry_offset = 0);
+    ~FAT32File() override;
 
     std::size_t read(void* buffer, std::size_t size) override;
     std::size_t write(const void* buffer, std::size_t size) override;
@@ -112,8 +117,14 @@ public:
     bool readCluster(std::uint32_t cluster, void* buffer);
     std::uint32_t getClusterSize() const;
     
+    // Helper functions for writing clusters
+    bool writeCluster(std::uint32_t cluster, const void* buffer);
+    std::uint32_t allocateCluster();
+    bool setNextCluster(std::uint32_t cluster, std::uint32_t next_cluster);
+    bool updateDirEntrySize(std::uint32_t dir_cluster, std::uint32_t offset, std::uint32_t new_size);
+
 private:
-    std::uint32_t findEntryInDir(std::uint32_t dir_cluster, const char* name, FAT_DirEntry& out_entry);
+    std::uint32_t findEntryInDir(std::uint32_t dir_cluster, const char* name, FAT_DirEntry& out_entry, std::uint32_t& out_dir_cluster, std::uint32_t& out_entry_offset);
     void formatShortName(const char* name, char* out_name11);
 };
 
