@@ -7,3 +7,5 @@ bootloader/BOOTX64.EFI
 bootloader/boot.o
 kernel/build/
 kernel/obj/
+assets/*
+!assets/test.txt

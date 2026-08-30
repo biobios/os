@@ -18,9 +18,10 @@ public:
     std::uint64_t pid;
     std::unique_ptr<AddressSpaceType> address_space;
     Thread* main_thread;
+    std::uint64_t entry_point;
 
-    Process(std::uint64_t id, std::unique_ptr<AddressSpaceType> as, Thread* thread)
-        : pid(id), address_space(std::move(as)), main_thread(thread) {}
+    Process(std::uint64_t id, std::unique_ptr<AddressSpaceType> as, Thread* thread, std::uint64_t entry = 0)
+        : pid(id), address_space(std::move(as)), main_thread(thread), entry_point(entry) {}
 
     void activate() {
         if (address_space) {

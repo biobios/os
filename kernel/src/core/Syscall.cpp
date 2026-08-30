@@ -50,6 +50,8 @@ __attribute__((naked)) void syscall_entry() {
         "swapgs\n"
         "movq %rsp, %gs:0\n"
         "movq %gs:8, %rsp\n"
+        
+        "pushq %rbp\n"
 
         "pushq %rcx\n"
         "pushq %r11\n"
@@ -66,6 +68,7 @@ __attribute__((naked)) void syscall_entry() {
         "movq %r10, %rcx\n"
         "movq %r8, %r8\n"
         "movq %r9, %r9\n"
+        "pushq $0\n" // Dummy for 16-byte alignment
         "pushq %rax\n"
 
         "call handleSyscall\n"
@@ -80,6 +83,8 @@ __attribute__((naked)) void syscall_entry() {
         "popq %r9\n"
         "popq %r11\n"
         "popq %rcx\n"
+        
+        "popq %rbp\n"
 
         "movq %gs:0, %rsp\n"
         "swapgs\n"

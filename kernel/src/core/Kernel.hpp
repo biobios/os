@@ -25,6 +25,7 @@
 #include <memory>
 #include "core/Process.hpp"
 #include "core/Syscall.hpp"
+#include "utils/ELF.hpp"
 
 namespace oz {
 PageTable* getMasterPML4();
@@ -105,6 +106,11 @@ struct KernelStorage {
 
         Kernel(oz_boot::PlatformInfo* platformInfo);
         void run();
+
+    private:
+        Thread* loadProcessFromElf(const char* path, VFS& vfs);
+
+    public:
 
         KernelAddressSpace<KernelAccessor>& getKernelSpace() { return kernel_space; }
         PageTableManager<KernelAccessor>& getPageTableManager() { return pt_manager; }
@@ -251,69 +257,18 @@ void KernelStorage<KernelSettings>::Kernel::run() {
     }
     
     // --- User Process Test ---
-    sh.printString("Creating user process...\n\r");
+    sh.printString("Loading init.elf...\n\r");
     sh.repaint();
 
-    auto user_as = ProcessAddressSpace<KernelAccessor>::create(kernel_space);
-    if (user_as) {
-        auto code_block = fm.allocateBlock(0);
-        if (code_block) {
-            void* phys_addr = reinterpret_cast<void*>(fm.getPhysicalAddress(code_block).get());
-            void* virt_addr = phys_to_virt(createPhysicalAddress<void>(reinterpret_cast<std::uintptr_t>(phys_addr)));
-            
-            const std::uint8_t dummy_bin[] = {
-                0x48, 0xc7, 0xc0, 0x01, 0x00, 0x00, 0x00, 0x48, 0xc7, 0xc7, 0x01, 0x00,
-                0x00, 0x00, 0x48, 0x8d, 0x35, 0x15, 0x00, 0x00, 0x00, 0x48, 0xc7, 0xc2,
-                0x0e, 0x00, 0x00, 0x00, 0x0f, 0x05, 0x48, 0xc7, 0xc0, 0x3c, 0x00, 0x00,
-                0x00, 0x48, 0x31, 0xff, 0x0f, 0x05, 0x48, 0x65, 0x6c, 0x6c, 0x6f, 0x2c,
-                0x20, 0x55, 0x73, 0x65, 0x72, 0x21, 0x0a, 0x00
-            };
-            utils::memcpy(virt_addr, dummy_bin, sizeof(dummy_bin));
-            user_as->mapUser(0x400000, reinterpret_cast<std::uintptr_t>(phys_addr), MemoryFlags::Present | MemoryFlags::Writable | MemoryFlags::User | MemoryFlags::Executable);
-            
-            auto stack_block = fm.allocateBlock(0);
-            if (stack_block) {
-                void* stack_phys = reinterpret_cast<void*>(fm.getPhysicalAddress(stack_block).get());
-                std::uintptr_t stack_virt = 0x700000000000;
-                user_as->mapUser(stack_virt, reinterpret_cast<std::uintptr_t>(stack_phys), MemoryFlags::Present | MemoryFlags::Writable | MemoryFlags::User);
-                
-                // プロセスを動的確保して保持する
-                auto* proc = new Process<KernelAccessor>(1, std::move(user_as), nullptr);
-                
-                // ユーザープロセス用のカーネルスレッドを作成
-                // エントリポイントでは TSS/SyscallContext の設定をして enter_user_mode に飛ぶ
-                Thread* user_thread = scheduler.createThread(1, [](void* arg) {
-                    auto* proc_ptr = static_cast<Process<KernelAccessor>*>(arg);
-                    
-                    // 現在のスレッド情報を取得し、TSS の kernel_stack を設定する
-                    auto* current_thread = KernelStorage<KernelSettings>::kernel_storage.kernel.scheduler.getCurrentThread();
-                    std::uint64_t kernel_stack_top = reinterpret_cast<std::uint64_t>(current_thread->stack_base) + current_thread->stack_size;
-                    
-                    setSyscallKernelStack(kernel_stack_top);
-                    x86_64::setKernelStack(kernel_stack_top);
-                    
-                    // Process のアクティベート (CR3 の切り替え)
-                    proc_ptr->activate();
-                    
-                    // User stack と entry point (ここでは固定)
-                    std::uintptr_t stack_virt = 0x700000000000;
-                    
-                    // Ring 3へのジャンプ
-                    enter_user_mode(0x400000, stack_virt + 4096 - 8);
-                }, proc);
-                
-                // Thread に Process の pml4_phys を設定
-                user_thread->pml4_phys = proc->address_space->getArchContext().getPhysicalPML4();
-                user_thread->user_data = proc;
-                user_thread->cleanup = [](void* arg) {
-                    auto* p = static_cast<Process<KernelAccessor>*>(arg);
-                    delete p;
-                };
-                
-                scheduler.queueThread(user_thread);
-            }
-        }
+    Thread* user_thread = loadProcessFromElf("init.elf", vfs);
+    
+    if (user_thread) {
+        scheduler.queueThread(user_thread);
+        sh.printString("init.elf loaded successfully.\n\r");
+    } else {
+        sh.printString("Failed to load init.elf!\n\r");
     }
+    sh.repaint();
     // ---------------------------
     
     // --- Multithreading Demo ---
@@ -384,4 +339,105 @@ void KernelStorage<KernelSettings>::Kernel::run() {
     }
 }
 
+template <typename KernelSettings>
+Thread* KernelStorage<KernelSettings>::Kernel::loadProcessFromElf(const char* path, VFS& vfs) {
+    auto user_as = ProcessAddressSpace<KernelAccessor>::create(kernel_space);
+    if (!user_as) return nullptr;
+
+    auto file = vfs.open(path);
+    if (!file) return nullptr;
+
+    std::size_t file_size = file->getSize();
+    auto file_buf = new std::uint8_t[file_size];
+    file->read(file_buf, file_size);
+    
+    auto* elf_header = reinterpret_cast<elf::Elf64_Ehdr*>(file_buf);
+    if (!elf::isValidElf(elf_header)) {
+        delete[] file_buf;
+        return nullptr;
+    }
+
+    std::uintptr_t entry_point = elf_header->e_entry;
+    auto* phdr_table = reinterpret_cast<elf::Elf64_Phdr*>(file_buf + elf_header->e_phoff);
+    
+    for (int i = 0; i < elf_header->e_phnum; ++i) {
+        if (phdr_table[i].p_type == elf::PT_LOAD) {
+            std::uintptr_t vaddr = phdr_table[i].p_vaddr;
+            std::uint64_t memsz = phdr_table[i].p_memsz;
+            std::uint64_t filesz = phdr_table[i].p_filesz;
+            std::uint64_t offset = phdr_table[i].p_offset;
+            
+            std::uintptr_t vaddr_aligned = vaddr & ~0xFFFULL;
+            std::uintptr_t vaddr_offset = vaddr - vaddr_aligned;
+            std::uint64_t map_size = (memsz + vaddr_offset + 0xFFF) & ~0xFFFULL;
+            
+            for (std::uint64_t p = 0; p < map_size; p += 4096) {
+                auto block = fm.allocateBlock(0);
+                if (block) {
+                    std::uint64_t paddr = fm.getPhysicalAddress(block).get();
+                    MemoryFlags flags = MemoryFlags::Present | MemoryFlags::User;
+                    if (phdr_table[i].p_flags & elf::PF_W) flags = flags | MemoryFlags::Writable;
+                    if (phdr_table[i].p_flags & elf::PF_X) flags = flags | MemoryFlags::Executable;
+                    
+                    user_as->mapUser(vaddr_aligned + p, paddr, flags);
+                    
+                    void* virt_ptr = phys_to_virt(createPhysicalAddress<void>(paddr));
+                    utils::memset(virt_ptr, 0, 4096);
+                    
+                    std::uint64_t page_vaddr_start = vaddr_aligned + p;
+                    std::uint64_t page_vaddr_end = page_vaddr_start + 4096;
+                    
+                    if (page_vaddr_start < vaddr + filesz && page_vaddr_end > vaddr) {
+                        std::uint64_t copy_start = utils::max(page_vaddr_start, static_cast<std::uint64_t>(vaddr));
+                        std::uint64_t copy_end = utils::min(page_vaddr_end, static_cast<std::uint64_t>(vaddr + filesz));
+                        std::uint64_t copy_size = copy_end - copy_start;
+                        std::uint64_t file_offset = offset + (copy_start - vaddr);
+                        std::uint64_t page_offset = copy_start - page_vaddr_start;
+                        
+                        utils::memcpy(reinterpret_cast<std::uint8_t*>(virt_ptr) + page_offset, 
+                                        file_buf + file_offset, 
+                                        copy_size);
+                    }
+                }
+            }
+        }
+    }
+    
+    delete[] file_buf;
+
+    auto stack_block = fm.allocateBlock(1); // 2 pages
+    if (!stack_block) return nullptr;
+
+    void* stack_phys = reinterpret_cast<void*>(fm.getPhysicalAddress(stack_block).get());
+    std::uintptr_t stack_virt = 0x700000000000 - 8192;
+    
+    user_as->mapUser(stack_virt, reinterpret_cast<std::uintptr_t>(stack_phys), MemoryFlags::Present | MemoryFlags::Writable | MemoryFlags::User);
+    user_as->mapUser(stack_virt + 4096, reinterpret_cast<std::uintptr_t>(stack_phys) + 4096, MemoryFlags::Present | MemoryFlags::Writable | MemoryFlags::User);
+    
+    auto* proc = new Process<KernelAccessor>(1, std::move(user_as), nullptr, entry_point);
+
+    Thread* user_thread = scheduler.createThread(1, [](void* arg) {
+        auto* proc_ptr = static_cast<Process<KernelAccessor>*>(arg);
+        
+        auto* current_thread = KernelStorage<KernelSettings>::kernel_storage.kernel.scheduler.getCurrentThread();
+        std::uint64_t kernel_stack_top = reinterpret_cast<std::uint64_t>(current_thread->stack_base) + current_thread->stack_size;
+        
+        setSyscallKernelStack(kernel_stack_top);
+        x86_64::setKernelStack(kernel_stack_top);
+        
+        proc_ptr->activate();
+        
+        std::uintptr_t stack_top = 0x700000000000;
+        enter_user_mode(proc_ptr->entry_point, stack_top - 8);
+    }, proc);
+    
+    user_thread->pml4_phys = proc->address_space->getArchContext().getPhysicalPML4();
+    user_thread->user_data = proc;
+    user_thread->cleanup = [](void* arg) {
+        auto* p = static_cast<Process<KernelAccessor>*>(arg);
+        delete p;
+    };
+
+    return user_thread;
+}
 }  // namespace oz

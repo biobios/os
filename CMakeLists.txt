@@ -35,6 +35,7 @@ set(QEMU_MEMORY "4G" CACHE STRING "QEMU memory size")
 # Subdirectories
 add_subdirectory(bootloader)
 add_subdirectory(kernel)
+add_subdirectory(user)
 
 # Custom target: image (creates / updates FAT32 disk image)
 add_custom_target(image
@@ -44,7 +45,7 @@ add_custom_target(image
         --bootloader "$<TARGET_FILE:bootloader>"
         --kernel "$<TARGET_FILE:kernel>"
         --assets "${CMAKE_CURRENT_SOURCE_DIR}/assets"
-    DEPENDS bootloader kernel "${CMAKE_CURRENT_SOURCE_DIR}/scripts/create_image.py" "${CMAKE_CURRENT_SOURCE_DIR}/assets"
+    DEPENDS bootloader kernel init "${CMAKE_CURRENT_SOURCE_DIR}/scripts/create_image.py" "${CMAKE_CURRENT_SOURCE_DIR}/assets"
     COMMENT "Generating and populating FAT32 disk image (${HDD_IMAGE})"
     VERBATIM
 )
