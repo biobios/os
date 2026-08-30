@@ -8,6 +8,7 @@
 #include "memory/PageTable.hpp"
 #include "core/bootStructures.hpp"
 #include "hardware/x86_64.hpp"
+#include "hardware/Serial.hpp"
 #include "core/Syscall.hpp"
 #include "core/Process.hpp"
 
@@ -137,6 +138,7 @@ extern "C" void kernel_main(oz_boot::PlatformInfo* platformInfoPhys) {
     }
 
     // 9. Initialize architecture specifics
+    oz::hardware::Serial::init();
     oz::x86_64::enableSSE();
     oz::x86_64::initGDTR();
     oz::x86_64::initIDTR();

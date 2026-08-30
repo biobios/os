@@ -61,6 +61,7 @@ if(QEMU_EXECUTABLE)
             -device usb-kbd,bus=xhci.0
             -bios "${OVMF_PATH}"
             -hda "${HDD_IMAGE}"
+            -serial file:${CMAKE_CURRENT_SOURCE_DIR}/kernel.log
         DEPENDS image
         COMMENT "Running OZ OS in QEMU"
         VERBATIM
@@ -75,6 +76,7 @@ if(QEMU_EXECUTABLE)
             -device usb-kbd,bus=xhci.0
             -bios "${OVMF_PATH}"
             -hda "${HDD_IMAGE}"
+            -serial file:${CMAKE_CURRENT_SOURCE_DIR}/kernel.log
         DEPENDS image
         COMMENT "Running OZ OS in QEMU (Waiting for GDB on :1234)"
         VERBATIM

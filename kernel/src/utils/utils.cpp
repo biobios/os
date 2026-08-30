@@ -1,5 +1,6 @@
 #include "utils/utils.hpp"
 #include "shell/Shell.hpp"
+#include "hardware/Serial.hpp"
 
 namespace {
 oz::Shell* sh;
@@ -26,10 +27,7 @@ void setShellPtr(oz::Shell* shell) {
 }
 
 void dprint(const char* str) {
-    if (sh) {
-        sh->printString(str); 
-        sh->repaint();
-    }
+    oz::hardware::Serial::writeString(str);
 }
 
 // void write(const char* str) {
@@ -54,9 +52,7 @@ void dprint(const char* str) {
 
 void abort() {
 
-    dprint("abort");
-
-    sh->repaint();
+    dprint("\nabort\n");
 
     while(true){
         __asm__ volatile("hlt");

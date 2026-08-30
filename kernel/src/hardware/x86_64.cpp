@@ -4,6 +4,7 @@
 #include <cstddef>
 
 #include "memory/Address.hpp"
+#include "utils/utils.hpp"
 
 namespace {
     alignas(16) std::uint64_t gdt[8] = {
@@ -81,20 +82,63 @@ namespace{
     };
 
     __attribute__((interrupt))
-    void defaultHandler(void*){
+    void defaultHandler(oz::x86_64::ExceptionFrame* frame){
         oz::x86_64::notifyEndOfInterrupt();
     }
 
-    
-    template<std::uint8_t index>
+    void dumpExceptionInfo(const char* name, oz::x86_64::ExceptionFrame* frame, std::uint64_t error_code = 0) {
+        char hexStr[17];
+        dprint("\n\nEXCEPTION: ");
+        dprint(name);
+        dprint("\nRIP: 0x");
+        oz::utils::to_hex(frame->rip, hexStr);
+        dprint(hexStr);
+        dprint("\nCS: 0x");
+        oz::utils::to_hex(frame->cs, hexStr);
+        dprint(hexStr);
+        dprint("\nRFLAGS: 0x");
+        oz::utils::to_hex(frame->rflags, hexStr);
+        dprint(hexStr);
+        dprint("\nRSP: 0x");
+        oz::utils::to_hex(frame->rsp, hexStr);
+        dprint(hexStr);
+        dprint("\nSS: 0x");
+        oz::utils::to_hex(frame->ss, hexStr);
+        dprint(hexStr);
+        dprint("\nError Code: 0x");
+        oz::utils::to_hex(error_code, hexStr);
+        dprint(hexStr);
+        dprint("\nHALT.\n");
+        while(true) { __asm__ volatile("hlt"); }
+    }
+
     __attribute__((interrupt))
-    void Hoge(void*){
-        oz::x86_64::notifyEndOfInterrupt();
+    void int00Handler(oz::x86_64::ExceptionFrame* frame) { dumpExceptionInfo("#DE Divide Error", frame); }
+
+    __attribute__((interrupt))
+    void int06Handler(oz::x86_64::ExceptionFrame* frame) { dumpExceptionInfo("#UD Invalid Opcode", frame); }
+
+    __attribute__((interrupt))
+    void int08Handler(oz::x86_64::ExceptionFrame* frame, std::uint64_t error_code) { dumpExceptionInfo("#DF Double Fault", frame, error_code); }
+
+    __attribute__((interrupt))
+    void int13Handler(oz::x86_64::ExceptionFrame* frame, std::uint64_t error_code) { dumpExceptionInfo("#GP General Protection", frame, error_code); }
+
+    __attribute__((interrupt))
+    void int14Handler(oz::x86_64::ExceptionFrame* frame, std::uint64_t error_code) { 
+        std::uint64_t cr2;
+        __asm__ volatile("mov %%cr2, %0" : "=r"(cr2));
+        char hexStr[17];
+        dprint("\nCR2: 0x");
+        oz::utils::to_hex(cr2, hexStr);
+        dprint(hexStr);
+        dumpExceptionInfo("#PF Page Fault", frame, error_code); 
     }
 
     InterruptDescriptor idt[oz::x86_64::MAX_INTERRUPTS_COUNT];
 
 }
+
 
 void oz::x86_64::setInterruptDescriptor(std::uint8_t index, void* handler){
     idt[index].offset_00_15 = reinterpret_cast<std::uint64_t>(handler) & 0xffff;
@@ -109,6 +153,12 @@ void oz::x86_64::initIDTR() {
     for(std::size_t i = 0; i < MAX_INTERRUPTS_COUNT; i++){
         setInterruptDescriptor(i, reinterpret_cast<void*>(defaultHandler));
     }
+
+    setInterruptDescriptor(0, reinterpret_cast<void*>(int00Handler));
+    setInterruptDescriptor(6, reinterpret_cast<void*>(int06Handler));
+    setInterruptDescriptor(8, reinterpret_cast<void*>(int08Handler));
+    setInterruptDescriptor(13, reinterpret_cast<void*>(int13Handler));
+    setInterruptDescriptor(14, reinterpret_cast<void*>(int14Handler));
 
     volatile std::uint64_t idtr[2];
     idtr[0] = (reinterpret_cast<std::uint64_t>(&idt) << 16) | (sizeof(idt) - 1);

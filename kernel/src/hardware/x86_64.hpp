@@ -40,6 +40,14 @@ struct TaskStateSegment {
 };
 #pragma pack(pop)
 
+struct ExceptionFrame {
+    std::uint64_t rip;
+    std::uint64_t cs;
+    std::uint64_t rflags;
+    std::uint64_t rsp;
+    std::uint64_t ss;
+};
+
 constexpr std::uint16_t KERNEL_CS = 1 * 8;
 constexpr std::uint16_t KERNEL_DS = 2 * 8;
 constexpr std::uint16_t USER_CS32 = 3 * 8;
