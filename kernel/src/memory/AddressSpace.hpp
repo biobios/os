@@ -1,12 +1,12 @@
 #pragma once
 
 #include <cstdint>
+#include <memory>
 #include <utility>
 #include "memory/Address.hpp"
 #include "memory/IFrameManager.hpp"
 #include "memory/MemoryFlags.hpp"
 #include "memory/x86_64AddressSpaceContext.hpp"
-#include "memory/IKernelMemoryAllocator.hpp"
 
 namespace oz {
 
@@ -35,7 +35,7 @@ private:
 public:
     explicit ProcessAddressSpace(ArchContext ctx) : arch_ctx(std::move(ctx)) {}
 
-    static kmalloc_unique_ptr<ProcessAddressSpace, Accessor> create(const KernelAddressSpace<Accessor, ArchContext>& kernel_space) {
+    static std::unique_ptr<ProcessAddressSpace> create(const KernelAddressSpace<Accessor, ArchContext>& kernel_space) {
         ArchContext new_ctx = ArchContext::cloneProcessSpace(kernel_space.getArchContext());
         if (!new_ctx.isValid()) {
             return nullptr;

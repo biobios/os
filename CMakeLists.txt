@@ -43,7 +43,8 @@ add_custom_target(image
         --size-mb "${HDD_SIZE_MB}"
         --bootloader "$<TARGET_FILE:bootloader>"
         --kernel "$<TARGET_FILE:kernel>"
-    DEPENDS bootloader kernel "${CMAKE_CURRENT_SOURCE_DIR}/scripts/create_image.py"
+        --assets "${CMAKE_CURRENT_SOURCE_DIR}/assets"
+    DEPENDS bootloader kernel "${CMAKE_CURRENT_SOURCE_DIR}/scripts/create_image.py" "${CMAKE_CURRENT_SOURCE_DIR}/assets"
     COMMENT "Generating and populating FAT32 disk image (${HDD_IMAGE})"
     VERBATIM
 )

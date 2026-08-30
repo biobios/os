@@ -213,7 +213,18 @@ class FAT32Writer:
         self.f.close()
 
 
-def create_or_update_image(image_path, size_bytes, bootloader_path, kernel_path, label="OZ OS"):
+def copy_recursive(writer, host_dir, dest_cluster):
+    for item in os.listdir(host_dir):
+        host_path = os.path.join(host_dir, item)
+        if os.path.isdir(host_path):
+            subdir_cluster = writer.get_or_create_subdir(dest_cluster, item)
+            copy_recursive(writer, host_path, subdir_cluster)
+        else:
+            with open(host_path, "rb") as f:
+                data = f.read()
+            writer.write_file(dest_cluster, item, data)
+
+def create_or_update_image(image_path, size_bytes, bootloader_path, kernel_path, label="OZ OS", assets_dir=None):
     os.makedirs(os.path.dirname(os.path.abspath(image_path)), exist_ok=True)
 
     needs_format = not os.path.exists(image_path) or os.path.getsize(image_path) != size_bytes
@@ -242,6 +253,10 @@ def create_or_update_image(image_path, size_bytes, bootloader_path, kernel_path,
         run_cmd(f"mmd -i {image_path} ::/os || true")
         run_cmd(f"mcopy -o -i {image_path} {bootloader_path} ::/EFI/BOOT/BOOTX64.EFI")
         run_cmd(f"mcopy -o -i {image_path} {kernel_path} ::/os/kernel.bin")
+        if assets_dir and os.path.exists(assets_dir):
+            for item in os.listdir(assets_dir):
+                item_path = os.path.join(assets_dir, item)
+                run_cmd(f"mcopy -s -o -i {image_path} {item_path} ::/")
     else:
         writer = FAT32Writer(image_path)
         try:
@@ -251,10 +266,13 @@ def create_or_update_image(image_path, size_bytes, bootloader_path, kernel_path,
 
             os_cluster = writer.get_or_create_subdir(writer.root_cluster, "os")
             writer.write_file(os_cluster, "kernel.bin", kernel_data)
+            
+            if assets_dir and os.path.exists(assets_dir):
+                copy_recursive(writer, assets_dir, writer.root_cluster)
         finally:
             writer.close()
 
-    print(f"Successfully populated {image_path} with BOOTX64.EFI and kernel.bin.")
+    print(f"Successfully populated {image_path} with BOOTX64.EFI, kernel.bin, and assets.")
 
 def main():
     parser = argparse.ArgumentParser(description="Create and populate FAT32 OS disk image")
@@ -262,6 +280,7 @@ def main():
     parser.add_argument("--size-mb", type=int, default=200, help="Image size in MB (default: 200)")
     parser.add_argument("--bootloader", required=True, help="Path to BOOTX64.EFI")
     parser.add_argument("--kernel", required=True, help="Path to kernel.bin")
+    parser.add_argument("--assets", required=False, help="Path to an assets directory to be copied recursively to the root of the image")
     parser.add_argument("--label", default="OZ OS", help="FAT32 Volume Label")
 
     args = parser.parse_args()
@@ -270,7 +289,8 @@ def main():
         size_bytes=args.size_mb * 1024 * 1024,
         bootloader_path=args.bootloader,
         kernel_path=args.kernel,
-        label=args.label
+        label=args.label,
+        assets_dir=args.assets
     )
 
 if __name__ == "__main__":
