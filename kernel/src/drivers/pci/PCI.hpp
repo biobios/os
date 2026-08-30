@@ -2,6 +2,10 @@
 
 #include <cstdint>
 
+#pragma GCC diagnostic push
+#pragma GCC diagnostic error "-Wpadded"
+
+
 namespace PCI{
     struct PCIConfigurationHeaderCommon{
         std::uint16_t VendorID;
@@ -169,3 +173,4 @@ namespace PCI{
         }
     }
 }
+#pragma GCC diagnostic pop

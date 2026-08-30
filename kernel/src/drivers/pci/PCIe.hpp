@@ -2,6 +2,10 @@
 
 #include "hardware/ACPI.hpp"
 
+#pragma GCC diagnostic push
+#pragma GCC diagnostic error "-Wpadded"
+
+
 namespace PCIe {
 
 struct MemorymappedConfigurationSpaceDescription {
@@ -33,3 +37,4 @@ struct MemorymappedConfigurationSpaceDescriptionTable {
     }
 };
 }  // namespace PCIe
+#pragma GCC diagnostic pop

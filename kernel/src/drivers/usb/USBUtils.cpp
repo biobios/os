@@ -4,7 +4,7 @@ namespace USBUtils {
 
 USB::InterfaceDescriptor* findInterface(USB::ConfigurationDescriptor* conf_desc, std::uint8_t class_code, std::uint8_t subclass_code, std::uint8_t protocol) {
     std::uint8_t* ptr = reinterpret_cast<std::uint8_t*>(conf_desc);
-    std::uint8_t* end = ptr + conf_desc->total_length;
+    std::uint8_t* end = ptr + static_cast<std::uint16_t>(conf_desc->total_length);
     
     while (ptr < end) {
         USB::DescriptorHeader* header = reinterpret_cast<USB::DescriptorHeader*>(ptr);
@@ -25,7 +25,7 @@ USB::InterfaceDescriptor* findInterface(USB::ConfigurationDescriptor* conf_desc,
 
 USB::EndpointDescriptor* findEndpoint(USB::ConfigurationDescriptor* conf_desc, USB::InterfaceDescriptor* intf, bool is_in, std::uint8_t type) {
     std::uint8_t* ptr = reinterpret_cast<std::uint8_t*>(intf) + intf->length;
-    std::uint8_t* end = reinterpret_cast<std::uint8_t*>(conf_desc) + conf_desc->total_length;
+    std::uint8_t* end = reinterpret_cast<std::uint8_t*>(conf_desc) + static_cast<std::uint16_t>(conf_desc->total_length);
     
     while (ptr < end) {
         USB::DescriptorHeader* header = reinterpret_cast<USB::DescriptorHeader*>(ptr);

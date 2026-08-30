@@ -6,6 +6,8 @@ namespace oz {
 
 // Thread context saved on the stack during a context switch.
 // Ordered from lowest address (top of stack) to highest address.
+#pragma GCC diagnostic push
+#pragma GCC diagnostic error "-Wpadded"
 struct ThreadContext {
     std::uint64_t r15;
     std::uint64_t r14;
@@ -14,7 +16,8 @@ struct ThreadContext {
     std::uint64_t rbp;
     std::uint64_t rbx;
     std::uint64_t rip; // Pushed by call instruction
-} __attribute__((packed));
+};
+#pragma GCC diagnostic pop
 
 enum class ThreadState {
     Ready,

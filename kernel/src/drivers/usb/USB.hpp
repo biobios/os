@@ -1,6 +1,11 @@
 #pragma once
 
 #include <cstdint>
+#include "utils/Unaligned.hpp"
+
+#pragma GCC diagnostic push
+#pragma GCC diagnostic error "-Wpadded"
+
 
 namespace USB {
 
@@ -10,7 +15,7 @@ struct SetupData {
     std::uint16_t value;
     std::uint16_t index;
     std::uint16_t length;
-} __attribute__((packed));
+};
 
 enum class RequestType : std::uint8_t {
     Standard = 0,
@@ -55,7 +60,7 @@ enum class DescriptorType : std::uint8_t {
 struct DescriptorHeader {
     std::uint8_t length;
     std::uint8_t descriptor_type;
-} __attribute__((packed));
+};
 
 struct DeviceDescriptor {
     std::uint8_t length;
@@ -72,18 +77,18 @@ struct DeviceDescriptor {
     std::uint8_t product;
     std::uint8_t serial_number;
     std::uint8_t num_configurations;
-} __attribute__((packed));
+};
 
 struct ConfigurationDescriptor {
     std::uint8_t length;
     std::uint8_t descriptor_type;
-    std::uint16_t total_length;
+    Unaligned<std::uint16_t, Aligned1> total_length;
     std::uint8_t num_interfaces;
     std::uint8_t configuration_value;
     std::uint8_t configuration_id;
     std::uint8_t attributes;
     std::uint8_t max_power;
-} __attribute__((packed));
+};
 
 struct InterfaceDescriptor {
     std::uint8_t length;
@@ -95,15 +100,16 @@ struct InterfaceDescriptor {
     std::uint8_t interface_subclass;
     std::uint8_t interface_protocol;
     std::uint8_t interface_id;
-} __attribute__((packed));
+};
 
 struct EndpointDescriptor {
     std::uint8_t length;
     std::uint8_t descriptor_type;
     std::uint8_t endpoint_address;
     std::uint8_t attributes;
-    std::uint16_t max_packet_size;
+    Unaligned<std::uint16_t, Aligned1> max_packet_size;
     std::uint8_t interval;
-} __attribute__((packed));
+};
 
 } // namespace USB
+#pragma GCC diagnostic pop

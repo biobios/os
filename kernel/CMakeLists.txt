@@ -37,7 +37,6 @@ target_compile_options(kernel PRIVATE
     -O2
     -Wall
     -Wextra
-    -Wpadded
     -g
     -fno-exceptions
     -fno-rtti
