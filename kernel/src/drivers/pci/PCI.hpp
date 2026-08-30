@@ -2,6 +2,10 @@
 
 #include <cstdint>
 
+#pragma GCC diagnostic push
+#pragma GCC diagnostic error "-Wpadded"
+
+
 namespace PCI{
     struct PCIConfigurationHeaderCommon{
         std::uint16_t VendorID;
@@ -164,8 +168,9 @@ namespace PCI{
             return 0xFEE00000 | (static_cast<std::uint32_t>(processerID) << 12);
         }
 
-        constexpr std::uint16_t makeMSIMessageData(std::uint8_t vector, std::uint8_t deliveryMode = 0, std::uint8_t triggerMode = 1, std::uint8_t levelTriggered = 1){
+        constexpr std::uint16_t makeMSIMessageData(std::uint8_t vector, std::uint8_t deliveryMode = 0, std::uint8_t triggerMode = 0, std::uint8_t levelTriggered = 0){
             return ((triggerMode & 0b1) << 15) | ((levelTriggered & 0b1) << 14) | ((deliveryMode & 0b111) << 8) | vector;
         }
     }
 }
+#pragma GCC diagnostic pop

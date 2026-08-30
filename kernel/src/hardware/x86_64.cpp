@@ -91,7 +91,7 @@ void oz::x86_64::initIDTR() {
 constexpr std::uint64_t END_OF_INTERRUPT_REGISTER_ADDR = oz::DIRECT_MAP_OFFSET + 0xfee000b0ULL;
 __attribute__((no_caller_saved_registers))
 void oz::x86_64::notifyEndOfInterrupt() {
-    *reinterpret_cast<std::uint32_t*>(END_OF_INTERRUPT_REGISTER_ADDR) = 0;
+    *reinterpret_cast<volatile std::uint32_t*>(END_OF_INTERRUPT_REGISTER_ADDR) = 0;
 }
 
 void oz::x86_64::setPageMap(const void* map) {
@@ -167,8 +167,26 @@ void oz::x86_64::writeIO32(std::uint16_t addr, std::uint32_t value) {
     );
 }
 
-constexpr std::uint64_t localAPICIDPtr = oz::DIRECT_MAP_OFFSET + 0xfee00020ULL;
+
 
 std::uint8_t oz::x86_64::getLocalAPICID() {
-    return *reinterpret_cast<std::uint32_t*>(localAPICIDPtr) >> 24;
+    std::uint32_t eax = 1, ebx, ecx, edx;
+    __asm__ volatile("cpuid" : "=a"(eax), "=b"(ebx), "=c"(ecx), "=d"(edx) : "a"(eax));
+    return static_cast<std::uint8_t>(ebx >> 24);
+}
+
+void oz::x86_64::initAPICTimer(std::uint8_t interrupt_vector) {
+    std::uintptr_t apic_base = oz::DIRECT_MAP_OFFSET + 0xfee00000ULL;
+    volatile std::uint32_t* lvt_timer = reinterpret_cast<volatile std::uint32_t*>(apic_base + 0x320);
+    volatile std::uint32_t* initial_count = reinterpret_cast<volatile std::uint32_t*>(apic_base + 0x380);
+    volatile std::uint32_t* divide_config = reinterpret_cast<volatile std::uint32_t*>(apic_base + 0x3e0);
+
+    // Set divide config to 16
+    *divide_config = 0x3;
+
+    // Set LVT Timer to Periodic Mode (bit 17) and set the interrupt vector
+    *lvt_timer = (1 << 17) | interrupt_vector;
+
+    // Set a default count
+    *initial_count = 100000;
 }

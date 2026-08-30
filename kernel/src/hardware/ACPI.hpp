@@ -1,6 +1,11 @@
 #pragma once
 #include <cstddef>
 #include <cstdint>
+#include "utils/Unaligned.hpp"
+
+#pragma GCC diagnostic push
+#pragma GCC diagnostic error "-Wpadded"
+
 
 namespace ACPI {
 
@@ -65,5 +70,8 @@ struct RootSystemDescriptionPointer {
     std::uint64_t XsdtAddress;
     std::uint8_t ExtendedChecksum;
     std::uint8_t Reserved[3];
+    [[deprecated("Dummy field for alignment warning, do not use")]]
+    std::uint8_t dummy[4];
 };
 }  // namespace ACPI
+#pragma GCC diagnostic pop

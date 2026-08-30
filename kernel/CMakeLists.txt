@@ -1,4 +1,18 @@
-add_subdirectory(dependencies/ozlib)
+# Inject OS kernel cross-compilation flags to all subdirectories including ozlib
+add_compile_options(
+    --target=x86_64-unknown-none-elf
+    -mcmodel=kernel
+    -ffreestanding
+    -mno-red-zone
+)
+
+include(FetchContent)
+FetchContent_Declare(
+    ozlib
+    GIT_REPOSITORY https://github.com/biobios/ozlib.git
+    GIT_TAG        main
+)
+FetchContent_MakeAvailable(ozlib)
 
 file(GLOB_RECURSE KERNEL_SOURCES CONFIGURE_DEPENDS
     "src/*.cpp"
@@ -20,15 +34,10 @@ target_include_directories(kernel PRIVATE
 )
 
 target_compile_options(kernel PRIVATE
-    --target=x86_64-unknown-none-elf
     -O2
     -Wall
     -Wextra
-    -Wpadded
     -g
-    -ffreestanding
-    -mno-red-zone
-    -mcmodel=kernel
     -fno-exceptions
     -fno-rtti
     -fno-use-cxa-atexit

@@ -1,6 +1,6 @@
 COMPILER = clang++
 LINKER = ld.lld
-CFLAGS = -O2 -Wall -Wextra -Wpadded -g --target=x86_64-unknown-none-elf -g -ffreestanding -mno-red-zone -fno-exceptions -fno-rtti -std=c++20 -I $(INCLUDEDIR) -I $(INCDIR) -c
+CFLAGS = -O2 -Wall -Wextra -g --target=x86_64-unknown-none-elf -g -ffreestanding -mno-red-zone -fno-exceptions -fno-rtti -std=c++20 -I $(INCLUDEDIR) -I $(INCDIR) -c
 LFLAGS = --entry $(ENTRYPOINT) -z norelro --image-base 0x100000 -g --static -L$(LIBDIR) -lcommonstd -lozstd
 INCLUDEDIR = ./dependencies/ozlib/include/
 LIBDIR = ./dependencies/ozlib/lib/

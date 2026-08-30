@@ -47,8 +47,8 @@ void oz::Graphics::fillRect(std::uint32_t base_x, std::uint32_t base_y,
     }
     std::uint32_t x;
     std::uint32_t y;
-    for (y = 0; y < base_y + height; y++) {
-        for (x = 0; x < base_x + width; x++) {
+    for (y = base_y; y < base_y + height; y++) {
+        for (x = base_x; x < base_x + width; x++) {
             setPixel(current_color, x, y);
         }
     }

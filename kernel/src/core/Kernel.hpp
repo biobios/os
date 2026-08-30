@@ -4,7 +4,6 @@
 
 #include "memory/AddressSpace.hpp"
 #include "graphics/Graphics.hpp"
-#include "memory/KernelMemoryAllocator.hpp"
 #include "memory/IKernelMemoryAllocator.hpp"
 #include "memory/PageTable.hpp"
 #include "memory/PageTableManager.hpp"
@@ -15,8 +14,9 @@
 #include "drivers/pci/PCIUtils.hpp"
 #include "hardware/ACPIUtils.hpp"
 #include "utils/utils.hpp"
-#include <new>
 #include "drivers/usb/class/HIDKeyboardDriver.hpp"
+#include "core/Mutex.hpp"
+#include "core/IScheduler.hpp"
 
 namespace oz {
 PageTable* getMasterPML4();
@@ -44,17 +44,40 @@ struct KernelStorage {
     };
 
     template <typename... Args>
-        requires(kernel_memory_allocator<typename KernelSettings::template KernelMemoryAllocatorFunctor<typename KernelStorage<KernelSettings>::KernelAccessor1>>)
+        requires(kernel_memory_allocator<typename KernelSettings::template KernelMemoryAllocatorFunctor<KernelAccessor1>>)
     struct KernelAccessor2<Args...> : public KernelAccessor1 {
         struct Settings : public KernelAccessor1::Settings {
             using KernelMemoryAllocator = typename KernelSettings::template KernelMemoryAllocatorFunctor<KernelAccessor1>;
         };
         static consteval auto getKernelMemoryAllocator() -> Settings::KernelMemoryAllocator& {
             return kernel_storage.kernel.k_malloc;
-        }   
+        }
     };
 
-    using KernelAccessor = KernelAccessor2<>;
+    template <typename...>
+    struct KernelAccessor3;
+
+    template <typename... Args>
+        requires(scheduler<typename KernelSettings::Scheduler>)
+    struct KernelAccessor3<Args...> : public KernelAccessor2<> {
+        using Settings = KernelAccessor2<>::Settings;
+        static consteval auto getScheduler() -> Settings::Scheduler& {
+            return kernel_storage.kernel.scheduler;
+        }
+    };
+
+    template <typename... Args>
+        requires(scheduler<typename KernelSettings::template SchedulerFunctor<KernelAccessor2<>>>)
+    struct KernelAccessor3<Args...> : public KernelAccessor2<> {
+        struct Settings : public KernelAccessor2<>::Settings {
+            using Scheduler = typename KernelSettings::template SchedulerFunctor<KernelAccessor2<>>;
+        };
+        static consteval auto getScheduler() -> Settings::Scheduler& {
+            return kernel_storage.kernel.scheduler;
+        }
+    };
+
+    using KernelAccessor = KernelAccessor3<>;
 
     class Kernel : public PhysicalAddressProvider {
         using Settings = KernelAccessor::Settings;
@@ -67,6 +90,8 @@ struct KernelStorage {
         Settings::KernelMemoryAllocator k_malloc;
         PageTableManager<KernelAccessor> pt_manager;
         KernelAddressSpace<KernelAccessor> kernel_space;
+        Settings::Scheduler scheduler;
+        Mutex<KernelAccessor> graphics_mutex;
         oz_boot::PlatformInfo* platform_info_;
 
         Kernel(oz_boot::PlatformInfo* platformInfo);
@@ -131,6 +156,8 @@ void KernelStorage<KernelSettings>::Kernel::run() {
                 
                 if (xhci->initialize(fm)) {
                     sh.printString("xHCI Initialized Successfully!\n\r");
+                    xhci->scanInitialPorts();
+                    xhci->processEvents();
                 } else {
                     sh.printString("xHCI Initialization Failed!\n\r");
                 }
@@ -139,23 +166,78 @@ void KernelStorage<KernelSettings>::Kernel::run() {
         }
     }
     
+    // --- Multithreading Demo ---
+    // 1. Create Idle / Reaper thread (level 0 = 4KB stack)
+    Thread* idle_t = scheduler.createThread(0, Settings::Scheduler::idle_reaper_task, &scheduler);
+    scheduler.queueThread(idle_t);
+    
+    // 2. Create Animation thread (level 1 = 8KB stack)
+    Thread* anim_t = scheduler.createThread(1, [](void* arg) {
+        Graphics* g = static_cast<Graphics*>(arg);
+        std::uint32_t x = 0;
+        std::uint32_t y = 0;
+        int dx = 5;
+        int dy = 5;
+        Pixel color = {255, 0, 0, 0}; // Blue
+        Pixel bg = {40, 40, 40, 0};   // Background (Gray)
+        
+        // Let's get our kernel's graphics mutex
+        auto& mutex = KernelStorage<KernelSettings>::kernel_storage.kernel.graphics_mutex;
+        
+        while(1) {
+            mutex.lock();
+            
+            // Erase old square
+            g->setColor(bg);
+            g->fillRect(x, y, 20, 20);
+            
+            // Update position
+            if (x + dx >= g->getWidth() - 20 || x + dx <= 0) dx = -dx;
+            if (y + dy >= g->getHeight() - 20 || y + dy <= 0) dy = -dy;
+            x += dx;
+            y += dy;
+            
+            // Draw new square
+            g->setColor(color);
+            g->fillRect(x, y, 20, 20);
+            
+            mutex.unlock();
+            
+            // Delay to make the animation visible
+            kernel_storage.kernel.scheduler.sleep(10);
+        }
+    }, &g);
+    
+    scheduler.queueThread(anim_t);
+    
+    // 3. Start APIC Timer for preemption
+    scheduler.initMainThread();
+    oz::x86_64::initAPICTimer(32);
+    sh.printString("Started multithreading demo with Reaper!\n\r");
+    sh.repaint();
+    // ---------------------------
+    
     while (1) {
-        if (xhci) {
-            xhci->pollPorts();
-            xhci->processEvents();
+        __asm__ volatile("cli");
+
+        bool has_event = false;
+        HID::KeyEvent event;
+        if (kbd_driver && kbd_driver->getKeyboard().pop(event)) {
+            has_event = true;
         }
-        
-        if (kbd_driver) {
-            HID::KeyEvent event;
-            while (kbd_driver->getKeyboard().pop(event)) {
-                if (event.state == HID::KeyState::Pressed && event.ascii != 0) {
-                    char str[2] = {event.ascii, '\0'};
-                    dprint(str);
-                }
+
+        if (has_event) {
+            __asm__ volatile("sti");
+            if (event.state == HID::KeyState::Pressed && event.ascii != 0) {
+                char str[2] = {event.ascii, '\0'};
+                graphics_mutex.lock();
+                g.setColor({255, 255, 255, 0}); // White
+                dprint(str);
+                graphics_mutex.unlock();
             }
+        } else {
+            __asm__ volatile("sti; hlt");
         }
-        
-        // __asm__("hlt"); // HLTを呼ぶと割り込みが来るまで停止してしまうので、ポーリングの場合はコメントアウトするか、タイマー割り込み等を設定する
     }
 }
 

@@ -20,5 +20,6 @@ void writeIO8(std::uint16_t addr, std::uint8_t value);
 void writeIO16(std::uint16_t addr, std::uint16_t value);
 void writeIO32(std::uint16_t addr, std::uint32_t value);
 std::uint8_t getLocalAPICID();
+void initAPICTimer(std::uint8_t interrupt_vector);
 }
 }  // namespace oz

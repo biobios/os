@@ -1,13 +1,12 @@
 #include <cstdint>
-#include <new>
 
 #include "memory/Address.hpp"
 #include "memory/FrameManager.hpp"
 #include "core/Kernel.hpp"
+#include "core/Scheduler.hpp"
 #include "memory/KernelMemoryAllocator.hpp"
 #include "memory/PageTable.hpp"
 #include "core/bootStructures.hpp"
-#include "utils/utils.hpp"
 #include "hardware/x86_64.hpp"
 
 // Early boot page tables
@@ -109,7 +108,15 @@ struct Settings {
     using FrameManager = oz::x86_64::FrameManager;
     template <typename Accessor>
     using KernelMemoryAllocatorFunctor = oz::TLSFMemoryAllocator<Accessor>;
+    template <typename Accessor>
+    using SchedulerFunctor = oz::Scheduler<Accessor>;
 };
+
+__attribute__((interrupt))
+static void timerInterruptHandler(void* frame) {
+    oz::x86_64::notifyEndOfInterrupt();
+    oz::KernelStorage<Settings>::kernel_storage.kernel.scheduler.tick();
+}
 
 extern "C" void kernel_main(oz_boot::PlatformInfo* platformInfoPhys) {
     // 6. Convert PlatformInfo pointer to direct map virtual address
@@ -133,10 +140,12 @@ extern "C" void kernel_main(oz_boot::PlatformInfo* platformInfoPhys) {
     oz::x86_64::initIDTR();
 
     // 10. Initialize and run Kernel
-    // setKernelPtr(static_cast<void*>(&k));
     using KStorage = oz::KernelStorage<Settings>;
     new (&KStorage::kernel_storage.kernel) KStorage::Kernel{platformInfo};
-    // reinterpret_cast<KStorage::Kernel*>(&k)->run();
+    
+    // Register timer interrupt handler
+    oz::x86_64::setInterruptDescriptor(32, reinterpret_cast<void*>(timerInterruptHandler));
+
     KStorage::kernel_storage.kernel.run();
 
     while (1) __asm__ volatile("hlt");
