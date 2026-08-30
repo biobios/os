@@ -71,7 +71,3 @@ extern "C" void* memset(void* s, int c, std::size_t n) {
     return s;
 }
 
-void operator delete(void* p) noexcept { (void)p; }
-void operator delete(void* p, std::size_t) noexcept { (void)p; }
-void operator delete[](void* p) noexcept { (void)p; }
-void operator delete[](void* p, std::size_t) noexcept { (void)p; }

@@ -72,3 +72,33 @@ namespace oz{
         }
     }
 }
+namespace oz {
+namespace utils {
+    inline void memcpy(void* dest, const void* src, std::size_t count) {
+        char* d = static_cast<char*>(dest);
+        const char* s = static_cast<const char*>(src);
+        while (count--) {
+            *d++ = *s++;
+        }
+    }
+    inline void memset(void* dest, std::uint8_t val, std::size_t count) {
+        std::uint8_t* d = static_cast<std::uint8_t*>(dest);
+        while (count--) {
+            *d++ = val;
+        }
+    }
+    inline int memcmp(const void* lhs, const void* rhs, std::size_t count) {
+        const unsigned char* p1 = static_cast<const unsigned char*>(lhs);
+        const unsigned char* p2 = static_cast<const unsigned char*>(rhs);
+        while (count--) {
+            if (*p1 != *p2) return *p1 - *p2;
+            p1++; p2++;
+        }
+        return 0;
+    }
+    inline char toupper(char c) {
+        if (c >= 'a' && c <= 'z') return c - 32;
+        return c;
+    }
+}
+}

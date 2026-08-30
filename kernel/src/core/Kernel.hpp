@@ -17,6 +17,11 @@
 #include "drivers/usb/class/HIDKeyboardDriver.hpp"
 #include "core/Mutex.hpp"
 #include "core/IScheduler.hpp"
+#include "drivers/storage/ahci/AHCI.hpp"
+#include "fs/FAT32.hpp"
+#include "fs/VFS.hpp"
+#include "utils/new_delete.hpp"
+#include <memory>
 
 namespace oz {
 PageTable* getMasterPML4();
@@ -128,12 +133,16 @@ KernelStorage<KernelSettings>::Kernel::Kernel(oz_boot::PlatformInfo* platformInf
 
 template <typename KernelSettings>
 void KernelStorage<KernelSettings>::Kernel::run() {
+    oz::setKernelMemoryAllocator(KernelAccessor{});
     g.clearScreen();
     sh.printString("Finish init\n\rStart Kernel in Higher-Half!\n\r");
     sh.repaint();
 
-    kmalloc_unique_ptr<xHCIUtils::Controller, KernelAccessor> xhci;
-    kmalloc_unique_ptr<USBClassDriver::HIDKeyboardDriver, KernelAccessor> kbd_driver;
+    std::unique_ptr<xHCIUtils::Controller> xhci;
+    std::unique_ptr<USBClassDriver::HIDKeyboardDriver> kbd_driver;
+    std::unique_ptr<AHCI::Controller> ahci_ctrl;
+    std::unique_ptr<FAT32FileSystem> fat32_fs;
+    VFS vfs;
     
     if (platform_info_->RSDP) {
         ACPI::RootSystemDescriptionPointer* rsdp = reinterpret_cast<ACPI::RootSystemDescriptionPointer*>(platform_info_->RSDP);
@@ -149,8 +158,8 @@ void KernelStorage<KernelSettings>::Kernel::run() {
                 sh.printString("Found xHCI Controller! Initializing...\n\r");
                 sh.repaint();
                 
-                xhci = make_kmalloc_unique<xHCIUtils::Controller, KernelAccessor>(xhci_func);
-                kbd_driver = make_kmalloc_unique<USBClassDriver::HIDKeyboardDriver, KernelAccessor>();
+                xhci = std::make_unique<xHCIUtils::Controller>(xhci_func);
+                kbd_driver = std::make_unique<USBClassDriver::HIDKeyboardDriver>();
                 xhci->registerClassDriver(kbd_driver.get());
                 sh.printString("Initializing xHCI...\n\r");
                 
@@ -160,6 +169,40 @@ void KernelStorage<KernelSettings>::Kernel::run() {
                     xhci->processEvents();
                 } else {
                     sh.printString("xHCI Initialization Failed!\n\r");
+                }
+                sh.repaint();
+            }
+            
+            // --- AHCI Initialization ---
+            PCIUtils::PCIFunction ahci_func = mcfgWrapper.findFunction(0x01, 0x06, 0x01);
+            if (ahci_func) {
+                sh.printString("Found AHCI Controller! Initializing...\n\r");
+                sh.repaint();
+                
+                ahci_ctrl = std::make_unique<AHCI::Controller>(ahci_func);
+                if (ahci_ctrl->initialize(fm)) {
+                    sh.printString("AHCI Initialized Successfully!\n\r");
+                    AHCI::AHCIPortDevice* sata_dev = ahci_ctrl->getFirstSataDevice();
+                    if (sata_dev) {
+                        sh.printString("SATA Device Found! Mounting FAT32...\n\r");
+                        fat32_fs = std::make_unique<FAT32FileSystem>(sata_dev);
+                        if (fat32_fs->init()) {
+                            sh.printString("FAT32 Mounted Successfully!\n\r");
+                            vfs.mountRoot(fat32_fs.get());
+                            
+                            // Test reading kernel.bin
+                            auto file = vfs.open("os/kernel.bin");
+                            if (file) {
+                                sh.printString("os/kernel.bin opened successfully!\n\r");
+                            } else {
+                                sh.printString("os/kernel.bin not found.\n\r");
+                            }
+                        } else {
+                            sh.printString("FAT32 Mount Failed.\n\r");
+                        }
+                    }
+                } else {
+                    sh.printString("AHCI Initialization Failed!\n\r");
                 }
                 sh.repaint();
             }
