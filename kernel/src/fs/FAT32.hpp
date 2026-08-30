@@ -4,6 +4,8 @@
 #include <cstdint>
 #include <memory>
 
+#include "fs/BufferCache.hpp"
+
 namespace oz {
 
 #pragma pack(push, 1)
@@ -98,13 +100,14 @@ public:
 class FAT32FileSystem : public FileSystem {
 private:
     BlockDevice* block_device;
+    BufferCacheManager* cache;
     FAT32_BPB bpb;
     
     std::uint32_t fat_start_sector;
     std::uint32_t data_start_sector;
     
 public:
-    FAT32FileSystem(BlockDevice* device);
+    FAT32FileSystem(BlockDevice* device, BufferCacheManager* cache);
     ~FAT32FileSystem() override = default;
 
     bool init();

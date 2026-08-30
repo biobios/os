@@ -224,14 +224,14 @@ void FAT32Directory::close() {
 
 // --- FAT32FileSystem ---
 
-FAT32FileSystem::FAT32FileSystem(BlockDevice* device) 
-    : block_device(device), fat_start_sector(0), data_start_sector(0) {}
+FAT32FileSystem::FAT32FileSystem(BlockDevice* device, BufferCacheManager* cache) 
+    : block_device(device), cache(cache), fat_start_sector(0), data_start_sector(0) {
+    oz::utils::memset(&bpb, 0, sizeof(bpb));
+}
 
 bool FAT32FileSystem::init() {
-    getBufferCache().init(); // Initialize global cache
-
     std::uint8_t boot_sector[512];
-    if (!getBufferCache().readBlock(block_device, 0, 1, boot_sector)) {
+    if (!cache->readBlock(block_device, 0, 1, boot_sector)) {
         return false;
     }
 
@@ -255,7 +255,7 @@ std::uint32_t FAT32FileSystem::getNextCluster(std::uint32_t current_cluster) {
     std::uint32_t entry_offset = fat_offset % bpb.bytes_per_sector;
 
     std::uint8_t sector_buf[512]; // Assuming 512-byte sectors for FAT
-    if (!getBufferCache().readBlock(block_device, fat_sector, 1, sector_buf)) {
+    if (!cache->readBlock(block_device, fat_sector, 1, sector_buf)) {
         return 0x0FFFFFFF; // Error reading FAT -> EOF
     }
 
@@ -266,7 +266,7 @@ std::uint32_t FAT32FileSystem::getNextCluster(std::uint32_t current_cluster) {
 bool FAT32FileSystem::readCluster(std::uint32_t cluster, void* buffer) {
     if (cluster < 2) return false;
     std::uint32_t sector = data_start_sector + (cluster - 2) * bpb.sectors_per_cluster;
-    return getBufferCache().readBlock(block_device, sector, bpb.sectors_per_cluster, buffer);
+    return cache->readBlock(block_device, sector, bpb.sectors_per_cluster, buffer);
 }
 
 std::uint32_t FAT32FileSystem::getClusterSize() const {
@@ -401,7 +401,7 @@ std::unique_ptr<Directory> FAT32FileSystem::openDir(const char* path) {
 bool FAT32FileSystem::writeCluster(std::uint32_t cluster, const void* buffer) {
     if (cluster < 2) return false;
     std::uint32_t sector = data_start_sector + (cluster - 2) * bpb.sectors_per_cluster;
-    return getBufferCache().writeBlock(block_device, sector, bpb.sectors_per_cluster, buffer);
+    return cache->writeBlock(block_device, sector, bpb.sectors_per_cluster, buffer);
 }
 
 std::uint32_t FAT32FileSystem::allocateCluster() {
@@ -417,7 +417,7 @@ std::uint32_t FAT32FileSystem::allocateCluster() {
         std::uint32_t entry_offset = fat_offset % bpb.bytes_per_sector;
         
         if (current_fat_sector != fat_sector) {
-            if (!getBufferCache().readBlock(block_device, fat_sector, 1, sector_buf)) {
+            if (!cache->readBlock(block_device, fat_sector, 1, sector_buf)) {
                 return 0; // Error
             }
             current_fat_sector = fat_sector;
@@ -427,12 +427,12 @@ std::uint32_t FAT32FileSystem::allocateCluster() {
         if (entry_val == 0x00000000) {
             // Found a free cluster. Mark it as EOF (0x0FFFFFFF) to reserve it.
             *reinterpret_cast<std::uint32_t*>(&sector_buf[entry_offset]) = (*reinterpret_cast<std::uint32_t*>(&sector_buf[entry_offset]) & 0xF0000000) | 0x0FFFFFFF;
-            getBufferCache().writeBlock(block_device, fat_sector, 1, sector_buf);
+            cache->writeBlock(block_device, fat_sector, 1, sector_buf);
             
             // Also need to write to backup FATs if there are multiple.
             for (int i = 1; i < bpb.fat_count; ++i) {
                 std::uint32_t backup_fat_sector = fat_sector + (i * fat_size);
-                getBufferCache().writeBlock(block_device, backup_fat_sector, 1, sector_buf);
+                cache->writeBlock(block_device, backup_fat_sector, 1, sector_buf);
             }
             
             // Zero out the newly allocated cluster to prevent garbage data
@@ -454,20 +454,20 @@ bool FAT32FileSystem::setNextCluster(std::uint32_t cluster, std::uint32_t next_c
     std::uint32_t entry_offset = fat_offset % bpb.bytes_per_sector;
     
     std::uint8_t sector_buf[512];
-    if (!getBufferCache().readBlock(block_device, fat_sector, 1, sector_buf)) return false;
+    if (!cache->readBlock(block_device, fat_sector, 1, sector_buf)) return false;
     
     // Preserve the top 4 bits of the FAT32 entry
     std::uint32_t current_val = *reinterpret_cast<std::uint32_t*>(&sector_buf[entry_offset]);
     std::uint32_t new_val = (current_val & 0xF0000000) | (next_cluster & 0x0FFFFFFF);
     *reinterpret_cast<std::uint32_t*>(&sector_buf[entry_offset]) = new_val;
     
-    if (!getBufferCache().writeBlock(block_device, fat_sector, 1, sector_buf)) return false;
+    if (!cache->writeBlock(block_device, fat_sector, 1, sector_buf)) return false;
     
     // Write backup FATs
     std::uint32_t fat_size = bpb.sectors_per_fat_16 != 0 ? bpb.sectors_per_fat_16 : bpb.sectors_per_fat_32;
     for (int i = 1; i < bpb.fat_count; ++i) {
         std::uint32_t backup_fat_sector = fat_sector + (i * fat_size);
-        getBufferCache().writeBlock(block_device, backup_fat_sector, 1, sector_buf);
+        cache->writeBlock(block_device, backup_fat_sector, 1, sector_buf);
     }
     
     return true;

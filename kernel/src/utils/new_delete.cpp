@@ -32,3 +32,5 @@ void operator delete(void* p, std::size_t) noexcept {
 void operator delete[](void* p, std::size_t) noexcept {
     if (g_free) g_free(p);
 }
+
+// Stubs removed

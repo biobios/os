@@ -4,10 +4,7 @@
 
 namespace oz {
 
-BufferCacheManager& getBufferCache() {
-    static BufferCacheManager instance;
-    return instance;
-}
+
 
 BufferCacheManager::BufferCacheManager() 
     : lru_head(nullptr), lru_tail(nullptr), free_list(nullptr),
@@ -16,11 +13,7 @@ BufferCacheManager::BufferCacheManager()
     oz::utils::memset(hash_table, 0, sizeof(hash_table));
 }
 
-BufferCacheManager::~BufferCacheManager() {
-    sync(); // Flush all dirty blocks
-    delete[] cache_memory;
-    delete[] buffer_heads;
-}
+// Destructor removed
 
 void BufferCacheManager::init() {
     // Already initialized check

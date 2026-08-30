@@ -50,7 +50,7 @@ private:
 
 public:
     BufferCacheManager();
-    ~BufferCacheManager();
+    ~BufferCacheManager() = default;
     
     void init();
     
@@ -61,7 +61,6 @@ public:
     void sync(BlockDevice* device = nullptr);
 };
 
-// Global instance getter
-BufferCacheManager& getBufferCache();
+// getBufferCache is removed in favor of Kernel member
 
 } // namespace oz

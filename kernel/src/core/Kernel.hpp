@@ -20,8 +20,11 @@
 #include "drivers/storage/ahci/AHCI.hpp"
 #include "fs/FAT32.hpp"
 #include "fs/VFS.hpp"
+#include "fs/BufferCache.hpp"
 #include "utils/new_delete.hpp"
 #include <memory>
+#include "core/Process.hpp"
+#include "core/Syscall.hpp"
 
 namespace oz {
 PageTable* getMasterPML4();
@@ -96,6 +99,7 @@ struct KernelStorage {
         PageTableManager<KernelAccessor> pt_manager;
         KernelAddressSpace<KernelAccessor> kernel_space;
         Settings::Scheduler scheduler;
+        BufferCacheManager buffer_cache;
         Mutex<KernelAccessor> graphics_mutex;
         oz_boot::PlatformInfo* platform_info_;
 
@@ -134,6 +138,11 @@ KernelStorage<KernelSettings>::Kernel::Kernel(oz_boot::PlatformInfo* platformInf
 template <typename KernelSettings>
 void KernelStorage<KernelSettings>::Kernel::run() {
     oz::setKernelMemoryAllocator(KernelAccessor{});
+    kernel_storage.kernel.buffer_cache.init();
+    
+    oz::g_exit_thread_func = []() {
+        kernel_storage.kernel.scheduler.exitThread();
+    };
     g.clearScreen();
     sh.printString("Finish init\n\rStart Kernel in Higher-Half!\n\r");
     sh.repaint();
@@ -185,7 +194,7 @@ void KernelStorage<KernelSettings>::Kernel::run() {
                     AHCI::AHCIPortDevice* sata_dev = ahci_ctrl->getFirstSataDevice();
                     if (sata_dev) {
                         sh.printString("SATA Device Found! Mounting FAT32...\n\r");
-                        fat32_fs = std::make_unique<FAT32FileSystem>(sata_dev);
+                        fat32_fs = std::make_unique<FAT32FileSystem>(sata_dev, &kernel_storage.kernel.buffer_cache);
                         if (fat32_fs->init()) {
                             sh.printString("FAT32 Mounted Successfully!\n\r");
                             vfs.mountRoot(fat32_fs.get());
@@ -241,6 +250,72 @@ void KernelStorage<KernelSettings>::Kernel::run() {
         }
     }
     
+    // --- User Process Test ---
+    sh.printString("Creating user process...\n\r");
+    sh.repaint();
+
+    auto user_as = ProcessAddressSpace<KernelAccessor>::create(kernel_space);
+    if (user_as) {
+        auto code_block = fm.allocateBlock(0);
+        if (code_block) {
+            void* phys_addr = reinterpret_cast<void*>(fm.getPhysicalAddress(code_block).get());
+            void* virt_addr = phys_to_virt(createPhysicalAddress<void>(reinterpret_cast<std::uintptr_t>(phys_addr)));
+            
+            const std::uint8_t dummy_bin[] = {
+                0x48, 0xc7, 0xc0, 0x01, 0x00, 0x00, 0x00, 0x48, 0xc7, 0xc7, 0x01, 0x00,
+                0x00, 0x00, 0x48, 0x8d, 0x35, 0x15, 0x00, 0x00, 0x00, 0x48, 0xc7, 0xc2,
+                0x0e, 0x00, 0x00, 0x00, 0x0f, 0x05, 0x48, 0xc7, 0xc0, 0x3c, 0x00, 0x00,
+                0x00, 0x48, 0x31, 0xff, 0x0f, 0x05, 0x48, 0x65, 0x6c, 0x6c, 0x6f, 0x2c,
+                0x20, 0x55, 0x73, 0x65, 0x72, 0x21, 0x0a, 0x00
+            };
+            utils::memcpy(virt_addr, dummy_bin, sizeof(dummy_bin));
+            user_as->mapUser(0x400000, reinterpret_cast<std::uintptr_t>(phys_addr), MemoryFlags::Present | MemoryFlags::Writable | MemoryFlags::User | MemoryFlags::Executable);
+            
+            auto stack_block = fm.allocateBlock(0);
+            if (stack_block) {
+                void* stack_phys = reinterpret_cast<void*>(fm.getPhysicalAddress(stack_block).get());
+                std::uintptr_t stack_virt = 0x700000000000;
+                user_as->mapUser(stack_virt, reinterpret_cast<std::uintptr_t>(stack_phys), MemoryFlags::Present | MemoryFlags::Writable | MemoryFlags::User);
+                
+                // プロセスを動的確保して保持する
+                auto* proc = new Process<KernelAccessor>(1, std::move(user_as), nullptr);
+                
+                // ユーザープロセス用のカーネルスレッドを作成
+                // エントリポイントでは TSS/SyscallContext の設定をして enter_user_mode に飛ぶ
+                Thread* user_thread = scheduler.createThread(1, [](void* arg) {
+                    auto* proc_ptr = static_cast<Process<KernelAccessor>*>(arg);
+                    
+                    // 現在のスレッド情報を取得し、TSS の kernel_stack を設定する
+                    auto* current_thread = KernelStorage<KernelSettings>::kernel_storage.kernel.scheduler.getCurrentThread();
+                    std::uint64_t kernel_stack_top = reinterpret_cast<std::uint64_t>(current_thread->stack_base) + current_thread->stack_size;
+                    
+                    setSyscallKernelStack(kernel_stack_top);
+                    x86_64::setKernelStack(kernel_stack_top);
+                    
+                    // Process のアクティベート (CR3 の切り替え)
+                    proc_ptr->activate();
+                    
+                    // User stack と entry point (ここでは固定)
+                    std::uintptr_t stack_virt = 0x700000000000;
+                    
+                    // Ring 3へのジャンプ
+                    enter_user_mode(0x400000, stack_virt + 4096 - 8);
+                }, proc);
+                
+                // Thread に Process の pml4_phys を設定
+                user_thread->pml4_phys = proc->address_space->getArchContext().getPhysicalPML4();
+                user_thread->user_data = proc;
+                user_thread->cleanup = [](void* arg) {
+                    auto* p = static_cast<Process<KernelAccessor>*>(arg);
+                    delete p;
+                };
+                
+                scheduler.queueThread(user_thread);
+            }
+        }
+    }
+    // ---------------------------
+    
     // --- Multithreading Demo ---
     // 1. Create Idle / Reaper thread (level 0 = 4KB stack)
     Thread* idle_t = scheduler.createThread(0, Settings::Scheduler::idle_reaper_task, &scheduler);
@@ -256,29 +331,22 @@ void KernelStorage<KernelSettings>::Kernel::run() {
         Pixel color = {255, 0, 0, 0}; // Blue
         Pixel bg = {40, 40, 40, 0};   // Background (Gray)
         
-        // Let's get our kernel's graphics mutex
         auto& mutex = KernelStorage<KernelSettings>::kernel_storage.kernel.graphics_mutex;
         
         while(1) {
             mutex.lock();
-            
-            // Erase old square
             g->setColor(bg);
             g->fillRect(x, y, 20, 20);
             
-            // Update position
             if (x + dx >= g->getWidth() - 20 || x + dx <= 0) dx = -dx;
             if (y + dy >= g->getHeight() - 20 || y + dy <= 0) dy = -dy;
             x += dx;
             y += dy;
             
-            // Draw new square
             g->setColor(color);
             g->fillRect(x, y, 20, 20);
-            
             mutex.unlock();
             
-            // Delay to make the animation visible
             kernel_storage.kernel.scheduler.sleep(10);
         }
     }, &g);

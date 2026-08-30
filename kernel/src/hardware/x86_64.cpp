@@ -6,40 +6,68 @@
 #include "memory/Address.hpp"
 
 namespace {
-const std::uint64_t gdt[] = {
-    0x0000000000000000, /* NULL descriptor */
-    0x00af9a000000ffff, /* base=0, limit=4GB, mode=code(r-x),kernel */
-    0x00cf93000000ffff  /* base=0, limit=4GB, mode=data(rw-),kernel */
-};
+    alignas(16) std::uint64_t gdt[8] = {
+        0x0000000000000000, /* 0: NULL descriptor */
+        0x00af9a000000ffff, /* 1: Kernel Code 64-bit */
+        0x00cf93000000ffff, /* 2: Kernel Data */
+        0x00cffa000000ffff, /* 3: User Code 32-bit (for sysret) */
+        0x00cff2000000ffff, /* 4: User Data */
+        0x00affa000000ffff, /* 5: User Code 64-bit */
+        0x0000000000000000, /* 6: TSS Low */
+        0x0000000000000000  /* 7: TSS High */
+    };
+    oz::x86_64::TaskStateSegment tss = {};
 }
 
 void oz::x86_64::initGDTR() {
-    volatile std::uint64_t gdtr[2];
-    gdtr[0] = (reinterpret_cast<std::uint64_t>(&gdt) << 16) | (sizeof(gdt) - 1);
-    gdtr[1] = (reinterpret_cast<std::uint64_t>(&gdt) >> 48);
+    std::uint64_t tss_addr = reinterpret_cast<std::uint64_t>(&tss);
+    std::uint64_t base_low = tss_addr & 0xffff;
+    std::uint64_t base_mid = (tss_addr >> 16) & 0xff;
+    std::uint64_t base_high = (tss_addr >> 24) & 0xff;
+    std::uint64_t base_upper32 = tss_addr >> 32;
+
+    gdt[6] = 0x0000890000000067 | (base_low << 16) | (base_mid << 32) | (base_high << 56);
+    gdt[7] = base_upper32;
+    tss.iomap_base = sizeof(tss);
+
+    // GDTR requires 10 bytes: 2 bytes limit, 8 bytes base
+    #pragma pack(push, 1)
+    struct {
+        std::uint16_t limit;
+        std::uint64_t base;
+    } gdtr;
+    #pragma pack(pop)
+    
+    gdtr.limit = sizeof(gdt) - 1;
+    gdtr.base = reinterpret_cast<std::uint64_t>(gdt);
+
     __asm__ volatile("lgdt %[gdtr]" ::[gdtr] "m"(gdtr));
 
     __asm__ volatile(
-        "movw $0, %%ax\n"
+        "movw %[ds], %%ax\n"
         "movw %%ax, %%ds\n"
         "movw %%ax, %%es\n"
         "movw %%ax, %%fs\n"
-        "movw %%ax, %%gs\n" ::
+        "movw %%ax, %%gs\n"
+        "movw %%ax, %%ss\n" ::
+            [ds] "i" (KERNEL_DS)
             : "%ax");
 
-    std::uint16_t selector = 8;
     std::uint64_t dummy;
     __asm__ volatile(
-        "movw $16, %%ax\n"
-        "movw %%ax, %%ss\n"
         "pushq %[selector]\n"
         "leaq 1f(%%rip), %[dummy]\n"
         "pushq %[dummy]\n"
         "lretq\n"
         "1:"
         : [dummy] "=r"(dummy)
-        : [selector] "m"(selector)
-        : "%ax");
+        : [selector] "i"(KERNEL_CS));
+
+    __asm__ volatile("ltr %%ax" :: "a"(TSS_SELECTOR));
+}
+
+void oz::x86_64::setKernelStack(std::uint64_t rsp) {
+    tss.rsp0 = rsp;
 }
 
 namespace{

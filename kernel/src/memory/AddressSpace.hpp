@@ -7,6 +7,7 @@
 #include "memory/IFrameManager.hpp"
 #include "memory/MemoryFlags.hpp"
 #include "memory/x86_64AddressSpaceContext.hpp"
+#include "memory/KernelMemoryAllocator.hpp"
 
 namespace oz {
 
@@ -41,7 +42,7 @@ public:
             return nullptr;
         }
 
-        auto new_as = make_kmalloc_unique<ProcessAddressSpace, Accessor>(std::move(new_ctx));
+        auto new_as = std::make_unique<ProcessAddressSpace>(std::move(new_ctx));
         if (!new_as) {
             new_ctx.destroyProcessSpace();
         }

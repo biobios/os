@@ -165,6 +165,14 @@ public:
         next_thread->state = ThreadState::Running;
         current_thread = next_thread;
         
+        if (next_thread->pml4_phys.get() != 0) {
+            std::uint64_t current_cr3;
+            __asm__ volatile("mov %%cr3, %0" : "=r"(current_cr3));
+            if (current_cr3 != static_cast<std::uint64_t>(next_thread->pml4_phys.get())) {
+                __asm__ volatile("mov %0, %%cr3" :: "r"(static_cast<std::uint64_t>(next_thread->pml4_phys.get())));
+            }
+        }
+        
         if (prev_thread) {
             switch_context(&prev_thread->rsp, next_thread->rsp);
         } else {
@@ -216,6 +224,11 @@ public:
         
         while (current_zombie) {
             Thread* next_z = current_zombie->next_zombie;
+            
+            // Call cleanup callback if any
+            if (current_zombie->cleanup) {
+                current_zombie->cleanup(current_zombie->user_data);
+            }
             
             // Free the stack frame
             if (current_zombie->stack_block.getDescriptor() != nullptr) {

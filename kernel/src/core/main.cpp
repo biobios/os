@@ -8,6 +8,8 @@
 #include "memory/PageTable.hpp"
 #include "core/bootStructures.hpp"
 #include "hardware/x86_64.hpp"
+#include "core/Syscall.hpp"
+#include "core/Process.hpp"
 
 // Early boot page tables
 extern "C" {
@@ -138,6 +140,7 @@ extern "C" void kernel_main(oz_boot::PlatformInfo* platformInfoPhys) {
     oz::x86_64::enableSSE();
     oz::x86_64::initGDTR();
     oz::x86_64::initIDTR();
+    oz::initSyscall();
 
     // 10. Initialize and run Kernel
     using KStorage = oz::KernelStorage<Settings>;

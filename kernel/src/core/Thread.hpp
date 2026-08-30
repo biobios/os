@@ -1,6 +1,8 @@
 #pragma once
 #include <cstdint>
 #include "memory/IFrameManager.hpp"
+#include "memory/PageTable.hpp"
+#include "memory/Address.hpp"
 
 namespace oz {
 
@@ -26,7 +28,7 @@ enum class ThreadState {
     Dead
 };
 
-class Thread {
+class Thread : public PhysicalAddressProvider {
 public:
     std::uint64_t id;
     void* rsp;
@@ -42,10 +44,15 @@ public:
     Thread* next_sleep;        // For Scheduler sleep queue
     std::uint64_t wake_up_tick; // Tick count when thread should wake up
 
-    Thread(std::uint64_t id, void* stack, std::uint64_t size, PageBlock<> block, std::uint8_t level)
+    PhysicalAddress<PageTable> pml4_phys;
+    void* user_data;
+    void (*cleanup)(void*);
+
+    Thread(std::uint64_t id, void* stack, std::uint64_t size, PageBlock<> block, std::uint8_t level, PhysicalAddress<PageTable> pml4_phys = PhysicalAddressProvider::nullPhysicalAddress<PageTable>())
         : id(id), rsp(reinterpret_cast<std::uint8_t*>(stack) + size), 
           stack_base(stack), stack_size(size), stack_block(block), frame_level(level),
-          state(ThreadState::Ready), next(nullptr), next_waiter(nullptr), next_zombie(nullptr) {}
+          state(ThreadState::Ready), next(nullptr), next_waiter(nullptr), next_zombie(nullptr),
+          pml4_phys(pml4_phys), user_data(nullptr), cleanup(nullptr) {}
 };
 
 extern "C" void switch_context(void** old_rsp, void* new_rsp);
