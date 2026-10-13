@@ -1,7 +1,6 @@
 #pragma once
 
 #include <cstdint>
-#include "utils/Unaligned.hpp"
 
 #pragma GCC diagnostic push
 #pragma GCC diagnostic error "-Wpadded"
@@ -79,10 +78,10 @@ struct DeviceDescriptor {
     std::uint8_t num_configurations;
 };
 
-struct ConfigurationDescriptor {
+struct __attribute__((packed)) ConfigurationDescriptor {
     std::uint8_t length;
     std::uint8_t descriptor_type;
-    Unaligned<std::uint16_t, Aligned1> total_length;
+    std::uint16_t total_length;
     std::uint8_t num_interfaces;
     std::uint8_t configuration_value;
     std::uint8_t configuration_id;
@@ -102,12 +101,12 @@ struct InterfaceDescriptor {
     std::uint8_t interface_id;
 };
 
-struct EndpointDescriptor {
+struct __attribute__((packed)) EndpointDescriptor {
     std::uint8_t length;
     std::uint8_t descriptor_type;
     std::uint8_t endpoint_address;
     std::uint8_t attributes;
-    Unaligned<std::uint16_t, Aligned1> max_packet_size;
+    std::uint16_t max_packet_size;
     std::uint8_t interval;
 };
 

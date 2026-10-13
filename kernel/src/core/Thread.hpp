@@ -3,6 +3,7 @@
 #include "memory/IFrameManager.hpp"
 #include "memory/PageTable.hpp"
 #include "memory/Address.hpp"
+#include "core/Channel.hpp"
 
 namespace oz {
 
@@ -25,6 +26,7 @@ enum class ThreadState {
     Ready,
     Running,
     Blocked,
+    BlockedOnRecv,
     Dead
 };
 
@@ -39,7 +41,7 @@ public:
     
     ThreadState state;
     Thread* next;              // For Scheduler ready queue
-    Thread* next_waiter;       // For Mutex wait queue
+    Thread* next_waiter;       // For Mutex wait queue / Channel wait queue
     Thread* next_zombie;       // For Reaper cleanup queue
     Thread* next_sleep;        // For Scheduler sleep queue
     std::uint64_t wake_up_tick; // Tick count when thread should wake up
@@ -47,6 +49,17 @@ public:
     PhysicalAddress<PageTable> pml4_phys;
     void* user_data;
     void (*cleanup)(void*);
+    
+    std::uint64_t gs_base{0};
+    std::uint64_t kernel_gs_base{0};
+
+    // For saving user RSP during blocking syscalls
+    std::uint64_t syscall_user_rsp{0};
+
+    // For blocking IPC recv
+    CapID recv_cap_id{0};
+    IPCMessage* recv_msg_buf{nullptr};
+    bool recv_result{false};
 
     Thread(std::uint64_t id, void* stack, std::uint64_t size, PageBlock<> block, std::uint8_t level, PhysicalAddress<PageTable> pml4_phys = PhysicalAddressProvider::nullPhysicalAddress<PageTable>())
         : id(id), rsp(reinterpret_cast<std::uint8_t*>(stack) + size), 
@@ -56,7 +69,6 @@ public:
 };
 
 extern "C" void switch_context(void** old_rsp, void* new_rsp);
-extern "C" void thread_stub();
 extern "C" void thread_stub();
 
 } // namespace oz

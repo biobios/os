@@ -14,6 +14,12 @@ typedef struct
     UINT32 descriptor_version;
 } BootMemoryMap;
 
+typedef struct {
+    char name[32];
+    uint64_t base_address;
+    uint64_t size;
+} BootModuleInfo;
+
 typedef struct
 {
     uint64_t frame_buffer_base;
@@ -22,6 +28,8 @@ typedef struct
     uint32_t frame_buffer_vertical;
     uint64_t RootSytemDescriptionPointer;
     BootMemoryMap memory_map;
+    uint64_t num_modules;
+    BootModuleInfo modules[16];
 } PlatformInfo;
 
 int equalsEFI_GUID(EFI_GUID* guid1, EFI_GUID* guid2){
@@ -128,6 +136,44 @@ EFI_STATUS uefi_main(EFI_HANDLE imageHandle, EFI_SYSTEM_TABLE* systemTable)
 
     kernel_file->Close(kernel_file);
 
+    // Load modules (initrd.tar)
+    info.num_modules = 0;
+    
+    EFI_FILE_PROTOCOL* initrd_file;
+    // We open from root since assets are copied to root!
+    status = root->Open(root, &initrd_file, L"initrd.tar", EFI_FILE_MODE_READ, 0);
+    if (status == EFI_SUCCESS) {
+        UINTN file_info_size = FILE_INFO_BUF_SIZE;
+        UINTN fi_buf[FILE_INFO_BUF_SIZE / sizeof(UINTN)];
+        EFI_GUID fi_guid = EFI_FILE_INFO_ID;
+        status = initrd_file->GetInfo(initrd_file, &fi_guid, &file_info_size, fi_buf);
+        if (status == EFI_SUCCESS) {
+            EFI_FILE_INFO* fi_ptr = (EFI_FILE_INFO*)fi_buf;
+            UINT64 ModSize = fi_ptr->FileSize;
+            void* modBuffer;
+            status = systemTable->BootServices->AllocatePool(EfiLoaderData, ModSize, &modBuffer);
+            if (status == EFI_SUCCESS) {
+                status = initrd_file->Read(initrd_file, &ModSize, modBuffer);
+                if (status == EFI_SUCCESS) {
+                    info.modules[0].base_address = (uint64_t)modBuffer;
+                    info.modules[0].size = ModSize;
+                    const char* name = "initrd.tar";
+                    int j;
+                    for (j = 0; j < 31 && name[j] != 0; j++) {
+                        info.modules[0].name[j] = name[j];
+                    }
+                    info.modules[0].name[j] = '\0';
+                    info.num_modules = 1;
+                }
+            }
+        }
+        initrd_file->Close(initrd_file);
+    } else {
+        systemTable->ConOut->OutputString(systemTable->ConOut, L"initrd.tar not found!\n\r");
+        while(1) __asm__ volatile("hlt");
+    }
+
+
     //ProgramHeaderをもとにメモリを確保しバッファから移す
     Elf64_Ehdr* efiHeader = (Elf64_Ehdr*)loaderBuffer;
     Elf64_Phdr* progHeader = (Elf64_Phdr*)((char*)efiHeader + efiHeader->e_phoff);
@@ -199,4 +245,11 @@ EFI_STATUS uefi_main(EFI_HANDLE imageHandle, EFI_SYSTEM_TABLE* systemTable)
     
     while(1);
     return EFI_SUCCESS;
+}
+
+void* memcpy(void* dest, const void* src, UINTN n) {
+    char* d = dest;
+    const char* s = src;
+    while (n--) *d++ = *s++;
+    return dest;
 }

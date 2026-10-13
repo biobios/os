@@ -3,8 +3,8 @@
 
 namespace oz {
 
-__attribute__((naked)) void enter_user_mode(std::uint64_t rip, std::uint64_t user_rsp) {
-    // rdi = rip, rsi = user_rsp
+__attribute__((naked)) void enter_user_mode(std::uint64_t rip, std::uint64_t user_rsp, std::uint64_t rflags) {
+    // rdi = rip, rsi = user_rsp, rdx = rflags
     __asm__ volatile (
         "cli\n"
         "movw %0, %%ax\n"
@@ -15,7 +15,7 @@ __attribute__((naked)) void enter_user_mode(std::uint64_t rip, std::uint64_t use
         
         "pushq %0\n"        // SS = USER_DS | 3
         "pushq %%rsi\n"     // RSP = user_rsp
-        "pushq $0x202\n"    // RFLAGS = IF=1
+        "pushq %%rdx\n"     // RFLAGS = rflags
         "pushq %1\n"        // CS = USER_CS | 3
         "pushq %%rdi\n"     // RIP = rip
         

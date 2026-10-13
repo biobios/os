@@ -1,20 +1,17 @@
 #pragma once
 
-#include "drivers/usb/xhci/xHCI.hpp"
-#include "drivers/pci/PCIUtils.hpp"
-#include "memory/FrameManager.hpp"
-#include "drivers/usb/USB.hpp"
-#include "drivers/usb/class/ClassDriver.hpp"
+#include "xHCI.hpp"
+#include "USB.hpp"
 #include <cstdint>
 #include <cstddef>
 
-namespace xHCIUtils {
+namespace xHCIDriver {
 
 class Ring {
 public:
-    Ring() : buf_(nullptr), ring_size_(0), cycle_bit_(1), enqueue_index_(0) {}
+    Ring() : buf_(nullptr), buf_phys_(0), ring_size_(0), cycle_bit_(1), enqueue_index_(0) {}
     
-    void initialize(xHCI::TRB::Any volatile* buf, std::size_t size);
+    void initialize(xHCI::TRB::Any volatile* buf, std::uint64_t buf_phys, std::size_t size);
     void push(const xHCI::TRB::Any& trb);
     
     xHCI::TRB::Any volatile* getBuffer() const { return buf_; }
@@ -22,6 +19,7 @@ public:
     
 private:
     xHCI::TRB::Any volatile* buf_;
+    std::uint64_t buf_phys_;
     std::size_t ring_size_;
     std::uint32_t cycle_bit_;
     std::size_t enqueue_index_;
@@ -29,16 +27,18 @@ private:
 
 class EventRing {
 public:
-    EventRing() : buf_(nullptr), ring_size_(0), cycle_bit_(1), dequeue_index_(0) {}
+    EventRing() : buf_(nullptr), buf_phys_(0), ring_size_(0), cycle_bit_(1), dequeue_index_(0) {}
     
-    void initialize(xHCI::TRB::Any volatile* buf, std::size_t size);
+    void initialize(xHCI::TRB::Any volatile* buf, std::uint64_t buf_phys, std::size_t size);
     bool hasEvent();
     xHCI::TRB::Any pop();
     std::size_t getDequeueIndex() const { return dequeue_index_; }
     xHCI::TRB::Any volatile* getBuffer() const { return buf_; }
+    std::uint64_t getPhysicalAddress() const { return buf_phys_; }
 
 private:
     xHCI::TRB::Any volatile* buf_;
+    std::uint64_t buf_phys_;
     std::size_t ring_size_;
     std::uint32_t cycle_bit_;
     std::size_t dequeue_index_;
@@ -58,28 +58,36 @@ enum class DeviceState : std::uint8_t {
 
 struct Device {
     Ring transfer_rings[31];
-    void* control_buffer;
-    xHCI::InputContext* input_context;
-    std::uint8_t* report_buffer;
-    std::uint8_t dci_interrupt_in;
-    std::uint8_t config_value;
-    USBClassDriver::ClassDriver* driver{nullptr};
+    void* control_buffer{nullptr};
+    xHCI::InputContext* input_context{nullptr};
+    std::uint8_t* report_buffer{nullptr};
+    std::uint8_t dci_interrupt_in{0};
+    std::uint8_t config_value{0};
     DeviceState state{DeviceState::Blank};
+    std::uint64_t device_context_phys{0};
+    void* device_context_virt{nullptr};
 };
+
+struct DmaPage {
+    void* virt;
+    std::uint64_t phys;
+};
+
+using ReportCallback = void (*)(const std::uint8_t*);
 
 class Controller {
 public:
-    Controller(PCIUtils::PCIFunction pci_function);
+    Controller(std::uint64_t mmio_virt);
     
-    bool initialize(oz::x86_64::FrameManager& fm);
+    bool initialize();
     void processEvents();
     void scanInitialPorts();
     void handlePortStatusChange(std::uint8_t port_id);
-    void registerClassDriver(USBClassDriver::ClassDriver* driver);
     void clearEventInterruptStatus();
+    void setReportCallback(ReportCallback cb) { report_callback_ = cb; }
 
 private:
-    PCIUtils::PCIFunction pci_function_;
+    std::uint64_t mmio_virt_;
     xHCI::CapabilityRegisters volatile* cap_regs_;
     xHCI::OperationalRegisters volatile* op_regs_;
     xHCI::RuntimeRegisters volatile* rt_regs_;
@@ -90,13 +98,11 @@ private:
 
     std::uint64_t* dcbaa_; 
     std::uint8_t max_ports_;
-    oz::x86_64::FrameManager* fm_;
     
     Device devices_[256];
-    USBClassDriver::ClassDriver* class_drivers_[16];
-    int num_class_drivers_{0};
+    ReportCallback report_callback_{nullptr};
     
-    void configureInterrupts();
+    DmaPage allocPage();
     void reset();
     void ringDoorbell(std::uint8_t target, std::uint8_t stream_id = 0);
     void issueEnableSlotCommand();
@@ -108,4 +114,4 @@ private:
     void issueInterruptTransfer(std::uint8_t slot_id);
 };
 
-} // namespace xHCIUtils
+} // namespace xHCIDriver

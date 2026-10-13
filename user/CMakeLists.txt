@@ -22,6 +22,35 @@ target_link_libraries(init oz_syscall)
 target_link_options(init PRIVATE "-T${CMAKE_CURRENT_SOURCE_DIR}/src/init/linker.ld" "-nostdlib" "-static")
 
 # Copy the built init.elf to assets so it will be included in the disk image
-add_custom_command(TARGET init POST_BUILD
-    COMMAND ${CMAKE_COMMAND} -E copy $<TARGET_FILE:init> ${CMAKE_SOURCE_DIR}/assets/init.elf
+
+
+# console process
+add_executable(console src/console/main.cpp src/console/linker.ld)
+target_link_libraries(console oz_syscall)
+target_link_options(console PRIVATE "-T${CMAKE_CURRENT_SOURCE_DIR}/src/console/linker.ld" "-nostdlib" "-static")
+
+
+
+
+# vfs process
+add_executable(vfs src/vfs/main.cpp src/vfs/VFS.cpp src/vfs/FAT32.cpp src/vfs/BufferCache.cpp src/vfs/linker.ld)
+target_link_libraries(vfs oz_syscall ozstd)
+target_include_directories(vfs PRIVATE ${CMAKE_SOURCE_DIR}/build/_deps/ozlib-src/include)
+target_link_options(vfs PRIVATE "-T${CMAKE_CURRENT_SOURCE_DIR}/src/vfs/linker.ld" "-nostdlib" "-static")
+
+# ahci process
+add_executable(ahci src/ahci/main.cpp src/ahci/AHCI.cpp src/ahci/linker.ld)
+target_link_libraries(ahci oz_syscall ozstd)
+target_include_directories(ahci PRIVATE ${CMAKE_SOURCE_DIR}/build/_deps/ozlib-src/include)
+target_link_options(ahci PRIVATE "-T${CMAKE_CURRENT_SOURCE_DIR}/src/ahci/linker.ld" "-nostdlib" "-static")
+
+# xhci process (USB host controller + keyboard driver)
+add_executable(xhci src/xhci/main.cpp src/xhci/xHCIDriver.cpp src/xhci/HIDKeyboard.cpp src/xhci/linker.ld)
+target_link_libraries(xhci oz_syscall)
+target_link_options(xhci PRIVATE "-T${CMAKE_CURRENT_SOURCE_DIR}/src/xhci/linker.ld" "-nostdlib" "-static")
+
+add_custom_target(initrd ALL
+    COMMAND tar -cvf ${CMAKE_SOURCE_DIR}/assets/initrd.tar -C ${CMAKE_CURRENT_BINARY_DIR} init console vfs ahci xhci
+    DEPENDS init console vfs ahci xhci
 )
+target_sources(oz_syscall PRIVATE lib/malloc.cpp)

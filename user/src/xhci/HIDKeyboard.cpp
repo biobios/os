@@ -1,5 +1,4 @@
-#include "drivers/keyboard/HIDKeyboard.hpp"
-#include "utils/utils.hpp" // For dprint
+#include "HIDKeyboard.hpp"
 
 namespace HID {
 
@@ -17,7 +16,23 @@ static const char shift_keycode_map[] = {
     '\n', 0, '\b', '\t', ' ', '_', '+', '{', '}', '|', 0, ':', '"', '~', '<', '>', '?' // 0x28 - 0x38
 };
 
-Keyboard::Keyboard() {}
+void Keyboard::push(const KeyEvent& e) {
+    if (count_ < BUF_SIZE) {
+        buffer_[tail_] = e;
+        tail_ = (tail_ + 1) % BUF_SIZE;
+        count_++;
+    }
+}
+
+bool Keyboard::pop(KeyEvent& out_event) {
+    if (count_ > 0) {
+        out_event = buffer_[head_];
+        head_ = (head_ + 1) % BUF_SIZE;
+        count_--;
+        return true;
+    }
+    return false;
+}
 
 char Keyboard::keycodeToAscii(std::uint8_t keycode, bool shift) {
     if (keycode < sizeof(keycode_map)) {
@@ -59,7 +74,7 @@ void Keyboard::processReport(const std::uint8_t* report) {
             event.ascii = keycodeToAscii(key, shift_pressed);
             event.state = KeyState::Pressed;
             event.modifiers = mods;
-            buffer_.push(event);
+            push(event);
         }
     }
 
@@ -82,7 +97,7 @@ void Keyboard::processReport(const std::uint8_t* report) {
             event.ascii = keycodeToAscii(prev_key, shift_pressed);
             event.state = KeyState::Released;
             event.modifiers = mods;
-            buffer_.push(event);
+            push(event);
         }
     }
 
@@ -92,9 +107,4 @@ void Keyboard::processReport(const std::uint8_t* report) {
     }
 }
 
-bool Keyboard::pop(KeyEvent& out_event) {
-    return buffer_.pop(out_event);
-}
-
 } // namespace HID
-

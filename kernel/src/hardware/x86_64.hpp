@@ -59,6 +59,7 @@ void initGDTR();
 void setKernelStack(std::uint64_t rsp);
 void setInterruptDescriptor(std::uint8_t index, void* handler);
 void initIDTR();
+void initIRQStubs();
 __attribute__((no_caller_saved_registers))
 void notifyEndOfInterrupt();
 void setPageMap(const void* map);

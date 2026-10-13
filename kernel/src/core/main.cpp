@@ -135,6 +135,12 @@ extern "C" void kernel_main(oz_boot::PlatformInfo* platformInfoPhys) {
     platformInfo->memory_map.buffer = oz::phys_to_virt(BootInfoProvider::getPhys(static_cast<std::uint8_t*>(platformInfo->memory_map.buffer)));
     if (platformInfo->RSDP) {
         platformInfo->RSDP = oz::phys_to_virt(BootInfoProvider::getPhys(platformInfo->RSDP));
+    
+    for (std::uint64_t i = 0; i < platformInfo->num_modules; ++i) {
+        platformInfo->modules[i].base_address = reinterpret_cast<std::uint64_t>(
+            oz::phys_to_virt(BootInfoProvider::getPhys(reinterpret_cast<void*>(platformInfo->modules[i].base_address)))
+        );
+    }
     }
 
     // 9. Initialize architecture specifics

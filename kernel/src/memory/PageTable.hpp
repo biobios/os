@@ -8,7 +8,7 @@
 
 namespace oz {
 
-class PageFlags : public utils::FlagClass<std::uint64_t, PageFlags> {
+class PageFlags : public ::utils::FlagClass<std::uint64_t, PageFlags> {
 public:
     constexpr explicit PageFlags(std::uint64_t flags) : FlagClass(flags) {}
 

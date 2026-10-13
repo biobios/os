@@ -43,6 +43,12 @@ namespace oz_boot{
         std::uint64_t Attribute;
     };
 
+    struct BootModuleInfo {
+        char name[32];
+        std::uint64_t base_address;
+        std::uint64_t size;
+    };
+
     struct PlatformInfo {
         void* frame_buffer_base;
         std::uint64_t frame_buffer_size;
@@ -50,6 +56,8 @@ namespace oz_boot{
         std::uint32_t frame_buffer_vertical;
         ACPI::RootSystemDescriptionPointer* RSDP;
         BootMemoryMap memory_map;
+        std::uint64_t num_modules;
+        BootModuleInfo modules[16];
     };
 
     inline bool isAvailable(std::uint32_t type){

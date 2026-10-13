@@ -1,24 +1,16 @@
-#include "drivers/usb/xhci/xHCIUtils.hpp"
-#include "memory/Address.hpp"
-#include "utils/utils.hpp"
-#include "hardware/x86_64.hpp"
+#include "xHCIDriver.hpp"
+#include "syscall.hpp"
 
-namespace xHCIUtils {
+namespace xHCIDriver {
 
-Controller* g_xhci_controller = nullptr;
-
-__attribute__((interrupt))
-void xHCIInterruptHandler(void* frame) {
-    if (g_xhci_controller) {
-        g_xhci_controller->processEvents();
-        g_xhci_controller->clearEventInterruptStatus();
-    }
-    oz::x86_64::notifyEndOfInterrupt();
-}
+// File-scope storage for per-slot physical addresses
+static DmaPage g_control_pages[256];
+static std::uint64_t input_ctx_phys_map[256];
 
 // --- Ring Implementation ---
-void Ring::initialize(xHCI::TRB::Any volatile* buf, std::size_t size) {
+void Ring::initialize(xHCI::TRB::Any volatile* buf, std::uint64_t buf_phys, std::size_t size) {
     buf_ = buf;
+    buf_phys_ = buf_phys;
     ring_size_ = size;
     cycle_bit_ = 1;
     enqueue_index_ = 0;
@@ -46,8 +38,9 @@ void Ring::push(const xHCI::TRB::Any& trb) {
 }
 
 // --- EventRing Implementation ---
-void EventRing::initialize(xHCI::TRB::Any volatile* buf, std::size_t size) {
+void EventRing::initialize(xHCI::TRB::Any volatile* buf, std::uint64_t buf_phys, std::size_t size) {
     buf_ = buf;
+    buf_phys_ = buf_phys;
     ring_size_ = size;
     cycle_bit_ = 1;
     dequeue_index_ = 0;
@@ -73,150 +66,95 @@ xHCI::TRB::Any EventRing::pop() {
 }
 
 // --- Controller Implementation ---
-Controller::Controller(PCIUtils::PCIFunction pci_function) 
-    : pci_function_(pci_function), cap_regs_(nullptr), op_regs_(nullptr), rt_regs_(nullptr), doorbell_regs_(nullptr), dcbaa_(nullptr) {}
+Controller::Controller(std::uint64_t mmio_virt) 
+    : mmio_virt_(mmio_virt), cap_regs_(nullptr), op_regs_(nullptr), rt_regs_(nullptr), doorbell_regs_(nullptr), dcbaa_(nullptr) {}
 
-void Controller::configureInterrupts() {
-    g_xhci_controller = this;
-    oz::x86_64::setInterruptDescriptor(0x40, reinterpret_cast<void*>(xHCIInterruptHandler));
-
-    std::uint8_t msi_offset;
-    if (pci_function_.findCapability(PCI::CapabilityID_MSI, &msi_offset)) {
-        PCIUtils::MSICapabilityWrapper msi(pci_function_, msi_offset);
-        msi.setMessageAddress(PCI::x86_64::makeMSIMessageAddress(oz::x86_64::getLocalAPICID()));
-        msi.setMessageData(PCI::x86_64::makeMSIMessageData(0x40));
-        msi.enable();
-    } else if (pci_function_.findCapability(PCI::CapabilityID_MSIX, &msi_offset)) {
-        PCIUtils::MSIXCapabilityWrapper msix(pci_function_, msi_offset);
-        msix.setEntry(0, 0, PCI::x86_64::makeMSIMessageData(0x40), PCI::x86_64::makeMSIMessageAddress(oz::x86_64::getLocalAPICID()));
-        msix.enable();
-    }
+DmaPage Controller::allocPage() {
+    static std::uint64_t bump_virt = 0x300000000000;
+    auto cap = oz::sys_frame_alloc(240, 1);
+    auto phys = oz::sys_frame_phys_addr(cap);
+    oz::sys_vspace_map(0, cap, bump_virt, 0x01 | 0x02); // Read/write
+    DmaPage p{(void*)bump_virt, phys};
+    bump_virt += 4096;
+    return p;
 }
 
-bool Controller::initialize(oz::x86_64::FrameManager& fm) {
-    fm_ = &fm;
-    dprint("[xHCI] Starting Init0\r\n");
+bool Controller::initialize() {
+    oz::sys_debug_print("[xHCI] Starting Init1\n\r");
     
-    // Enable Bus Master (bit 2), Memory Space (bit 1), and Disable INTx (bit 10)
-    pci_function_.header->Command |= (1 << 10) | 0b110;
-    
-    dprint("[xHCI] PCI Command Reg: ");
-    char hex_str_cmd[17];
-    oz::utils::to_hex(pci_function_.header->Command, hex_str_cmd);
-    dprint(hex_str_cmd);
-    dprint("\r\n");
-    
-    dprint("[xHCI] Starting Init1\r\n");
-    
-    std::uint32_t bar0 = pci_function_.header->BaseAddressRegister[0];
-    std::uint32_t bar1 = pci_function_.header->BaseAddressRegister[1];
-    dprint("[xHCI] Starting Init2\r\n");
-    
-    std::uintptr_t mmio_base = bar0 & ~0xFULL;
-    if ((bar0 & 0b110) == 0b100) {
-        mmio_base |= static_cast<std::uint64_t>(bar1) << 32;
-    }
-    
-    char hex_str[17];
-    oz::utils::to_hex(mmio_base, hex_str);
-    dprint("[xHCI] MMIO Base: 0x");
-    dprint(hex_str);
-    dprint("\r\n");
-    
-    cap_regs_ = reinterpret_cast<xHCI::CapabilityRegisters volatile*>(mmio_base + oz::DIRECT_MAP_OFFSET);
-    op_regs_ = reinterpret_cast<xHCI::OperationalRegisters volatile*>(reinterpret_cast<std::uintptr_t>(cap_regs_) + cap_regs_->capLength);
-    rt_regs_ = reinterpret_cast<xHCI::RuntimeRegisters volatile*>(reinterpret_cast<std::uintptr_t>(cap_regs_) + (cap_regs_->rtsoff & ~0x1F));
-    doorbell_regs_ = reinterpret_cast<std::uint32_t volatile*>(reinterpret_cast<std::uintptr_t>(cap_regs_) + (cap_regs_->dboff & ~0x3));
+    cap_regs_ = reinterpret_cast<xHCI::CapabilityRegisters volatile*>(mmio_virt_);
+    op_regs_ = reinterpret_cast<xHCI::OperationalRegisters volatile*>(mmio_virt_ + cap_regs_->capLength);
+    rt_regs_ = reinterpret_cast<xHCI::RuntimeRegisters volatile*>(mmio_virt_ + (cap_regs_->rtsoff & ~0x1F));
+    doorbell_regs_ = reinterpret_cast<std::uint32_t volatile*>(mmio_virt_ + (cap_regs_->dboff & ~0x3));
 
-    dprint("[xHCI] DBOFF: ");
-    char hex_str_dboff[17];
-    oz::utils::to_hex(cap_regs_->dboff, hex_str_dboff);
-    dprint(hex_str_dboff);
-    dprint(", RTSOFF: ");
-    oz::utils::to_hex(cap_regs_->rtsoff, hex_str_dboff);
-    dprint(hex_str_dboff);
-    dprint("\r\n");
-
-    dprint("[xHCI] Starting Init3\r\n");
+    oz::sys_debug_print("[xHCI] Starting Init3\n\r");
     
     std::uint32_t max_scratchpads = ((cap_regs_->hcsParams2 >> 21) & 0x1F) | (((cap_regs_->hcsParams2 >> 27) & 0x1F) << 5);
     
-    dprint("[xHCI] Max Scratchpad Buffers: ");
-    char hex_str_sp[17];
-    oz::utils::to_hex(max_scratchpads, hex_str_sp);
-    dprint(hex_str_sp);
-    dprint("\r\n");
-    
     max_ports_ = static_cast<std::uint8_t>(cap_regs_->hcsParams1 >> 24);
 
-    dprint("[xHCI] Starting Reset\r\n");
+    oz::sys_debug_print("[xHCI] Starting Reset\n\r");
     reset();
-    dprint("[xHCI] Reset Done\r\n");
+    oz::sys_debug_print("[xHCI] Reset Done\n\r");
 
-    dprint("[xHCI] Allocating DCBAA\r\n");
-    oz::PageBlock<> dcbaa_block = fm.allocateBlock(0);
-    dcbaa_ = reinterpret_cast<std::uint64_t*>(oz::phys_to_virt(fm.getPhysicalAddress(dcbaa_block)));
+    oz::sys_debug_print("[xHCI] Allocating DCBAA\n\r");
+    DmaPage dcbaa_page = allocPage();
+    dcbaa_ = reinterpret_cast<std::uint64_t*>(dcbaa_page.virt);
     for(int i = 0; i < 256; i++) dcbaa_[i] = 0;
 
-    std::uint32_t hcsparams2 = cap_regs_->hcsParams2;
-    std::uint32_t max_scratchpad = ((hcsparams2 >> 21) & 0x1F) | (((hcsparams2 >> 27) & 0x1F) << 5);
-    
-    if (max_scratchpad > 0) {
-        dprint("[xHCI] Allocating Scratchpad Buffers\r\n");
-        oz::PageBlock<> scratch_array_block = fm.allocateBlock(0);
-        std::uint64_t* scratch_array = reinterpret_cast<std::uint64_t*>(oz::phys_to_virt(fm.getPhysicalAddress(scratch_array_block)));
-        for (std::uint32_t i = 0; i < max_scratchpad; ++i) {
-            oz::PageBlock<> buffer = fm.allocateBlock(0);
-            scratch_array[i] = fm.getPhysicalAddress(buffer).get();
+    if (max_scratchpads > 0) {
+        oz::sys_debug_print("[xHCI] Allocating Scratchpad Buffers\n\r");
+        DmaPage scratch_array_page = allocPage();
+        std::uint64_t* scratch_array = reinterpret_cast<std::uint64_t*>(scratch_array_page.virt);
+        for (std::uint32_t i = 0; i < max_scratchpads; ++i) {
+            DmaPage buffer = allocPage();
+            scratch_array[i] = buffer.phys;
         }
-        dcbaa_[0] = fm.getPhysicalAddress(scratch_array_block).get();
+        dcbaa_[0] = scratch_array_page.phys;
     }
     
-    dprint("[xHCI] Allocating Command Ring\r\n");
-    oz::PageBlock<> cmd_block = fm.allocateBlock(0);
-    xHCI::TRB::Any* cmd_buf = reinterpret_cast<xHCI::TRB::Any*>(oz::phys_to_virt(fm.getPhysicalAddress(cmd_block)));
+    oz::sys_debug_print("[xHCI] Allocating Command Ring\n\r");
+    DmaPage cmd_page = allocPage();
+    xHCI::TRB::Any* cmd_buf = reinterpret_cast<xHCI::TRB::Any*>(cmd_page.virt);
     std::size_t cmd_ring_size = 4096 / sizeof(xHCI::TRB::Any);
     for (std::size_t i = 0; i < cmd_ring_size; ++i) {
         cmd_buf[i].data[0] = 0; cmd_buf[i].data[1] = 0;
         cmd_buf[i].data[2] = 0; cmd_buf[i].data[3] = 0;
     }
-    command_ring_.initialize(cmd_buf, cmd_ring_size);
-    cmd_buf[cmd_ring_size - 1].data[0] = static_cast<std::uint32_t>(fm.getPhysicalAddress(cmd_block).get());
-    cmd_buf[cmd_ring_size - 1].data[1] = static_cast<std::uint32_t>(fm.getPhysicalAddress(cmd_block).get() >> 32);
+    command_ring_.initialize(cmd_buf, cmd_page.phys, cmd_ring_size);
+    cmd_buf[cmd_ring_size - 1].data[0] = static_cast<std::uint32_t>(cmd_page.phys);
+    cmd_buf[cmd_ring_size - 1].data[1] = static_cast<std::uint32_t>(cmd_page.phys >> 32);
     cmd_buf[cmd_ring_size - 1].data[3] = (static_cast<std::uint32_t>(xHCI::TRB::Type::Link) << 10) | 2;
 
-    dprint("[xHCI] Allocating Event Ring\r\n");
-    oz::PageBlock<> event_block = fm.allocateBlock(0);
-    xHCI::TRB::Any* event_buf = reinterpret_cast<xHCI::TRB::Any*>(oz::phys_to_virt(fm.getPhysicalAddress(event_block)));
+    oz::sys_debug_print("[xHCI] Allocating Event Ring\n\r");
+    DmaPage event_page = allocPage();
+    xHCI::TRB::Any* event_buf = reinterpret_cast<xHCI::TRB::Any*>(event_page.virt);
     std::size_t event_ring_size = 4096 / sizeof(xHCI::TRB::Any);
     for (std::size_t i = 0; i < event_ring_size; ++i) {
         event_buf[i].data[0] = 0; event_buf[i].data[1] = 0;
         event_buf[i].data[2] = 0; event_buf[i].data[3] = 0;
     }
-    event_ring_.initialize(event_buf, event_ring_size);
+    event_ring_.initialize(event_buf, event_page.phys, event_ring_size);
 
-    dprint("[xHCI] Allocating ERST\r\n");
-    oz::PageBlock<> erst_block = fm.allocateBlock(0);
-    xHCI::EventRingSegmentTableEntry* erst = reinterpret_cast<xHCI::EventRingSegmentTableEntry*>(oz::phys_to_virt(fm.getPhysicalAddress(erst_block)));
-    erst[0].RingSegmentBaseAddressLo = static_cast<std::uint32_t>(fm.getPhysicalAddress(event_block).get());
-    erst[0].RingSegmentBaseAddressHi = static_cast<std::uint32_t>(fm.getPhysicalAddress(event_block).get() >> 32);
+    oz::sys_debug_print("[xHCI] Allocating ERST\n\r");
+    DmaPage erst_page = allocPage();
+    xHCI::EventRingSegmentTableEntry* erst = reinterpret_cast<xHCI::EventRingSegmentTableEntry*>(erst_page.virt);
+    erst[0].RingSegmentBaseAddressLo = static_cast<std::uint32_t>(event_page.phys);
+    erst[0].RingSegmentBaseAddressHi = static_cast<std::uint32_t>(event_page.phys >> 32);
     erst[0].RingSegmentSize = event_ring_size;
     erst[0].reserved = 0;
     erst[0].reserved2 = 0;
 
-    dprint("[xHCI] Writing to OpRegs & RtRegs\r\n");
-    op_regs_->deviceContextBaseAddressArrayPointer = fm.getPhysicalAddress(dcbaa_block).get();
+    oz::sys_debug_print("[xHCI] Writing to OpRegs & RtRegs\n\r");
+    op_regs_->deviceContextBaseAddressArrayPointer = dcbaa_page.phys;
     
-    std::uint64_t cmd_phys = fm.getPhysicalAddress(cmd_block).get();
-    op_regs_->cmdRingControl = (cmd_phys & ~0x3FULL) | 1;
+    op_regs_->cmdRingControl = (cmd_page.phys & ~0x3FULL) | 1;
 
     rt_regs_->IR[0].EventRingSegmentTableSize = 1;
-    rt_regs_->IR[0].EventRingSegmentTableBaseAddress = fm.getPhysicalAddress(erst_block).get();
-    rt_regs_->IR[0].EventRingDequeuePointer = fm.getPhysicalAddress(event_block).get() | (1 << 3);
+    rt_regs_->IR[0].EventRingSegmentTableBaseAddress = erst_page.phys;
+    rt_regs_->IR[0].EventRingDequeuePointer = event_page.phys | (1 << 3);
 
-    configureInterrupts();
-
-    dprint("[xHCI] Running Controller (Interrupt Mode)\r\n");
+    oz::sys_debug_print("[xHCI] Running Controller (Interrupt Mode)\n\r");
     rt_regs_->IR[0].InterrupterManagement |= xHCI::IMAN::InterruptEnable;
     op_regs_->usbCommand |= xHCI::USBCommand::InterrupterEnable;
     
@@ -226,7 +164,7 @@ bool Controller::initialize(oz::x86_64::FrameManager& fm) {
     op_regs_->usbCommand |= xHCI::USBCommand::RunStop;
     while ((op_regs_->usbStatus & xHCI::USBStatus::HostControllerHalted) != 0) {}
 
-    dprint("[xHCI] Controller Started\r\n");
+    oz::sys_debug_print("[xHCI] Controller Started\n\r");
     return true;
 }
 
@@ -261,11 +199,7 @@ void Controller::processEvents() {
                     }
                 }
             } else {
-                dprint("[xHCI] Command Failed Code: ");
-                char hex_str[17];
-                oz::utils::to_hex(completion_code, hex_str);
-                dprint(hex_str);
-                dprint("\r\n");
+                oz::sys_debug_print("[xHCI] Command Failed Code\n\r");
             }
         } else if (type == static_cast<std::uint8_t>(xHCI::TRB::Type::TransferEvent)) {
             std::uint8_t slot_id = (event.data[3] >> 24) & 0xFF;
@@ -289,25 +223,21 @@ void Controller::processEvents() {
                         devices_[slot_id].state = DeviceState::Running;
                         issueInterruptTransfer(slot_id);
                     } else if (devices_[slot_id].state == DeviceState::Running) {
-                        if (devices_[slot_id].driver) {
-                            devices_[slot_id].driver->processReport(devices_[slot_id].report_buffer);
+                        if (report_callback_) {
+                            report_callback_(devices_[slot_id].report_buffer);
                         }
                         issueInterruptTransfer(slot_id);
                     }
                 }
             } else {
-                dprint("[xHCI] Transfer Failed Code: ");
-                char hex_str[17];
-                oz::utils::to_hex(completion_code, hex_str);
-                dprint(hex_str);
-                dprint("\r\n");
+                oz::sys_debug_print("[xHCI] Transfer Failed Code\n\r");
             }
         } else if (type == static_cast<std::uint8_t>(xHCI::TRB::Type::PortStatusChangeEvent)) {
             std::uint8_t port_id = (event.data[0] >> 24) & 0xFF;
             handlePortStatusChange(port_id);
         }
         
-        std::uint64_t erdp = reinterpret_cast<std::uint64_t>(const_cast<xHCI::TRB::Any*>(event_ring_.getBuffer())) - oz::DIRECT_MAP_OFFSET + event_ring_.getDequeueIndex() * sizeof(xHCI::TRB::Any);
+        std::uint64_t erdp = event_ring_.getPhysicalAddress() + event_ring_.getDequeueIndex() * sizeof(xHCI::TRB::Any);
         rt_regs_->IR[0].EventRingDequeuePointer = erdp | (1 << 3);
     }
 }
@@ -366,25 +296,28 @@ void Controller::issueEnableSlotCommand() {
 }
 
 void Controller::issueAddressDeviceCommand(std::uint8_t slot_id) {
-    if (!fm_) return;
-
-    oz::PageBlock<> dev_ctx_block = fm_->allocateBlock(0);
-    xHCI::DeviceContext* dev_ctx = reinterpret_cast<xHCI::DeviceContext*>(oz::phys_to_virt(fm_->getPhysicalAddress(dev_ctx_block)));
+    DmaPage dev_ctx_page = allocPage();
+    xHCI::DeviceContext* dev_ctx = reinterpret_cast<xHCI::DeviceContext*>(dev_ctx_page.virt);
     for(std::size_t i = 0; i < sizeof(xHCI::DeviceContext); ++i) reinterpret_cast<std::uint8_t*>(dev_ctx)[i] = 0;
     
-    dcbaa_[slot_id] = fm_->getPhysicalAddress(dev_ctx_block).get();
+    dcbaa_[slot_id] = dev_ctx_page.phys;
+    devices_[slot_id].device_context_phys = dev_ctx_page.phys;
+    devices_[slot_id].device_context_virt = dev_ctx_page.virt;
 
-    oz::PageBlock<> input_ctx_block = fm_->allocateBlock(0);
-    xHCI::InputContext* input_ctx = reinterpret_cast<xHCI::InputContext*>(oz::phys_to_virt(fm_->getPhysicalAddress(input_ctx_block)));
+    DmaPage input_ctx_page = allocPage();
+    xHCI::InputContext* input_ctx = reinterpret_cast<xHCI::InputContext*>(input_ctx_page.virt);
     for(std::size_t i = 0; i < sizeof(xHCI::InputContext); ++i) reinterpret_cast<std::uint8_t*>(input_ctx)[i] = 0;
+    
+    // Store for later
+    input_ctx_phys_map[slot_id] = input_ctx_page.phys;
     
     input_ctx->inputControlContext.AddContextFlags = (1 << 0) | (1 << 1);
 
     input_ctx->slotContext.Offset00h = (1 << 27);
     input_ctx->slotContext.Offset04h = (1 << 16); 
 
-    oz::PageBlock<> ep0_ring_block = fm_->allocateBlock(0);
-    xHCI::TRB::Any* ep0_ring_buf = reinterpret_cast<xHCI::TRB::Any*>(oz::phys_to_virt(fm_->getPhysicalAddress(ep0_ring_block)));
+    DmaPage ep0_ring_page = allocPage();
+    xHCI::TRB::Any* ep0_ring_buf = reinterpret_cast<xHCI::TRB::Any*>(ep0_ring_page.virt);
     std::size_t ep0_ring_size = 4096 / sizeof(xHCI::TRB::Any);
     
     for (std::size_t i = 0; i < ep0_ring_size; ++i) {
@@ -392,10 +325,10 @@ void Controller::issueAddressDeviceCommand(std::uint8_t slot_id) {
         ep0_ring_buf[i].data[2] = 0; ep0_ring_buf[i].data[3] = 0;
     }
     
-    devices_[slot_id].transfer_rings[0].initialize(ep0_ring_buf, ep0_ring_size);
+    devices_[slot_id].transfer_rings[0].initialize(ep0_ring_buf, ep0_ring_page.phys, ep0_ring_size);
     
-    ep0_ring_buf[ep0_ring_size - 1].data[0] = static_cast<std::uint32_t>(fm_->getPhysicalAddress(ep0_ring_block).get());
-    ep0_ring_buf[ep0_ring_size - 1].data[1] = static_cast<std::uint32_t>(fm_->getPhysicalAddress(ep0_ring_block).get() >> 32);
+    ep0_ring_buf[ep0_ring_size - 1].data[0] = static_cast<std::uint32_t>(ep0_ring_page.phys);
+    ep0_ring_buf[ep0_ring_size - 1].data[1] = static_cast<std::uint32_t>(ep0_ring_page.phys >> 32);
     ep0_ring_buf[ep0_ring_size - 1].data[3] = (static_cast<std::uint32_t>(xHCI::TRB::Type::Link) << 10) | 2;
     
     input_ctx->endpointContext[0].EPState = 0; 
@@ -403,14 +336,14 @@ void Controller::issueAddressDeviceCommand(std::uint8_t slot_id) {
     input_ctx->endpointContext[0].Offset04h = (4 << 3);
     input_ctx->endpointContext[0].MaxPacketSize = 8;
     
-    std::uint64_t ep0_phys = fm_->getPhysicalAddress(ep0_ring_block).get();
+    std::uint64_t ep0_phys = ep0_ring_page.phys;
     input_ctx->endpointContext[0].TRDequeuePointerLo = ep0_phys & 0xFFFFFFFF;
     input_ctx->endpointContext[0].TRDequeuePointerLo |= 1;
     input_ctx->endpointContext[0].TRDequeuePointerHi = ep0_phys >> 32;
 
     xHCI::TRB::Any cmd;
     cmd.data[0] = 0; cmd.data[1] = 0; cmd.data[2] = 0; cmd.data[3] = 0;
-    std::uint64_t input_ctx_phys = reinterpret_cast<std::uintptr_t>(input_ctx) - oz::DIRECT_MAP_OFFSET;
+    std::uint64_t input_ctx_phys = input_ctx_page.phys;
     cmd.data[0] = input_ctx_phys & 0xFFFFFFFF;
     cmd.data[1] = input_ctx_phys >> 32;
     cmd.data[3] = (static_cast<std::uint32_t>(xHCI::TRB::Type::AddressDeviceCommand) << 10) | (slot_id << 24);
@@ -421,15 +354,14 @@ void Controller::issueAddressDeviceCommand(std::uint8_t slot_id) {
     ringDoorbell(0);
 }
 
+
 void Controller::issueGetDescriptor(std::uint8_t slot_id, std::uint8_t desc_type, std::uint8_t desc_index, std::uint16_t length) {
-    if (!fm_) return;
-    
     if (!devices_[slot_id].control_buffer) {
-        oz::PageBlock<> data_block = fm_->allocateBlock(0);
-        devices_[slot_id].control_buffer = oz::phys_to_virt(fm_->getPhysicalAddress(data_block));
+        g_control_pages[slot_id] = allocPage();
+        devices_[slot_id].control_buffer = g_control_pages[slot_id].virt;
     }
     
-    std::uint64_t data_phys = reinterpret_cast<std::uintptr_t>(devices_[slot_id].control_buffer) - oz::DIRECT_MAP_OFFSET;
+    std::uint64_t data_phys = g_control_pages[slot_id].phys;
     
     xHCI::TRB::Any setup;
     setup.data[0] = 0; setup.data[1] = 0; setup.data[2] = 0; setup.data[3] = 0;
@@ -475,18 +407,28 @@ void Controller::parseConfigurationDescriptor(std::uint8_t slot_id) {
     std::uint16_t target_max_packet_size = 0;
     std::uint8_t target_interval = 0;
     std::uint8_t target_ep_addr = 0;
-    USBClassDriver::ClassDriver* matched_driver = nullptr;
     
-    for (int i = 0; i < num_class_drivers_; ++i) {
-        target_ep_addr = class_drivers_[i]->matchAndParseConfiguration(conf_desc, target_max_packet_size, target_interval);
-        if (target_ep_addr != 0) {
-            matched_driver = class_drivers_[i];
-            break;
+    std::uint8_t* p = buf + conf_desc->length;
+    std::uint8_t* end = buf + conf_desc->total_length;
+    
+    while (p < end) {
+        USB::DescriptorHeader* header = reinterpret_cast<USB::DescriptorHeader*>(p);
+        if (header->length == 0) break;
+        
+        if (header->descriptor_type == static_cast<std::uint8_t>(USB::DescriptorType::Endpoint)) {
+            USB::EndpointDescriptor* ep_desc = reinterpret_cast<USB::EndpointDescriptor*>(p);
+            if ((ep_desc->endpoint_address & 0x80) != 0 && (ep_desc->attributes & 0x03) == 3) {
+                // Interrupt In Endpoint
+                target_ep_addr = ep_desc->endpoint_address;
+                target_max_packet_size = ep_desc->max_packet_size;
+                target_interval = ep_desc->interval;
+                break;
+            }
         }
+        p += header->length;
     }
     
     if (target_ep_addr != 0) {
-        devices_[slot_id].driver = matched_driver;
         issueConfigureEndpointCommand(slot_id, target_ep_addr, target_max_packet_size, target_interval);
     }
 }
@@ -506,8 +448,7 @@ void Controller::issueConfigureEndpointCommand(std::uint8_t slot_id, std::uint8_
     input_ctx->inputControlContext.DropContextFlags = 0;
     input_ctx->inputControlContext.AddContextFlags = (1 << dci) | (1 << 0);
     
-    std::uint64_t dev_ctx_phys = dcbaa_[slot_id];
-    xHCI::DeviceContext* dev_ctx = reinterpret_cast<xHCI::DeviceContext*>(dev_ctx_phys + oz::DIRECT_MAP_OFFSET);
+    xHCI::DeviceContext* dev_ctx = reinterpret_cast<xHCI::DeviceContext*>(devices_[slot_id].device_context_virt);
     input_ctx->slotContext = dev_ctx->slotContext;
     
     std::uint32_t current_entries = input_ctx->slotContext.Offset00h >> 27;
@@ -516,8 +457,8 @@ void Controller::issueConfigureEndpointCommand(std::uint8_t slot_id, std::uint8_
         input_ctx->slotContext.Offset00h |= (dci << 27);
     }
     
-    oz::PageBlock<> ep_ring_block = fm_->allocateBlock(0);
-    xHCI::TRB::Any* ep_ring_buf = reinterpret_cast<xHCI::TRB::Any*>(oz::phys_to_virt(fm_->getPhysicalAddress(ep_ring_block)));
+    DmaPage ep_ring_page = allocPage();
+    xHCI::TRB::Any* ep_ring_buf = reinterpret_cast<xHCI::TRB::Any*>(ep_ring_page.virt);
     std::size_t ep_ring_size = 4096 / sizeof(xHCI::TRB::Any);
     
     for (std::size_t i = 0; i < ep_ring_size; ++i) {
@@ -525,10 +466,10 @@ void Controller::issueConfigureEndpointCommand(std::uint8_t slot_id, std::uint8_
         ep_ring_buf[i].data[2] = 0; ep_ring_buf[i].data[3] = 0;
     }
     
-    devices_[slot_id].transfer_rings[dci - 1].initialize(ep_ring_buf, ep_ring_size);
+    devices_[slot_id].transfer_rings[dci - 1].initialize(ep_ring_buf, ep_ring_page.phys, ep_ring_size);
     
-    ep_ring_buf[ep_ring_size - 1].data[0] = static_cast<std::uint32_t>(fm_->getPhysicalAddress(ep_ring_block).get());
-    ep_ring_buf[ep_ring_size - 1].data[1] = static_cast<std::uint32_t>(fm_->getPhysicalAddress(ep_ring_block).get() >> 32);
+    ep_ring_buf[ep_ring_size - 1].data[0] = static_cast<std::uint32_t>(ep_ring_page.phys);
+    ep_ring_buf[ep_ring_size - 1].data[1] = static_cast<std::uint32_t>(ep_ring_page.phys >> 32);
     ep_ring_buf[ep_ring_size - 1].data[3] = (static_cast<std::uint32_t>(xHCI::TRB::Type::Link) << 10) | 2;
     
     input_ctx->endpointContext[dci - 1].EPState = 0;
@@ -538,16 +479,16 @@ void Controller::issueConfigureEndpointCommand(std::uint8_t slot_id, std::uint8_
     input_ctx->endpointContext[dci - 1].Interval = interval;
     input_ctx->endpointContext[dci - 1].AverageTRBLength = 8;
     
-    std::uint64_t ep_phys = fm_->getPhysicalAddress(ep_ring_block).get();
+    std::uint64_t ep_phys = ep_ring_page.phys;
     input_ctx->endpointContext[dci - 1].TRDequeuePointerLo = ep_phys & 0xFFFFFFFF;
     input_ctx->endpointContext[dci - 1].TRDequeuePointerLo |= 1;
     input_ctx->endpointContext[dci - 1].TRDequeuePointerHi = ep_phys >> 32;
     
     xHCI::TRB::Any cmd;
     cmd.data[0] = 0; cmd.data[1] = 0; cmd.data[2] = 0; cmd.data[3] = 0;
-    std::uint64_t input_ctx_phys = reinterpret_cast<std::uintptr_t>(input_ctx) - oz::DIRECT_MAP_OFFSET;
-    cmd.data[0] = input_ctx_phys & 0xFFFFFFFF;
-    cmd.data[1] = input_ctx_phys >> 32;
+    
+    cmd.data[0] = input_ctx_phys_map[slot_id] & 0xFFFFFFFF;
+    cmd.data[1] = input_ctx_phys_map[slot_id] >> 32;
     cmd.data[3] = (static_cast<std::uint32_t>(xHCI::TRB::Type::ConfigureEndpointCommand) << 10) | (slot_id << 24);
     
     devices_[slot_id].dci_interrupt_in = dci;
@@ -556,15 +497,15 @@ void Controller::issueConfigureEndpointCommand(std::uint8_t slot_id, std::uint8_
     ringDoorbell(0);
 }
 
+static DmaPage g_report_pages[256];
+
 void Controller::issueInterruptTransfer(std::uint8_t slot_id) {
-    if (!fm_) return;
-    
     if (!devices_[slot_id].report_buffer) {
-        oz::PageBlock<> report_block = fm_->allocateBlock(0);
-        devices_[slot_id].report_buffer = reinterpret_cast<std::uint8_t*>(oz::phys_to_virt(fm_->getPhysicalAddress(report_block)));
+        g_report_pages[slot_id] = allocPage();
+        devices_[slot_id].report_buffer = reinterpret_cast<std::uint8_t*>(g_report_pages[slot_id].virt);
     }
     
-    std::uint64_t report_phys = reinterpret_cast<std::uintptr_t>(devices_[slot_id].report_buffer) - oz::DIRECT_MAP_OFFSET;
+    std::uint64_t report_phys = g_report_pages[slot_id].phys;
     
     xHCI::TRB::Any normal;
     normal.data[0] = 0; normal.data[1] = 0; normal.data[2] = 0; normal.data[3] = 0;
@@ -579,8 +520,6 @@ void Controller::issueInterruptTransfer(std::uint8_t slot_id) {
 }
 
 void Controller::issueSetConfiguration(std::uint8_t slot_id) {
-    if (!fm_) return;
-    
     xHCI::TRB::Any setup;
     setup.data[0] = 0; setup.data[1] = 0; setup.data[2] = 0; setup.data[3] = 0;
     USB::SetupData setup_data;
@@ -609,10 +548,4 @@ void Controller::issueSetConfiguration(std::uint8_t slot_id) {
     ringDoorbell(slot_id, 1);
 }
 
-void Controller::registerClassDriver(USBClassDriver::ClassDriver* driver) {
-    if (num_class_drivers_ < 16) {
-        class_drivers_[num_class_drivers_++] = driver;
-    }
-}
-
-} // namespace xHCIUtils
+} // namespace xHCIDriver

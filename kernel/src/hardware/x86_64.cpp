@@ -5,6 +5,10 @@
 
 #include "memory/Address.hpp"
 #include "utils/utils.hpp"
+#include "core/IRQDispatch.hpp"
+#include "core/IRQHandler.hpp"
+#include "core/Thread.hpp"
+#include "utils/utils.hpp"
 
 namespace {
     alignas(16) std::uint64_t gdt[8] = {
@@ -164,6 +168,49 @@ void oz::x86_64::initIDTR() {
     idtr[0] = (reinterpret_cast<std::uint64_t>(&idt) << 16) | (sizeof(idt) - 1);
     idtr[1] = (reinterpret_cast<std::uint64_t>(&idt) >> 48);
     __asm__ volatile("lidt %[idtr]" ::[idtr] "m"(idtr));
+}
+
+namespace {
+    __attribute__((no_caller_saved_registers))
+    static void handleIRQ(std::uint8_t vector) {
+        auto* handler = oz::irq::getHandler(vector);
+        if (handler) {
+            auto* waiter = handler->onInterrupt();
+            if (waiter) {
+                auto unblock = oz::irq::getUnblockFn();
+                if (unblock) unblock(waiter);
+            }
+        }
+        oz::x86_64::notifyEndOfInterrupt();
+    }
+
+#define IRQ_STUB(N) \
+    __attribute__((interrupt)) \
+    void irqStub##N(oz::x86_64::ExceptionFrame* frame) { \
+        handleIRQ(0x##N); \
+    }
+
+    IRQ_STUB(30) IRQ_STUB(31) IRQ_STUB(32) IRQ_STUB(33)
+    IRQ_STUB(34) IRQ_STUB(35) IRQ_STUB(36) IRQ_STUB(37)
+    IRQ_STUB(38) IRQ_STUB(39) IRQ_STUB(3a) IRQ_STUB(3b)
+    IRQ_STUB(3c) IRQ_STUB(3d) IRQ_STUB(3e) IRQ_STUB(3f)
+    IRQ_STUB(40) IRQ_STUB(41) IRQ_STUB(42) IRQ_STUB(43)
+    IRQ_STUB(44) IRQ_STUB(45) IRQ_STUB(46) IRQ_STUB(47)
+    IRQ_STUB(48) IRQ_STUB(49) IRQ_STUB(4a) IRQ_STUB(4b)
+    IRQ_STUB(4c) IRQ_STUB(4d) IRQ_STUB(4e) IRQ_STUB(4f)
+}
+
+void oz::x86_64::initIRQStubs() {
+#define SET_STUB(N) setInterruptDescriptor(0x##N, reinterpret_cast<void*>(irqStub##N))
+    SET_STUB(30); SET_STUB(31); SET_STUB(32); SET_STUB(33);
+    SET_STUB(34); SET_STUB(35); SET_STUB(36); SET_STUB(37);
+    SET_STUB(38); SET_STUB(39); SET_STUB(3a); SET_STUB(3b);
+    SET_STUB(3c); SET_STUB(3d); SET_STUB(3e); SET_STUB(3f);
+    SET_STUB(40); SET_STUB(41); SET_STUB(42); SET_STUB(43);
+    SET_STUB(44); SET_STUB(45); SET_STUB(46); SET_STUB(47);
+    SET_STUB(48); SET_STUB(49); SET_STUB(4a); SET_STUB(4b);
+    SET_STUB(4c); SET_STUB(4d); SET_STUB(4e); SET_STUB(4f);
+#undef SET_STUB
 }
 
 constexpr std::uint64_t END_OF_INTERRUPT_REGISTER_ADDR = oz::DIRECT_MAP_OFFSET + 0xfee000b0ULL;

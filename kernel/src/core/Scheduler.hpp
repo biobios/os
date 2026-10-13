@@ -1,6 +1,8 @@
 #pragma once
 #include "core/Thread.hpp"
 #include "core/IScheduler.hpp"
+#include "core/Syscall.hpp"
+#include "hardware/x86_64.hpp"
 #include "utils/InterruptGuard.hpp"
 #include <cstdint>
 #include <new>
@@ -43,6 +45,8 @@ public:
         Thread* thread = new (thread_obj_mem) Thread(
             next_thread_id++, stack, stack_size, block, frame_level
         );
+        thread->gs_base = oz::x86_64::readMSR(0xC0000101);
+        thread->kernel_gs_base = oz::x86_64::readMSR(0xC0000102);
 
         // 3. Set up stack for switch_context
         std::uint64_t rsp = reinterpret_cast<std::uint64_t>(thread->stack_base) + thread->stack_size;
@@ -162,8 +166,26 @@ public:
             queueThread(prev_thread);
         }
         
+        if (prev_thread) {
+            prev_thread->gs_base = oz::x86_64::readMSR(0xC0000101);
+            prev_thread->kernel_gs_base = oz::x86_64::readMSR(0xC0000102);
+            // Save the user RSP from the global SyscallContext
+            prev_thread->syscall_user_rsp = g_syscall_context.user_rsp;
+        }
+
         next_thread->state = ThreadState::Running;
         current_thread = next_thread;
+
+        if (next_thread->gs_base != 0 || next_thread->kernel_gs_base != 0) {
+            oz::x86_64::writeMSR(0xC0000101, next_thread->gs_base);
+            oz::x86_64::writeMSR(0xC0000102, next_thread->kernel_gs_base);
+        }
+        
+        std::uint64_t kernel_stack_top = reinterpret_cast<std::uint64_t>(next_thread->stack_base) + next_thread->stack_size;
+        setSyscallKernelStack(kernel_stack_top);
+        x86_64::setKernelStack(kernel_stack_top);
+        // Restore the user RSP for the next thread
+        g_syscall_context.user_rsp = next_thread->syscall_user_rsp;
         
         if (next_thread->pml4_phys.get() != 0) {
             std::uint64_t current_cr3;
