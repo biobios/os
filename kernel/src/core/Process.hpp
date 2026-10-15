@@ -18,19 +18,17 @@ public:
     >;
 
     std::uint64_t pid;
-    std::unique_ptr<AddressSpaceType> address_space;
+    AddressSpaceType address_space;
     Thread* main_thread;
     std::uint64_t entry_point;
-    std::unique_ptr<CSpace> cspace;
+    CSpace* cspace{nullptr};
     std::uint64_t mmap_bump = 0x100000000000;
 
-    Process(std::uint64_t id, std::unique_ptr<AddressSpaceType> as, Thread* thread, std::uint64_t entry = 0)
-        : pid(id), address_space(std::move(as)), main_thread(thread), entry_point(entry), cspace(new CSpace()) {}
+    Process(std::uint64_t id, AddressSpaceType as, Thread* thread, std::uint64_t entry = 0, CSpace* cs = nullptr)
+        : pid(id), address_space(std::move(as)), main_thread(thread), entry_point(entry), cspace(cs) {}
 
     void activate() {
-        if (address_space) {
-            address_space->activate();
-        }
+        address_space.activate();
     }
 };
 

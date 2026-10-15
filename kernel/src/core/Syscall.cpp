@@ -19,7 +19,7 @@ void (*g_block_thread_func)() = nullptr;
 void (*g_unblock_thread_func)(Thread*) = nullptr;
 Thread* (*g_create_thread_func)(void (*entry)(void*), void* arg) = nullptr;
 void (*g_queue_thread_func)(Thread* t) = nullptr;
-VSpaceCreateResult (*g_create_vspace_func)() = nullptr;
+VSpaceCreateResult (*g_create_vspace_func)(UntypedMemory*) = nullptr;
 bool (*g_vspace_map_fn)(void*, std::uintptr_t, std::uintptr_t, std::uint64_t) = nullptr;
 bool (*g_vspace_unmap_fn)(void*, std::uintptr_t) = nullptr;
 void (*g_register_irq_handler_fn)(std::uint8_t, IRQHandler*) = nullptr;
@@ -321,8 +321,12 @@ extern "C" std::uint64_t handleSyscall(std::uint64_t rdi, std::uint64_t rsi, std
         CSpace* cspace = get_cspace();
         if (!cspace) return -1;
         
-        auto* new_cs = new CSpace();
-        auto* cs_cap_obj = new CSpaceCap(new_cs, true);
+        UntypedMemory* untyped = get_cap_typed<UntypedMemory>(
+            cspace, 240, ObjectType::UntypedMemory, CapRights::WRITE);
+        if (!untyped) return -1;
+        
+        CSpaceCap* cs_cap_obj = untyped->retypeCSpace();
+        if (!cs_cap_obj) return -1;
         
         Capability cs_cap(cs_cap_obj, CapRights::ALL);
         CapID new_id = cspace->add(cs_cap);
@@ -353,10 +357,15 @@ extern "C" std::uint64_t handleSyscall(std::uint64_t rdi, std::uint64_t rsi, std
         CSpace* cspace = get_cspace();
         if (!cspace || !g_create_vspace_func) return -1;
         
-        VSpaceCreateResult result = g_create_vspace_func();
+        UntypedMemory* untyped = get_cap_typed<UntypedMemory>(
+            cspace, 240, ObjectType::UntypedMemory, CapRights::WRITE);
+        if (!untyped) return -1;
+        
+        VSpaceCreateResult result = g_create_vspace_func(untyped);
         if (!result.address_space) return -1;
         
-        auto* vspace = new VSpace(result.address_space, g_vspace_map_fn, g_vspace_unmap_fn);
+        auto* vspace = untyped->allocateObject<VSpace>(result.address_space, g_vspace_map_fn, g_vspace_unmap_fn);
+        if (!vspace) return -1;
         Capability vs_cap(vspace, CapRights::ALL);
         CapID new_id = cspace->add(vs_cap);
         vspace->release();
@@ -368,13 +377,18 @@ extern "C" std::uint64_t handleSyscall(std::uint64_t rdi, std::uint64_t rsi, std
         CSpace* cspace = get_cspace();
         if (!cspace || !g_register_irq_handler_fn || !g_eoi_fn) return -1;
         
+        UntypedMemory* untyped = get_cap_typed<UntypedMemory>(
+            cspace, 240, ObjectType::UntypedMemory, CapRights::WRITE);
+        if (!untyped) return -1;
+        
         std::uint8_t vector = static_cast<std::uint8_t>(rdi);
         
         ChannelEndpoint* ep = get_cap_typed<ChannelEndpoint>(
             cspace, static_cast<CapID>(rsi), ObjectType::ChannelEndpoint, CapRights::WRITE);
         if (!ep) return -1;
         
-        auto* handler = new IRQHandler(vector, g_register_irq_handler_fn, g_eoi_fn);
+        auto* handler = untyped->allocateObject<IRQHandler>(vector, g_register_irq_handler_fn, g_eoi_fn);
+        if (!handler) return -1;
         handler->setNotificationEndpoint(ep);
         handler->registerHandler();
         
@@ -400,12 +414,17 @@ extern "C" std::uint64_t handleSyscall(std::uint64_t rdi, std::uint64_t rsi, std
         CSpace* cspace = get_cspace();
         if (!cspace) return -1;
         
-        auto* ioport = new IOPort(
+        UntypedMemory* untyped = get_cap_typed<UntypedMemory>(
+            cspace, 240, ObjectType::UntypedMemory, CapRights::WRITE);
+        if (!untyped) return -1;
+        
+        auto* ioport = untyped->allocateObject<IOPort>(
             static_cast<std::uint16_t>(rdi),
             static_cast<std::uint16_t>(rsi),
             g_read_io8_fn, g_read_io16_fn, g_read_io32_fn,
             g_write_io8_fn, g_write_io16_fn, g_write_io32_fn
         );
+        if (!ioport) return -1;
         
         Capability io_cap(ioport, CapRights::ALL);
         CapID new_id = cspace->add(io_cap);
@@ -456,6 +475,57 @@ extern "C" std::uint64_t handleSyscall(std::uint64_t rdi, std::uint64_t rsi, std
         } else {
             return -1;
         }
+        return 0;
+    } else if (syscall_number == 23) {
+        // untyped_retype(untyped_cap, target_type, arg)
+        CSpace* cspace = get_cspace();
+        if (!cspace) return -1;
+
+        UntypedMemory* untyped = get_cap_typed<UntypedMemory>(
+            cspace, static_cast<CapID>(rdi), ObjectType::UntypedMemory, CapRights::WRITE);
+        if (!untyped) return -1;
+
+        ObjectType target_type = static_cast<ObjectType>(rsi);
+        KernelObject* obj = nullptr;
+
+        if (target_type == ObjectType::Frame) {
+            obj = untyped->retypeFrame(rdx); // rdx = num_pages
+        } else if (target_type == ObjectType::TCB) {
+            obj = untyped->retypeTCB(g_queue_thread_func);
+        } else if (target_type == ObjectType::CSpaceCap) {
+            obj = untyped->retypeCSpace();
+        } else if (target_type == ObjectType::ChannelEndpoint) {
+            ChannelEndpoint* end0 = nullptr;
+            ChannelEndpoint* end1 = nullptr;
+            if (!untyped->retypeChannelPair(&end0, &end1)) return -1;
+            Capability cap0(end0, CapRights::ALL);
+            Capability cap1(end1, CapRights::ALL);
+            CapID id0 = cspace->add(cap0);
+            CapID id1 = cspace->add(cap1);
+            end0->release();
+            end1->release();
+            if (id0 == INVALID_CAP_ID || id1 == INVALID_CAP_ID) return -1;
+            return (static_cast<std::uint64_t>(id1) << 32) | static_cast<std::uint64_t>(id0);
+        }
+
+        if (!obj) return -1;
+
+        Capability cap(obj, CapRights::ALL);
+        CapID new_id = cspace->add(cap);
+        obj->release();
+
+        if (new_id == INVALID_CAP_ID) return static_cast<std::uint64_t>(-1);
+        return static_cast<std::uint64_t>(new_id);
+    } else if (syscall_number == 24) {
+        // untyped_revoke(untyped_cap)
+        CSpace* cspace = get_cspace();
+        if (!cspace) return -1;
+
+        UntypedMemory* untyped = get_cap_typed<UntypedMemory>(
+            cspace, static_cast<CapID>(rdi), ObjectType::UntypedMemory, CapRights::WRITE);
+        if (!untyped) return -1;
+
+        untyped->revoke();
         return 0;
     }
     

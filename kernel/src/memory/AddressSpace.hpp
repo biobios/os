@@ -7,7 +7,6 @@
 #include "memory/IFrameManager.hpp"
 #include "memory/MemoryFlags.hpp"
 #include "memory/x86_64AddressSpaceContext.hpp"
-#include "memory/KernelMemoryAllocator.hpp"
 
 namespace oz {
 
@@ -36,17 +35,13 @@ private:
 public:
     explicit ProcessAddressSpace(ArchContext ctx) : arch_ctx(std::move(ctx)) {}
 
-    static std::unique_ptr<ProcessAddressSpace> create(const KernelAddressSpace<Accessor, ArchContext>& kernel_space) {
+    static ProcessAddressSpace create(const KernelAddressSpace<Accessor, ArchContext>& kernel_space) {
         ArchContext new_ctx = ArchContext::cloneProcessSpace(kernel_space.getArchContext());
-        if (!new_ctx.isValid()) {
-            return nullptr;
-        }
+        return ProcessAddressSpace(std::move(new_ctx));
+    }
 
-        auto new_as = std::make_unique<ProcessAddressSpace>(std::move(new_ctx));
-        if (!new_as) {
-            new_ctx.destroyProcessSpace();
-        }
-        return new_as;
+    bool isValid() const {
+        return arch_ctx.isValid();
     }
 
     bool mapUser(std::uintptr_t virt_addr, PhysicalAddress<void> phys_addr, MemoryFlags flags) {

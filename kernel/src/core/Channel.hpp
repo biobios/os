@@ -36,7 +36,7 @@ private:
     Thread* waiter_tail{nullptr};
 
 public:
-    ChannelEndpoint() : KernelObject(ObjectType::ChannelEndpoint) {}
+    explicit ChannelEndpoint(bool untyped = false) : KernelObject(ObjectType::ChannelEndpoint, untyped) {}
     
     ~ChannelEndpoint() override {
         if (peer) {
@@ -114,13 +114,6 @@ public:
         return waiter_head != nullptr;
     }
 };
-
-inline void create_channel_pair(ChannelEndpoint** out_end0, ChannelEndpoint** out_end1) {
-    *out_end0 = new ChannelEndpoint();
-    *out_end1 = new ChannelEndpoint();
-    (*out_end0)->set_peer(*out_end1);
-    (*out_end1)->set_peer(*out_end0);
-}
 
 } // namespace oz
 

@@ -61,6 +61,8 @@ public:
     IPCMessage* recv_msg_buf{nullptr};
     bool recv_result{false};
 
+    bool is_untyped_backed{false};
+
     Thread(std::uint64_t id, void* stack, std::uint64_t size, PageBlock<> block, std::uint8_t level, PhysicalAddress<PageTable> pml4_phys = PhysicalAddressProvider::nullPhysicalAddress<PageTable>())
         : id(id), rsp(reinterpret_cast<std::uint8_t*>(stack) + size), 
           stack_base(stack), stack_size(size), stack_block(block), frame_level(level),

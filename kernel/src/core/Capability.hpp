@@ -41,18 +41,26 @@ protected:
     // release() once it has handed the object to a Capability/CSpace.
     std::uint32_t ref_count{1};
     ObjectType obj_type_{ObjectType::Unknown};
+    bool is_untyped_backed_{false};
 public:
-    explicit KernelObject(ObjectType t = ObjectType::Unknown) : obj_type_(t) {}
+    explicit KernelObject(ObjectType t = ObjectType::Unknown, bool untyped = false)
+        : obj_type_(t), is_untyped_backed_(untyped) {}
     virtual ~KernelObject() = default;
 
     ObjectType objectType() const { return obj_type_; }
+    bool isUntypedBacked() const { return is_untyped_backed_; }
+    void setUntypedBacked(bool untyped) { is_untyped_backed_ = untyped; }
 
     void add_ref() { ref_count++; }
     void release() {
         if (ref_count > 0) {
             ref_count--;
             if (ref_count == 0) {
-                delete this;
+                if (!is_untyped_backed_) {
+                    delete this;
+                } else {
+                    this->~KernelObject();
+                }
             }
         }
     }

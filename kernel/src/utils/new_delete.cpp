@@ -1,36 +1,25 @@
 #include "utils/new_delete.hpp"
+#include "utils/utils.hpp"
 #include <cstddef>
 #include <new>
 
-static void* (*g_malloc)(std::size_t) = nullptr;
-static void (*g_free)(void*) = nullptr;
-
-namespace oz {
-    void setMallocAndFree(void* (*malloc_func)(std::size_t), void (*free_func)(void*)) {
-        g_malloc = malloc_func;
-        g_free = free_func;
+// In a capability-based microkernel, dynamic heap allocation (unplaced operator new) is eliminated.
+// All kernel objects must be retyped from UntypedMemory capabilities via placement new.
+[[noreturn]] static void panic_no_heap() {
+    dprint("\n\r[Kernel Panic] Kernel heap allocation (operator new) is disabled in capability-based OS!\n\r");
+    while (true) {
+        asm volatile("hlt");
     }
 }
 
-void* operator new(std::size_t size) {
-    if (g_malloc) return g_malloc(size);
-    return nullptr;
+void* operator new(std::size_t) {
+    panic_no_heap();
 }
-void* operator new[](std::size_t size) {
-    if (g_malloc) return g_malloc(size);
-    return nullptr;
+void* operator new[](std::size_t) {
+    panic_no_heap();
 }
-void operator delete(void* p) noexcept {
-    if (g_free) g_free(p);
-}
-void operator delete[](void* p) noexcept {
-    if (g_free) g_free(p);
-}
-void operator delete(void* p, std::size_t) noexcept {
-    if (g_free) g_free(p);
-}
-void operator delete[](void* p, std::size_t) noexcept {
-    if (g_free) g_free(p);
-}
+void operator delete(void*) noexcept {}
+void operator delete[](void*) noexcept {}
+void operator delete(void*, std::size_t) noexcept {}
+void operator delete[](void*, std::size_t) noexcept {}
 
-// Stubs removed

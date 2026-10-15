@@ -12,11 +12,11 @@ private:
     bool owned_;  // If true, CSpaceCap owns the CSpace and will delete it on destruction
 
 public:
-    explicit CSpaceCap(CSpace* cs, bool owned = false)
-        : KernelObject(ObjectType::CSpaceCap), cspace_(cs), owned_(owned) {}
+    explicit CSpaceCap(CSpace* cs, bool owned = false, bool untyped = false)
+        : KernelObject(ObjectType::CSpaceCap, untyped), cspace_(cs), owned_(owned) {}
 
     ~CSpaceCap() override {
-        if (owned_ && cspace_) {
+        if (owned_ && cspace_ && !is_untyped_backed_) {
             delete cspace_;
         }
     }

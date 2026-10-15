@@ -4,7 +4,6 @@
 #include "memory/FrameManager.hpp"
 #include "core/Kernel.hpp"
 #include "core/Scheduler.hpp"
-#include "memory/KernelMemoryAllocator.hpp"
 #include "memory/PageTable.hpp"
 #include "core/bootStructures.hpp"
 #include "hardware/x86_64.hpp"
@@ -109,8 +108,6 @@ public:
 
 struct Settings {
     using FrameManager = oz::x86_64::FrameManager;
-    template <typename Accessor>
-    using KernelMemoryAllocatorFunctor = oz::TLSFMemoryAllocator<Accessor>;
     template <typename Accessor>
     using SchedulerFunctor = oz::Scheduler<Accessor>;
 };

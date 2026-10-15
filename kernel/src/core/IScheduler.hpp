@@ -6,8 +6,7 @@
 namespace oz {
 
 template <typename Scheduler>
-concept scheduler = requires(Scheduler sched, std::uint8_t level, void (*entry)(void*), void* arg, Thread* thread) {
-    { sched.createThread(level, entry, arg) } -> std::same_as<Thread*>;
+concept scheduler = requires(Scheduler sched, void (*entry)(void*), void* arg, Thread* thread) {
     { sched.initMainThread() } -> std::same_as<void>;
     { sched.queueThread(thread) } -> std::same_as<void>;
     { sched.schedule() } -> std::same_as<void>;

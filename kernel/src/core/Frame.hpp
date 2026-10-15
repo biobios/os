@@ -16,8 +16,9 @@ private:
 
 public:
     Frame(std::uintptr_t phys, std::size_t size, bool device,
-          void* cleanup_data = nullptr, void (*cleanup_fn)(void*) = nullptr)
-        : KernelObject(ObjectType::Frame),
+          void* cleanup_data = nullptr, void (*cleanup_fn)(void*) = nullptr,
+          bool untyped = false)
+        : KernelObject(ObjectType::Frame, untyped),
           phys_addr_(phys), size_(size), is_device_(device),
           cleanup_data_(cleanup_data), cleanup_fn_(cleanup_fn) {}
     

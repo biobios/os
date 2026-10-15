@@ -131,6 +131,14 @@ int sys_ioport_write(std::uint32_t ioport_cap, std::uint16_t port, std::uint64_t
     return static_cast<int>(syscall(22, ioport_cap, port, value, width, 0, 0));
 }
 
+std::uint32_t sys_untyped_retype(std::uint32_t untyped_cap, std::uint32_t target_type, std::uint64_t arg) {
+    return static_cast<std::uint32_t>(syscall(23, untyped_cap, target_type, arg, 0, 0, 0));
+}
+
+int sys_untyped_revoke(std::uint32_t untyped_cap) {
+    return static_cast<int>(syscall(24, untyped_cap, 0, 0, 0, 0, 0));
+}
+
 } // extern "C"
 
 } // namespace oz

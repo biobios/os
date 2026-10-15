@@ -31,24 +31,19 @@ private:
 public:
     Scheduler() = default;
 
-    Thread* createThread(std::uint8_t frame_level, void (*entry)(void*), void* arg) {
-        auto& fm = Accessor::getFrameManager();
-        auto& allocator = Accessor::getKernelMemoryAllocator();
+    Thread* initThread(Thread* thread, void* stack, std::uint64_t stack_size, void (*entry)(void*), void* arg) {
+        thread->id = next_thread_id++;
+        thread->stack_base = stack;
+        thread->stack_size = stack_size;
+        setupThreadContext(thread, entry, arg);
+        return thread;
+    }
 
-        // 1. Allocate Stack via FrameManager
-        PageBlock<> block = fm.allocateBlock(frame_level);
-        void* stack = phys_to_virt(fm.getPhysicalAddress(block));
-        std::uint64_t stack_size = (1ULL << frame_level) * fm.FRAME_SIZE;
-
-        // 2. Allocate Thread object via KernelMemoryAllocator
-        void* thread_obj_mem = allocator.malloc(sizeof(Thread));
-        Thread* thread = new (thread_obj_mem) Thread(
-            next_thread_id++, stack, stack_size, block, frame_level
-        );
+    void setupThreadContext(Thread* thread, void (*entry)(void*), void* arg) {
         thread->gs_base = oz::x86_64::readMSR(0xC0000101);
         thread->kernel_gs_base = oz::x86_64::readMSR(0xC0000102);
 
-        // 3. Set up stack for switch_context
+        // Set up stack for switch_context
         std::uint64_t rsp = reinterpret_cast<std::uint64_t>(thread->stack_base) + thread->stack_size;
         rsp &= ~15ULL; // 16-byte align
 
@@ -63,16 +58,14 @@ public:
         ctx->r14 = reinterpret_cast<std::uint64_t>(this); // Pass scheduler ptr
         ctx->r15 = 0;
         ctx->rbp = 0;
-
-        return thread;
     }
 
     void initMainThread() {
-        auto& allocator = Accessor::getKernelMemoryAllocator();
-        void* thread_obj_mem = allocator.malloc(sizeof(Thread));
-        Thread* thread = new (thread_obj_mem) Thread(
+        alignas(Thread) static std::uint8_t main_thread_storage[sizeof(Thread)];
+        Thread* thread = new (main_thread_storage) Thread(
             next_thread_id++, nullptr, 0, PageBlock<>{nullptr}, 0
         );
+        thread->is_untyped_backed = true;
         thread->state = ThreadState::Running;
         current_thread = thread;
     }
@@ -241,9 +234,6 @@ public:
             zombie_queue_tail = nullptr;
         }
         
-        auto& fm = Accessor::getFrameManager();
-        auto& allocator = Accessor::getKernelMemoryAllocator();
-        
         while (current_zombie) {
             Thread* next_z = current_zombie->next_zombie;
             
@@ -251,14 +241,6 @@ public:
             if (current_zombie->cleanup) {
                 current_zombie->cleanup(current_zombie->user_data);
             }
-            
-            // Free the stack frame
-            if (current_zombie->stack_block.getDescriptor() != nullptr) {
-                fm.freeBlock(current_zombie->stack_block);
-            }
-            
-            // Free the Thread object
-            allocator.free(current_zombie);
             
             current_zombie = next_z;
         }

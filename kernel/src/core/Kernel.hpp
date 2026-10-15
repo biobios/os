@@ -5,7 +5,6 @@
 
 #include "memory/AddressSpace.hpp"
 #include "graphics/Graphics.hpp"
-#include "memory/IKernelMemoryAllocator.hpp"
 #include "memory/PageTable.hpp"
 #include "memory/PageTableManager.hpp"
 #include "memory/paging.hpp"
@@ -18,7 +17,6 @@
 #include "core/Mutex.hpp"
 #include "core/IScheduler.hpp"
 
-#include "fs/BufferCache.hpp"
 #include "utils/new_delete.hpp"
 #include <memory>
 #include "core/Process.hpp"
@@ -49,49 +47,26 @@ struct KernelStorage {
     struct KernelAccessor2;
 
     template <typename... Args>
-        requires(kernel_memory_allocator<typename KernelSettings::KernelMemoryAllocator>)
+        requires(scheduler<typename KernelSettings::Scheduler>)
     struct KernelAccessor2<Args...> : public KernelAccessor1 {
         using Settings = KernelAccessor1::Settings;
-        static consteval auto getKernelMemoryAllocator() -> Settings::KernelMemoryAllocator& {
-            return kernel_storage.kernel.k_malloc;
+        static consteval auto getScheduler() -> Settings::Scheduler& {
+            return kernel_storage.kernel.scheduler;
         }
     };
 
     template <typename... Args>
-        requires(kernel_memory_allocator<typename KernelSettings::template KernelMemoryAllocatorFunctor<KernelAccessor1>>)
+        requires(scheduler<typename KernelSettings::template SchedulerFunctor<KernelAccessor1>>)
     struct KernelAccessor2<Args...> : public KernelAccessor1 {
         struct Settings : public KernelAccessor1::Settings {
-            using KernelMemoryAllocator = typename KernelSettings::template KernelMemoryAllocatorFunctor<KernelAccessor1>;
-        };
-        static consteval auto getKernelMemoryAllocator() -> Settings::KernelMemoryAllocator& {
-            return kernel_storage.kernel.k_malloc;
-        }
-    };
-
-    template <typename...>
-    struct KernelAccessor3;
-
-    template <typename... Args>
-        requires(scheduler<typename KernelSettings::Scheduler>)
-    struct KernelAccessor3<Args...> : public KernelAccessor2<> {
-        using Settings = KernelAccessor2<>::Settings;
-        static consteval auto getScheduler() -> Settings::Scheduler& {
-            return kernel_storage.kernel.scheduler;
-        }
-    };
-
-    template <typename... Args>
-        requires(scheduler<typename KernelSettings::template SchedulerFunctor<KernelAccessor2<>>>)
-    struct KernelAccessor3<Args...> : public KernelAccessor2<> {
-        struct Settings : public KernelAccessor2<>::Settings {
-            using Scheduler = typename KernelSettings::template SchedulerFunctor<KernelAccessor2<>>;
+            using Scheduler = typename KernelSettings::template SchedulerFunctor<KernelAccessor1>;
         };
         static consteval auto getScheduler() -> Settings::Scheduler& {
             return kernel_storage.kernel.scheduler;
         }
     };
 
-    using KernelAccessor = KernelAccessor3<>;
+    using KernelAccessor = KernelAccessor2<>;
 
     class Kernel : public PhysicalAddressProvider {
         using Settings = KernelAccessor::Settings;
@@ -101,11 +76,9 @@ struct KernelStorage {
 
     public:
         Settings::FrameManager fm;
-        Settings::KernelMemoryAllocator k_malloc;
         PageTableManager<KernelAccessor> pt_manager;
         KernelAddressSpace<KernelAccessor> kernel_space;
         Settings::Scheduler scheduler;
-        BufferCacheManager buffer_cache;
         Mutex<KernelAccessor> graphics_mutex;
         oz_boot::PlatformInfo* platform_info_;
 
@@ -113,7 +86,7 @@ struct KernelStorage {
         void run();
 
     private:
-        Thread* loadProcessFromElfBuffer(const std::uint8_t* file_buf, std::size_t file_size);
+        Thread* loadProcessFromElfBuffer(UntypedMemory& boot_untyped, const std::uint8_t* file_buf, std::size_t file_size);
 
     public:
 
@@ -138,7 +111,6 @@ KernelStorage<KernelSettings>::Kernel::Kernel(oz_boot::PlatformInfo* platformInf
         platformInfo->frame_buffer_vertical)
     , sh(&g)
     , fm(&platformInfo->memory_map, oz::paging::x86_64::page_sizes[0])
-    , k_malloc()
     , pt_manager(getMasterPML4())
     , kernel_space(getMasterPML4(), createPhysicalAddress<PageTable>(reinterpret_cast<std::uintptr_t>(getMasterPML4()) - oz::KERNEL_VIRT_OFFSET))
     , platform_info_(platformInfo)
@@ -149,8 +121,6 @@ KernelStorage<KernelSettings>::Kernel::Kernel(oz_boot::PlatformInfo* platformInf
 template <typename KernelSettings>
 void KernelStorage<KernelSettings>::Kernel::run() {
     oz::x86_64::initIRQStubs();
-    oz::setKernelMemoryAllocator(KernelAccessor{});
-    kernel_storage.kernel.buffer_cache.init();
     
     oz::g_exit_thread_func = []() {
         kernel_storage.kernel.scheduler.exitThread();
@@ -159,7 +129,7 @@ void KernelStorage<KernelSettings>::Kernel::run() {
         auto* thread = kernel_storage.kernel.scheduler.getCurrentThread();
         if (!thread || !thread->user_data) return nullptr;
         auto* proc = static_cast<Process<KernelAccessor>*>(thread->user_data);
-        return proc->cspace.get();
+        return proc->cspace;
     };
     oz::g_get_current_thread_func = []() -> Thread* {
         return kernel_storage.kernel.scheduler.getCurrentThread();
@@ -172,19 +142,18 @@ void KernelStorage<KernelSettings>::Kernel::run() {
     oz::g_unblock_thread_func = [](Thread* t) {
         kernel_storage.kernel.scheduler.queueThread(t);
     };
-    oz::g_create_thread_func = [](void (*entry)(void*), void* arg) -> Thread* {
-        return kernel_storage.kernel.scheduler.createThread(1, entry, arg);
-    };
+    oz::g_create_thread_func = nullptr;
     oz::g_queue_thread_func = [](Thread* t) {
         kernel_storage.kernel.scheduler.queueThread(t);
     };
-    oz::g_create_vspace_func = []() -> VSpaceCreateResult {
+    oz::g_create_vspace_func = [](UntypedMemory* untyped) -> VSpaceCreateResult {
+        if (!untyped) return {nullptr, nullptr};
         auto user_as = ProcessAddressSpace<KernelAccessor>::create(kernel_storage.kernel.kernel_space);
-        if (!user_as) return {nullptr, nullptr};
-        auto pml4 = user_as->getArchContext().getPhysicalPML4();
-        // Release ownership - caller is responsible for managing this
-        auto* raw_ptr = user_as.release();
-        return {raw_ptr, reinterpret_cast<void*>(pml4.get())};
+        if (!user_as.isValid()) return {nullptr, nullptr};
+        auto pml4 = user_as.getArchContext().getPhysicalPML4();
+        auto* as_obj = untyped->allocateObject<ProcessAddressSpace<KernelAccessor>>(std::move(user_as));
+        if (!as_obj) return {nullptr, nullptr};
+        return {as_obj, reinterpret_cast<void*>(pml4.get())};
     };
     oz::g_vspace_map_fn = [](void* as, std::uintptr_t virt, std::uintptr_t phys, std::uint64_t flags) -> bool {
         MemoryFlags mem_flags = MemoryFlags::Present | MemoryFlags::User;
@@ -296,6 +265,10 @@ void KernelStorage<KernelSettings>::Kernel::run() {
     sh.printString("Loading servers from initrd...\n\r");
     sh.repaint();
 
+    PageBlock boot_ut_block = fm.allocateBlock(5); // 32 pages = 128KB
+    std::uintptr_t boot_ut_phys = fm.getPhysicalAddress(boot_ut_block).get();
+    UntypedMemory boot_untyped(boot_ut_phys, 32 * 4096, nullptr, nullptr, false, true);
+
     Thread* console_thread = nullptr;
     Thread* init_thread = nullptr;
     Thread* vfs_thread = nullptr;
@@ -357,11 +330,11 @@ void KernelStorage<KernelSettings>::Kernel::run() {
             const char* xhci_name = "xhci";
             for (int j=0; j<4; ++j) if(name[j] != xhci_name[j]) is_xhci = false;
 
-            if (is_console) console_thread = loadProcessFromElfBuffer(file_data, file_size);
-            if (is_init) init_thread = loadProcessFromElfBuffer(file_data, file_size);
-            if (is_vfs) vfs_thread = loadProcessFromElfBuffer(file_data, file_size);
-            if (is_ahci) ahci_thread = loadProcessFromElfBuffer(file_data, file_size);
-            if (is_xhci) xhci_thread = loadProcessFromElfBuffer(file_data, file_size);
+            if (is_console) console_thread = loadProcessFromElfBuffer(boot_untyped, file_data, file_size);
+            if (is_init) init_thread = loadProcessFromElfBuffer(boot_untyped, file_data, file_size);
+            if (is_vfs) vfs_thread = loadProcessFromElfBuffer(boot_untyped, file_data, file_size);
+            if (is_ahci) ahci_thread = loadProcessFromElfBuffer(boot_untyped, file_data, file_size);
+            if (is_xhci) xhci_thread = loadProcessFromElfBuffer(boot_untyped, file_data, file_size);
             
             offset += 512 + ((file_size + 511) & ~511ULL);
         }
@@ -374,29 +347,20 @@ void KernelStorage<KernelSettings>::Kernel::run() {
         auto* ahci_proc = static_cast<Process<KernelAccessor>*>(ahci_thread->user_data);
         auto* xhci_proc = static_cast<Process<KernelAccessor>*>(xhci_thread->user_data);
         
-        // Helper lambdas for UntypedMemory
-        auto alloc_fn = [](std::size_t num_pages, void** cleanup_data) -> std::uintptr_t {
-            auto& fm = KernelAccessor::getFrameManager();
-            std::uint8_t level = 0;
-            std::size_t pages = 1;
-            while (pages < num_pages) { level++; pages <<= 1; }
-            PageBlock<> block = fm.allocateBlock(level);
-            if (!block) return 0;
-            *cleanup_data = block.getDescriptor();
-            return fm.getPhysicalAddress(block).get();
-        };
         auto free_fn = [](void* cleanup_data) {
             auto& fm = KernelAccessor::getFrameManager();
             fm.freeBlock(static_cast<PageFrameDescriptor*>(cleanup_data));
         };
 
         auto setup_proc_caps = [&](Process<KernelAccessor>* proc) {
-            auto* vspace = new VSpace(proc->address_space.get(), g_vspace_map_fn, g_vspace_unmap_fn);
+            auto* vspace = boot_untyped.allocateObject<VSpace>(&proc->address_space, g_vspace_map_fn, g_vspace_unmap_fn);
             Capability vspace_cap(vspace, CapRights::ALL);
             proc->cspace->insert(0, vspace_cap);
             vspace->release(); // CSpace now owns it
 
-            auto* untyped = new UntypedMemory(1024, alloc_fn, free_fn); // 1024 pages = 4MB budget
+            auto ut_block = fm.allocateBlock(10); // 1024 pages = 4MB
+            std::uintptr_t ut_phys = fm.getPhysicalAddress(ut_block).get();
+            auto* untyped = boot_untyped.allocateObject<UntypedMemory>(ut_phys, 1024 * 4096, ut_block.getDescriptor(), free_fn);
             Capability untyped_cap(untyped, CapRights::ALL);
             proc->cspace->insert(240, untyped_cap);
             untyped->release();
@@ -410,7 +374,7 @@ void KernelStorage<KernelSettings>::Kernel::run() {
 
         ChannelEndpoint* end_init = nullptr;
         ChannelEndpoint* end_console = nullptr;
-        create_channel_pair(&end_init, &end_console);
+        boot_untyped.retypeChannelPair(&end_init, &end_console);
         
         Capability write_cap(end_init, CapRights::WRITE | CapRights::GRANT);
         init_proc->cspace->insert(1, write_cap); // Slot 1
@@ -423,7 +387,7 @@ void KernelStorage<KernelSettings>::Kernel::run() {
         
         ChannelEndpoint* end_init_ahci = nullptr;
         ChannelEndpoint* end_ahci_init = nullptr;
-        create_channel_pair(&end_init_ahci, &end_ahci_init);
+        boot_untyped.retypeChannelPair(&end_init_ahci, &end_ahci_init);
         
         Capability init_ahci_cap(end_init_ahci, CapRights::WRITE | CapRights::GRANT);
         init_proc->cspace->insert(2, init_ahci_cap); // Slot 2 for init to write to ahci
@@ -434,7 +398,7 @@ void KernelStorage<KernelSettings>::Kernel::run() {
         // Channel: VFS → AHCI (block I/O requests)
         ChannelEndpoint* end_vfs_to_ahci = nullptr;
         ChannelEndpoint* end_ahci_from_vfs = nullptr;
-        create_channel_pair(&end_vfs_to_ahci, &end_ahci_from_vfs);
+        boot_untyped.retypeChannelPair(&end_vfs_to_ahci, &end_ahci_from_vfs);
         
         Capability vfs_send_cap(end_vfs_to_ahci, CapRights::WRITE | CapRights::GRANT);
         vfs_proc->cspace->insert(2, vfs_send_cap);   // VFS slot 2: send requests to AHCI
@@ -445,7 +409,7 @@ void KernelStorage<KernelSettings>::Kernel::run() {
         // Channel: AHCI → VFS (block I/O responses)
         ChannelEndpoint* end_ahci_to_vfs = nullptr;
         ChannelEndpoint* end_vfs_from_ahci = nullptr;
-        create_channel_pair(&end_ahci_to_vfs, &end_vfs_from_ahci);
+        boot_untyped.retypeChannelPair(&end_ahci_to_vfs, &end_vfs_from_ahci);
         
         Capability ahci_send_cap(end_ahci_to_vfs, CapRights::WRITE | CapRights::GRANT);
         ahci_proc->cspace->insert(4, ahci_send_cap);  // AHCI slot 4: send responses to VFS
@@ -456,7 +420,7 @@ void KernelStorage<KernelSettings>::Kernel::run() {
         // Channel: init → VFS (file operation requests)
         ChannelEndpoint* end_init_to_vfs = nullptr;
         ChannelEndpoint* end_vfs_from_init = nullptr;
-        create_channel_pair(&end_init_to_vfs, &end_vfs_from_init);
+        boot_untyped.retypeChannelPair(&end_init_to_vfs, &end_vfs_from_init);
 
         Capability init_vfs_send_cap(end_init_to_vfs, CapRights::WRITE | CapRights::GRANT);
         init_proc->cspace->insert(3, init_vfs_send_cap);  // Init slot 3: send to VFS
@@ -467,7 +431,7 @@ void KernelStorage<KernelSettings>::Kernel::run() {
         // Channel: VFS → init (file operation responses)
         ChannelEndpoint* end_vfs_to_init = nullptr;
         ChannelEndpoint* end_init_from_vfs = nullptr;
-        create_channel_pair(&end_vfs_to_init, &end_init_from_vfs);
+        boot_untyped.retypeChannelPair(&end_vfs_to_init, &end_init_from_vfs);
 
         Capability vfs_init_send_cap(end_vfs_to_init, CapRights::WRITE | CapRights::GRANT);
         vfs_proc->cspace->insert(5, vfs_init_send_cap);   // VFS slot 5: send to init
@@ -483,7 +447,7 @@ void KernelStorage<KernelSettings>::Kernel::run() {
             bootinfo_virt[0] = ahci_abar_phys; // Set ahci_abar_phys
             
             // Create Frame cap for BootInfo page
-            auto* bootinfo_frame = new Frame(bootinfo_phys, 4096, false,
+            auto* bootinfo_frame = boot_untyped.allocateObject<Frame>(bootinfo_phys, 4096, false,
                 pfd, free_fn); // pfd is the allocated page descriptor
             Capability bootinfo_cap(bootinfo_frame, CapRights::READ);
             init_proc->cspace->insert(243, bootinfo_cap);
@@ -494,7 +458,7 @@ void KernelStorage<KernelSettings>::Kernel::run() {
         }
 
         if (ahci_abar_phys != 0) {
-            auto* abar_frame = new Frame(ahci_abar_phys, 4096, true); // device memory, no cleanup
+            auto* abar_frame = boot_untyped.allocateObject<Frame>(ahci_abar_phys, 4096, true); // device memory, no cleanup
             Capability abar_cap(abar_frame, CapRights::ALL);
             ahci_proc->cspace->insert(241, abar_cap);
             abar_frame->release();
@@ -504,7 +468,7 @@ void KernelStorage<KernelSettings>::Kernel::run() {
         auto shared_block = fm.allocateBlock(4); // 2^4 = 16 pages
         if (shared_block) {
             std::uint64_t shared_phys = fm.getPhysicalAddress(shared_block).get();
-            auto* shared_frame = new Frame(shared_phys, 16 * 4096, false,
+            auto* shared_frame = boot_untyped.allocateObject<Frame>(shared_phys, 16 * 4096, false,
                 shared_block.getDescriptor(), free_fn);
             
             Capability shared_cap_vfs(shared_frame, CapRights::ALL);
@@ -520,13 +484,13 @@ void KernelStorage<KernelSettings>::Kernel::run() {
         // IRQ notification channel for xHCI interrupts
         ChannelEndpoint* end_irq_send = nullptr;
         ChannelEndpoint* end_irq_recv = nullptr;
-        create_channel_pair(&end_irq_send, &end_irq_recv);
+        boot_untyped.retypeChannelPair(&end_irq_send, &end_irq_recv);
 
         Capability irq_recv_cap(end_irq_recv, CapRights::READ);
         xhci_proc->cspace->insert(2, irq_recv_cap); // Slot 2: recv IRQ notifications
 
         // Create IRQHandler for vector 0x40
-        auto* xhci_irq_handler = new IRQHandler(0x40, 
+        auto* xhci_irq_handler = boot_untyped.allocateObject<IRQHandler>(0x40, 
             [](std::uint8_t vector, IRQHandler* handler) {
                 oz::irq::registerHandler(vector, handler);
             },
@@ -540,7 +504,7 @@ void KernelStorage<KernelSettings>::Kernel::run() {
 
         // xHCI MMIO BAR Frame capability
         if (xhci_bar_phys != 0) {
-            auto* xhci_mmio_frame = new Frame(xhci_bar_phys, 16 * 4096, true); // 64KB device memory, no cleanup
+            auto* xhci_mmio_frame = boot_untyped.allocateObject<Frame>(xhci_bar_phys, 16 * 4096, true); // 64KB device memory, no cleanup
             Capability mmio_cap(xhci_mmio_frame, CapRights::ALL);
             xhci_proc->cspace->insert(241, mmio_cap);
             xhci_mmio_frame->release();
@@ -558,8 +522,14 @@ void KernelStorage<KernelSettings>::Kernel::run() {
     sh.repaint();
     // ---------------------------
     
-    // Create Idle / Reaper thread
-    Thread* idle_t = scheduler.createThread(0, Settings::Scheduler::idle_reaper_task, &scheduler);
+    // Create Idle / Reaper thread (static allocation)
+    alignas(Thread) static std::uint8_t idle_thread_mem[sizeof(Thread)];
+    alignas(16) static std::uint8_t idle_stack[4096];
+    Thread* idle_t = new (idle_thread_mem) Thread(
+        0, idle_stack, sizeof(idle_stack), PageBlock<>{nullptr}, 0
+    );
+    idle_t->is_untyped_backed = true;
+    scheduler.setupThreadContext(idle_t, Settings::Scheduler::idle_reaper_task, &scheduler);
     scheduler.queueThread(idle_t);
 
     // Start APIC Timer for preemption
@@ -574,9 +544,10 @@ void KernelStorage<KernelSettings>::Kernel::run() {
 }
 
 template <typename KernelSettings>
-Thread* KernelStorage<KernelSettings>::Kernel::loadProcessFromElfBuffer(const std::uint8_t* file_buf, std::size_t file_size) {
+Thread* KernelStorage<KernelSettings>::Kernel::loadProcessFromElfBuffer(UntypedMemory& boot_untyped, const std::uint8_t* file_buf, std::size_t file_size) {
+    (void)file_size;
     auto user_as = ProcessAddressSpace<KernelAccessor>::create(kernel_space);
-    if (!user_as) return nullptr;
+    if (!user_as.isValid()) return nullptr;
 
     auto* elf_header = reinterpret_cast<const elf::Elf64_Ehdr*>(file_buf);
     if (!elf::isValidElf(elf_header)) {
@@ -605,7 +576,7 @@ Thread* KernelStorage<KernelSettings>::Kernel::loadProcessFromElfBuffer(const st
                     if (phdr_table[i].p_flags & elf::PF_W) flags = flags | MemoryFlags::Writable;
                     if (phdr_table[i].p_flags & elf::PF_X) flags = flags | MemoryFlags::Executable;
                     
-                    user_as->mapUser(vaddr_aligned + p, paddr, flags);
+                    user_as.mapUser(vaddr_aligned + p, paddr, flags);
                     
                     void* virt_ptr = phys_to_virt(createPhysicalAddress<void>(paddr));
                     utils::memset(virt_ptr, 0, 4096);
@@ -628,8 +599,6 @@ Thread* KernelStorage<KernelSettings>::Kernel::loadProcessFromElfBuffer(const st
             }
         }
     }
-    
-    
 
     auto stack_block = fm.allocateBlock(1); // 2 pages
     if (!stack_block) return nullptr;
@@ -637,12 +606,17 @@ Thread* KernelStorage<KernelSettings>::Kernel::loadProcessFromElfBuffer(const st
     void* stack_phys = reinterpret_cast<void*>(fm.getPhysicalAddress(stack_block).get());
     std::uintptr_t stack_virt = 0x700000000000 - 8192;
     
-    user_as->mapUser(stack_virt, reinterpret_cast<std::uintptr_t>(stack_phys), MemoryFlags::Present | MemoryFlags::Writable | MemoryFlags::User);
-    user_as->mapUser(stack_virt + 4096, reinterpret_cast<std::uintptr_t>(stack_phys) + 4096, MemoryFlags::Present | MemoryFlags::Writable | MemoryFlags::User);
+    user_as.mapUser(stack_virt, reinterpret_cast<std::uintptr_t>(stack_phys), MemoryFlags::Present | MemoryFlags::Writable | MemoryFlags::User);
+    user_as.mapUser(stack_virt + 4096, reinterpret_cast<std::uintptr_t>(stack_phys) + 4096, MemoryFlags::Present | MemoryFlags::Writable | MemoryFlags::User);
     
-    auto* proc = new Process<KernelAccessor>(1, std::move(user_as), nullptr, entry_point);
+    auto* proc = boot_untyped.allocateObject<Process<KernelAccessor>>(1, std::move(user_as), nullptr, entry_point, boot_untyped.allocateObject<CSpace>());
+    if (!proc) return nullptr;
 
-    Thread* user_thread = scheduler.createThread(1, [](void* arg) {
+    TCB* user_tcb = boot_untyped.retypeTCB();
+    if (!user_tcb) return nullptr;
+    Thread* user_thread = user_tcb->getThread();
+
+    scheduler.setupThreadContext(user_thread, [](void* arg) {
         auto* proc_ptr = static_cast<Process<KernelAccessor>*>(arg);
         
         auto* current_thread = KernelStorage<KernelSettings>::kernel_storage.kernel.scheduler.getCurrentThread();
@@ -657,12 +631,9 @@ Thread* KernelStorage<KernelSettings>::Kernel::loadProcessFromElfBuffer(const st
         enter_user_mode(proc_ptr->entry_point, stack_top - 8, 0x202);
     }, proc);
     
-    user_thread->pml4_phys = proc->address_space->getArchContext().getPhysicalPML4();
+    user_thread->pml4_phys = proc->address_space.getArchContext().getPhysicalPML4();
     user_thread->user_data = proc;
-    user_thread->cleanup = [](void* arg) {
-        auto* p = static_cast<Process<KernelAccessor>*>(arg);
-        delete p;
-    };
+    user_thread->cleanup = nullptr;
 
     return user_thread;
 }

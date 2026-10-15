@@ -5,6 +5,7 @@ namespace oz {
 
 class CSpace;
 class Thread;
+class UntypedMemory;
 
 extern void (*g_exit_thread_func)();
 extern CSpace* (*g_get_current_cspace_func)();
@@ -24,7 +25,7 @@ struct VSpaceCreateResult {
     void* address_space;  // ProcessAddressSpace*
     void* pml4_phys;      // Physical address of PML4
 };
-extern VSpaceCreateResult (*g_create_vspace_func)();
+extern VSpaceCreateResult (*g_create_vspace_func)(UntypedMemory* untyped);
 // Global VSpace map/unmap function pointers (set by Kernel.hpp, used by Syscall.cpp)
 extern bool (*g_vspace_map_fn)(void*, std::uintptr_t, std::uintptr_t, std::uint64_t);
 extern bool (*g_vspace_unmap_fn)(void*, std::uintptr_t);

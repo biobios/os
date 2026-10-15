@@ -2,10 +2,12 @@
 
 #include "core/Capability.hpp"
 #include "core/Channel.hpp"
+#include "core/UntypedMemory.hpp"
 
 namespace oz {
 
 inline bool cap_copy(CSpace* cspace, CapID dest, CapID src, CapRights rights) {
+    (void)dest;
     Capability src_cap = cspace->get(src);
     if (!src_cap.is_valid()) return false;
 
@@ -42,9 +44,13 @@ inline bool cap_channel_recv(CSpace* cspace, CapID ep_cap_id, IPCMessage& msg) {
 inline bool sys_channel_create(CSpace* cspace, CapID* out_id0, CapID* out_id1) {
     if (!cspace || !out_id0 || !out_id1) return false;
 
+    Capability ut_cap = cspace->get(240);
+    if (!ut_cap.is_valid() || ut_cap.object->objectType() != ObjectType::UntypedMemory) return false;
+    auto* untyped = static_cast<UntypedMemory*>(ut_cap.object);
+
     ChannelEndpoint* end0 = nullptr;
     ChannelEndpoint* end1 = nullptr;
-    create_channel_pair(&end0, &end1);
+    if (!untyped->retypeChannelPair(&end0, &end1)) return false;
 
     Capability cap0(end0, CapRights::ALL);
     Capability cap1(end1, CapRights::ALL);
@@ -52,7 +58,6 @@ inline bool sys_channel_create(CSpace* cspace, CapID* out_id0, CapID* out_id1) {
     *out_id0 = cspace->add(cap0);
     *out_id1 = cspace->add(cap1);
 
-    // Release our local reference (the Capability inside CSpace now owns it)
     end0->release();
     end1->release();
 
