@@ -127,7 +127,9 @@ void KernelStorage<KernelSettings>::Kernel::run() {
     };
     oz::g_get_current_cspace_func = []() -> CSpace* {
         auto* thread = kernel_storage.kernel.scheduler.getCurrentThread();
-        if (!thread || !thread->user_data) return nullptr;
+        if (!thread) return nullptr;
+        if (thread->cspace) return thread->cspace;
+        if (!thread->user_data) return nullptr;
         auto* proc = static_cast<Process<KernelAccessor>*>(thread->user_data);
         return proc->cspace;
     };
@@ -261,19 +263,13 @@ void KernelStorage<KernelSettings>::Kernel::run() {
     }
     
 
-    // --- User Process Test ---
-    sh.printString("Loading servers from initrd...\n\r");
+    // --- User Process Startup (Root Server) ---
+    sh.printString("Loading init process from initrd...\n\r");
     sh.repaint();
 
     PageBlock boot_ut_block = fm.allocateBlock(5); // 32 pages = 128KB
     std::uintptr_t boot_ut_phys = fm.getPhysicalAddress(boot_ut_block).get();
     UntypedMemory boot_untyped(boot_ut_phys, 32 * 4096, nullptr, nullptr, false, true);
-
-    Thread* console_thread = nullptr;
-    Thread* init_thread = nullptr;
-    Thread* vfs_thread = nullptr;
-    Thread* ahci_thread = nullptr;
-    Thread* xhci_thread = nullptr;
 
     const oz_boot::BootModuleInfo* initrd_file = nullptr;
     for (std::uint64_t i = 0; i < platform_info_->num_modules; ++i) {
@@ -290,6 +286,8 @@ void KernelStorage<KernelSettings>::Kernel::run() {
             break;
         }
     }
+
+    Thread* init_thread = nullptr;
 
     if (initrd_file && initrd_file->base_address) {
         const std::uint8_t* tar_ptr = reinterpret_cast<const std::uint8_t*>(initrd_file->base_address);
@@ -310,214 +308,107 @@ void KernelStorage<KernelSettings>::Kernel::run() {
             
             const std::uint8_t* file_data = tar_ptr + offset + 512;
             
-            bool is_console = true;
-            const char* cons_name = "console";
-            for (int j=0; j<7; ++j) if(name[j] != cons_name[j]) is_console = false;
-            
             bool is_init = true;
             const char* init_name = "init";
-            for (int j=0; j<4; ++j) if(name[j] != init_name[j]) is_init = false;
+            for (int j = 0; j < 4; ++j) if (name[j] != init_name[j]) is_init = false;
             
-            bool is_vfs = true;
-            const char* vfs_name = "vfs";
-            for (int j=0; j<3; ++j) if(name[j] != vfs_name[j]) is_vfs = false;
-            
-            bool is_ahci = true;
-            const char* ahci_name = "ahci";
-            for (int j=0; j<4; ++j) if(name[j] != ahci_name[j]) is_ahci = false;
-
-            bool is_xhci = true;
-            const char* xhci_name = "xhci";
-            for (int j=0; j<4; ++j) if(name[j] != xhci_name[j]) is_xhci = false;
-
-            if (is_console) console_thread = loadProcessFromElfBuffer(boot_untyped, file_data, file_size);
-            if (is_init) init_thread = loadProcessFromElfBuffer(boot_untyped, file_data, file_size);
-            if (is_vfs) vfs_thread = loadProcessFromElfBuffer(boot_untyped, file_data, file_size);
-            if (is_ahci) ahci_thread = loadProcessFromElfBuffer(boot_untyped, file_data, file_size);
-            if (is_xhci) xhci_thread = loadProcessFromElfBuffer(boot_untyped, file_data, file_size);
+            if (is_init) {
+                init_thread = loadProcessFromElfBuffer(boot_untyped, file_data, file_size);
+                break;
+            }
             
             offset += 512 + ((file_size + 511) & ~511ULL);
         }
     }
 
-    if (console_thread && init_thread && vfs_thread && ahci_thread && xhci_thread) {
-        auto* console_proc = static_cast<Process<KernelAccessor>*>(console_thread->user_data);
+    if (init_thread) {
         auto* init_proc = static_cast<Process<KernelAccessor>*>(init_thread->user_data);
-        auto* vfs_proc = static_cast<Process<KernelAccessor>*>(vfs_thread->user_data);
-        auto* ahci_proc = static_cast<Process<KernelAccessor>*>(ahci_thread->user_data);
-        auto* xhci_proc = static_cast<Process<KernelAccessor>*>(xhci_thread->user_data);
         
         auto free_fn = [](void* cleanup_data) {
             auto& fm = KernelAccessor::getFrameManager();
             fm.freeBlock(static_cast<PageFrameDescriptor*>(cleanup_data));
         };
 
-        auto setup_proc_caps = [&](Process<KernelAccessor>* proc) {
-            auto* vspace = boot_untyped.allocateObject<VSpace>(&proc->address_space, g_vspace_map_fn, g_vspace_unmap_fn);
-            Capability vspace_cap(vspace, CapRights::ALL);
-            proc->cspace->insert(0, vspace_cap);
-            vspace->release(); // CSpace now owns it
+        // 1. Setup VSpace (Slot 0)
+        auto* vspace = boot_untyped.allocateObject<VSpace>(
+            &init_proc->address_space, g_vspace_map_fn, g_vspace_unmap_fn,
+            init_proc->address_space.getArchContext().getPhysicalPML4().get()
+        );
+        Capability vspace_cap(vspace, CapRights::ALL);
+        init_proc->cspace->insert(0, vspace_cap);
+        vspace->release();
 
-            auto ut_block = fm.allocateBlock(10); // 1024 pages = 4MB
-            std::uintptr_t ut_phys = fm.getPhysicalAddress(ut_block).get();
-            auto* untyped = boot_untyped.allocateObject<UntypedMemory>(ut_phys, 1024 * 4096, ut_block.getDescriptor(), free_fn);
-            Capability untyped_cap(untyped, CapRights::ALL);
-            proc->cspace->insert(240, untyped_cap);
-            untyped->release();
-        };
+        // 2. Setup 64MB UntypedMemory for Init (Slot 240)
+        auto ut_block = fm.allocateBlock(14); // 16384 pages = 64MB
+        std::uintptr_t ut_phys = fm.getPhysicalAddress(ut_block).get();
+        auto* untyped = boot_untyped.allocateObject<UntypedMemory>(
+            ut_phys, 16384 * 4096, ut_block.getDescriptor(), free_fn);
+        Capability untyped_cap(untyped, CapRights::ALL);
+        init_proc->cspace->insert(240, untyped_cap);
+        untyped->release();
 
-        setup_proc_caps(console_proc);
-        setup_proc_caps(init_proc);
-        setup_proc_caps(vfs_proc);
-        setup_proc_caps(ahci_proc);
-        setup_proc_caps(xhci_proc);
+        // 3. AHCI MMIO Frame (Slot 241)
+        if (ahci_abar_phys != 0) {
+            auto* abar_frame = boot_untyped.allocateObject<Frame>(ahci_abar_phys, 4096, true);
+            Capability abar_cap(abar_frame, CapRights::ALL);
+            init_proc->cspace->insert(241, abar_cap);
+            abar_frame->release();
+        }
 
-        ChannelEndpoint* end_init = nullptr;
-        ChannelEndpoint* end_console = nullptr;
-        boot_untyped.retypeChannelPair(&end_init, &end_console);
-        
-        Capability write_cap(end_init, CapRights::WRITE | CapRights::GRANT);
-        init_proc->cspace->insert(1, write_cap); // Slot 1
-        vfs_proc->cspace->insert(1, write_cap); // Slot 1
-        ahci_proc->cspace->insert(1, write_cap); // Slot 1
-        xhci_proc->cspace->insert(1, write_cap); // Slot 1
-        
-        Capability console_cap(end_console, CapRights::READ);
-        console_proc->cspace->insert(1, console_cap); // Slot 1
-        
-        ChannelEndpoint* end_init_ahci = nullptr;
-        ChannelEndpoint* end_ahci_init = nullptr;
-        boot_untyped.retypeChannelPair(&end_init_ahci, &end_ahci_init);
-        
-        Capability init_ahci_cap(end_init_ahci, CapRights::WRITE | CapRights::GRANT);
-        init_proc->cspace->insert(2, init_ahci_cap); // Slot 2 for init to write to ahci
-        
-        Capability ahci_init_cap(end_ahci_init, CapRights::READ);
-        ahci_proc->cspace->insert(2, ahci_init_cap); // Slot 2 for ahci to read from init
-        
-        // Channel: VFS → AHCI (block I/O requests)
-        ChannelEndpoint* end_vfs_to_ahci = nullptr;
-        ChannelEndpoint* end_ahci_from_vfs = nullptr;
-        boot_untyped.retypeChannelPair(&end_vfs_to_ahci, &end_ahci_from_vfs);
-        
-        Capability vfs_send_cap(end_vfs_to_ahci, CapRights::WRITE | CapRights::GRANT);
-        vfs_proc->cspace->insert(2, vfs_send_cap);   // VFS slot 2: send requests to AHCI
-        
-        Capability ahci_recv_cap(end_ahci_from_vfs, CapRights::READ);
-        ahci_proc->cspace->insert(3, ahci_recv_cap);  // AHCI slot 3: recv requests from VFS
-        
-        // Channel: AHCI → VFS (block I/O responses)
-        ChannelEndpoint* end_ahci_to_vfs = nullptr;
-        ChannelEndpoint* end_vfs_from_ahci = nullptr;
-        boot_untyped.retypeChannelPair(&end_ahci_to_vfs, &end_vfs_from_ahci);
-        
-        Capability ahci_send_cap(end_ahci_to_vfs, CapRights::WRITE | CapRights::GRANT);
-        ahci_proc->cspace->insert(4, ahci_send_cap);  // AHCI slot 4: send responses to VFS
-        
-        Capability vfs_recv_cap(end_vfs_from_ahci, CapRights::READ);
-        vfs_proc->cspace->insert(3, vfs_recv_cap);    // VFS slot 3: recv responses from AHCI
+        // 4. xHCI MMIO Frame (Slot 242)
+        if (xhci_bar_phys != 0) {
+            auto* xhci_mmio_frame = boot_untyped.allocateObject<Frame>(xhci_bar_phys, 16 * 4096, true);
+            Capability mmio_cap(xhci_mmio_frame, CapRights::ALL);
+            init_proc->cspace->insert(242, mmio_cap);
+            xhci_mmio_frame->release();
+        }
 
-        // Channel: init → VFS (file operation requests)
-        ChannelEndpoint* end_init_to_vfs = nullptr;
-        ChannelEndpoint* end_vfs_from_init = nullptr;
-        boot_untyped.retypeChannelPair(&end_init_to_vfs, &end_vfs_from_init);
+        // 5. Setup BootInfo (Slot 243)
+        std::uint64_t initrd_offset = 0;
+        if (initrd_file && initrd_file->base_address) {
+            std::uintptr_t initrd_raw_phys = initrd_file->base_address - oz::DIRECT_MAP_OFFSET;
+            initrd_offset = initrd_raw_phys & 0xFFFULL;
+        }
 
-        Capability init_vfs_send_cap(end_init_to_vfs, CapRights::WRITE | CapRights::GRANT);
-        init_proc->cspace->insert(3, init_vfs_send_cap);  // Init slot 3: send to VFS
-
-        Capability vfs_init_recv_cap(end_vfs_from_init, CapRights::READ);
-        vfs_proc->cspace->insert(4, vfs_init_recv_cap);   // VFS slot 4: recv from init
-
-        // Channel: VFS → init (file operation responses)
-        ChannelEndpoint* end_vfs_to_init = nullptr;
-        ChannelEndpoint* end_init_from_vfs = nullptr;
-        boot_untyped.retypeChannelPair(&end_vfs_to_init, &end_init_from_vfs);
-
-        Capability vfs_init_send_cap(end_vfs_to_init, CapRights::WRITE | CapRights::GRANT);
-        vfs_proc->cspace->insert(5, vfs_init_send_cap);   // VFS slot 5: send to init
-
-        Capability init_vfs_recv_cap(end_init_from_vfs, CapRights::READ);
-        init_proc->cspace->insert(4, init_vfs_recv_cap);  // Init slot 4: recv from VFS
-
-        // Setup BootInfo
         auto* pfd = fm.allocatePages(1);
         std::uint64_t bootinfo_phys = pfd ? fm.getPhysicalAddress(pfd).get() : 0;
         if (bootinfo_phys) {
-            auto* bootinfo_virt = reinterpret_cast<std::uint64_t*>(phys_to_virt(createPhysicalAddress<void>(bootinfo_phys)));
-            bootinfo_virt[0] = ahci_abar_phys; // Set ahci_abar_phys
-            
-            // Create Frame cap for BootInfo page
+            auto* bootinfo_virt = reinterpret_cast<oz::BootInfo*>(phys_to_virt(createPhysicalAddress<void>(bootinfo_phys)));
+            bootinfo_virt->ahci_abar_phys = ahci_abar_phys;
+            bootinfo_virt->xhci_bar_phys = xhci_bar_phys;
+            bootinfo_virt->initrd_size = initrd_file ? initrd_file->size : 0;
+            bootinfo_virt->initrd_offset = initrd_offset;
+
             auto* bootinfo_frame = boot_untyped.allocateObject<Frame>(bootinfo_phys, 4096, false,
-                pfd, free_fn); // pfd is the allocated page descriptor
+                pfd, free_fn);
             Capability bootinfo_cap(bootinfo_frame, CapRights::READ);
             init_proc->cspace->insert(243, bootinfo_cap);
             bootinfo_frame->release();
             sh.printString("BootInfo capability created.\n\r");
-        } else {
-            sh.printString("ERROR: Failed to allocate BootInfo page!\n\r");
         }
 
-        if (ahci_abar_phys != 0) {
-            auto* abar_frame = boot_untyped.allocateObject<Frame>(ahci_abar_phys, 4096, true); // device memory, no cleanup
-            Capability abar_cap(abar_frame, CapRights::ALL);
-            ahci_proc->cspace->insert(241, abar_cap);
-            abar_frame->release();
+        // 6. Setup InitRD Frame capability (Slot 244)
+        if (initrd_file && initrd_file->base_address) {
+            std::uintptr_t initrd_raw_phys = initrd_file->base_address - oz::DIRECT_MAP_OFFSET;
+            std::uintptr_t initrd_aligned_phys = initrd_raw_phys & ~0xFFFULL;
+            std::size_t initrd_pages = (initrd_file->size + initrd_offset + 4095) / 4096;
+            auto* initrd_frame = boot_untyped.allocateObject<Frame>(initrd_aligned_phys, initrd_pages * 4096, true);
+            Capability initrd_cap(initrd_frame, CapRights::READ);
+            init_proc->cspace->insert(244, initrd_cap);
+            initrd_frame->release();
+            sh.printString("InitRD Frame capability created.\n\r");
         }
 
-        // Allocate shared buffer (16 pages = 64KB) for VFS-AHCI data transfer
-        auto shared_block = fm.allocateBlock(4); // 2^4 = 16 pages
-        if (shared_block) {
-            std::uint64_t shared_phys = fm.getPhysicalAddress(shared_block).get();
-            auto* shared_frame = boot_untyped.allocateObject<Frame>(shared_phys, 16 * 4096, false,
-                shared_block.getDescriptor(), free_fn);
-            
-            Capability shared_cap_vfs(shared_frame, CapRights::ALL);
-            vfs_proc->cspace->insert(242, shared_cap_vfs);
-            
-            Capability shared_cap_ahci(shared_frame, CapRights::ALL);
-            ahci_proc->cspace->insert(242, shared_cap_ahci);
-            
-            shared_frame->release(); // Both CSpaces now own references
-        }
-        
+        // 7. Setup Self CSpace capability (Slot 245)
+        auto* cs_cap_obj = boot_untyped.allocateObject<CSpaceCap>(init_proc->cspace, false);
+        Capability cs_cap(cs_cap_obj, CapRights::ALL);
+        init_proc->cspace->insert(245, cs_cap);
+        cs_cap_obj->release();
 
-        // IRQ notification channel for xHCI interrupts
-        ChannelEndpoint* end_irq_send = nullptr;
-        ChannelEndpoint* end_irq_recv = nullptr;
-        boot_untyped.retypeChannelPair(&end_irq_send, &end_irq_recv);
-
-        Capability irq_recv_cap(end_irq_recv, CapRights::READ);
-        xhci_proc->cspace->insert(2, irq_recv_cap); // Slot 2: recv IRQ notifications
-
-        // Create IRQHandler for vector 0x40
-        auto* xhci_irq_handler = boot_untyped.allocateObject<IRQHandler>(0x40, 
-            [](std::uint8_t vector, IRQHandler* handler) {
-                oz::irq::registerHandler(vector, handler);
-            },
-            []() { oz::x86_64::notifyEndOfInterrupt(); });
-        xhci_irq_handler->setNotificationEndpoint(end_irq_send);
-        xhci_irq_handler->registerHandler();
-
-        Capability irq_handler_cap(xhci_irq_handler, CapRights::ALL);
-        xhci_proc->cspace->insert(3, irq_handler_cap); // Slot 3: IRQ handler
-        xhci_irq_handler->release();
-
-        // xHCI MMIO BAR Frame capability
-        if (xhci_bar_phys != 0) {
-            auto* xhci_mmio_frame = boot_untyped.allocateObject<Frame>(xhci_bar_phys, 16 * 4096, true); // 64KB device memory, no cleanup
-            Capability mmio_cap(xhci_mmio_frame, CapRights::ALL);
-            xhci_proc->cspace->insert(241, mmio_cap);
-            xhci_mmio_frame->release();
-        }
-
-        scheduler.queueThread(console_thread);
-        scheduler.queueThread(ahci_thread);
-        scheduler.queueThread(vfs_thread);
         scheduler.queueThread(init_thread);
-        scheduler.queueThread(xhci_thread);
-        sh.printString("All servers loaded successfully.\n\r");
+        sh.printString("Init process loaded successfully.\n\r");
     } else {
-        sh.printString("Failed to load servers!\n\r");
+        sh.printString("Failed to load init process!\n\r");
     }
     sh.repaint();
     // ---------------------------
@@ -633,6 +524,7 @@ Thread* KernelStorage<KernelSettings>::Kernel::loadProcessFromElfBuffer(UntypedM
     
     user_thread->pml4_phys = proc->address_space.getArchContext().getPhysicalPML4();
     user_thread->user_data = proc;
+    user_thread->cspace = proc->cspace;
     user_thread->cleanup = nullptr;
 
     return user_thread;

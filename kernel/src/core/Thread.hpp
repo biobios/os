@@ -6,6 +6,7 @@
 #include "core/Channel.hpp"
 
 namespace oz {
+class CSpace;
 
 // Thread context saved on the stack during a context switch.
 // Ordered from lowest address (top of stack) to highest address.
@@ -62,6 +63,10 @@ public:
     bool recv_result{false};
 
     bool is_untyped_backed{false};
+
+    CSpace* cspace{nullptr};
+    std::uint64_t user_rip{0};
+    std::uint64_t user_rsp{0};
 
     Thread(std::uint64_t id, void* stack, std::uint64_t size, PageBlock<> block, std::uint8_t level, PhysicalAddress<PageTable> pml4_phys = PhysicalAddressProvider::nullPhysicalAddress<PageTable>())
         : id(id), rsp(reinterpret_cast<std::uint8_t*>(stack) + size), 

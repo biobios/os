@@ -90,6 +90,12 @@ int sys_cap_delete(std::uint32_t cap_id) {
     return static_cast<int>(syscall(10, cap_id, 0, 0, 0, 0, 0));
 }
 
+int sys_tcb_configure(std::uint32_t tcb_cap, std::uint32_t cspace_cap,
+                      std::uint32_t vspace_cap, std::uint64_t rip,
+                      std::uint64_t user_rsp) {
+    return static_cast<int>(syscall(11, tcb_cap, cspace_cap, vspace_cap, rip, user_rsp, 0));
+}
+
 int sys_tcb_resume(std::uint32_t tcb_cap) {
     return static_cast<int>(syscall(13, tcb_cap, 0, 0, 0, 0, 0));
 }

@@ -200,7 +200,6 @@ extern "C" std::uint64_t handleSyscall(std::uint64_t rdi, std::uint64_t rsi, std
         std::uintptr_t virt = rdx;
         std::uintptr_t phys = frame->physicalAddress();
         std::size_t frame_size = frame->size();
-        
         for (std::size_t offset = 0; offset < frame_size; offset += 4096) {
             if (!vspace->mapUser(virt + offset, phys + offset, r10)) {
                 char hb[17];
@@ -294,6 +293,30 @@ extern "C" std::uint64_t handleSyscall(std::uint64_t rdi, std::uint64_t rsi, std
         
         if (!cspace->remove(static_cast<CapID>(rdi))) return -1;
         return 0;
+    } else if (syscall_number == 11) {
+        // tcb_configure(tcb_cap, cspace_cap, vspace_cap, rip, user_rsp)
+        CSpace* cspace = get_cspace();
+        if (!cspace) return -1;
+
+        TCB* tcb = get_cap_typed<TCB>(
+            cspace, static_cast<CapID>(rdi), ObjectType::TCB, CapRights::WRITE);
+        if (!tcb) return -1;
+
+        CSpaceCap* target_cspace = get_cap_typed<CSpaceCap>(
+            cspace, static_cast<CapID>(rsi), ObjectType::CSpaceCap, CapRights::READ);
+        if (!target_cspace) return -1;
+
+        VSpace* target_vspace = get_cap_typed<VSpace>(
+            cspace, static_cast<CapID>(rdx), ObjectType::VSpace, CapRights::READ);
+        if (!target_vspace) return -1;
+
+        if (!is_user_address(r10)) return -1; // rip
+        if (!is_user_address(r8)) return -1;  // user_rsp
+
+        if (!tcb->configure(target_cspace->getCSpace(), target_vspace, r10, r8)) {
+            return -1;
+        }
+        return 0;
     } else if (syscall_number == 13) {
         // tcb_resume
         CSpace* cspace = get_cspace();
@@ -364,7 +387,10 @@ extern "C" std::uint64_t handleSyscall(std::uint64_t rdi, std::uint64_t rsi, std
         VSpaceCreateResult result = g_create_vspace_func(untyped);
         if (!result.address_space) return -1;
         
-        auto* vspace = untyped->allocateObject<VSpace>(result.address_space, g_vspace_map_fn, g_vspace_unmap_fn);
+        auto* vspace = untyped->allocateObject<VSpace>(
+            result.address_space, g_vspace_map_fn, g_vspace_unmap_fn,
+            reinterpret_cast<std::uintptr_t>(result.pml4_phys)
+        );
         if (!vspace) return -1;
         Capability vs_cap(vspace, CapRights::ALL);
         CapID new_id = cspace->add(vs_cap);
@@ -534,7 +560,7 @@ extern "C" std::uint64_t handleSyscall(std::uint64_t rdi, std::uint64_t rsi, std
 
 void initSyscall() {
     std::uint64_t efer = oz::x86_64::readMSR(oz::x86_64::MSR_EFER);
-    oz::x86_64::writeMSR(oz::x86_64::MSR_EFER, efer | 1);
+    oz::x86_64::writeMSR(oz::x86_64::MSR_EFER, efer | (1ULL << 11) | 1);
 
     std::uint64_t star = (static_cast<std::uint64_t>(oz::x86_64::USER_CS32) << 48) | 
                          (static_cast<std::uint64_t>(oz::x86_64::KERNEL_CS) << 32);

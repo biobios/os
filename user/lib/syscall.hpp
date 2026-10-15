@@ -4,6 +4,35 @@
 
 namespace oz {
 
+enum class CapRights : std::uint32_t {
+    NONE    = 0,
+    READ    = 1 << 0,
+    WRITE   = 1 << 1,
+    EXEC    = 1 << 2,
+    GRANT   = 1 << 3,
+    ALL     = 0xFFFFFFFF
+};
+
+inline constexpr CapRights operator|(CapRights a, CapRights b) {
+    return static_cast<CapRights>(static_cast<std::uint32_t>(a) | static_cast<std::uint32_t>(b));
+}
+
+inline constexpr CapRights operator&(CapRights a, CapRights b) {
+    return static_cast<CapRights>(static_cast<std::uint32_t>(a) & static_cast<std::uint32_t>(b));
+}
+
+enum class ObjectType : std::uint32_t {
+    Unknown = 0,
+    ChannelEndpoint = 1,
+    Frame = 2,
+    UntypedMemory = 3,
+    VSpace = 4,
+    TCB = 5,
+    CSpaceCap = 6,
+    IRQHandler = 7,
+    IOPort = 8,
+};
+
 extern "C" {
 
 struct IPCMessage {
@@ -37,6 +66,9 @@ std::uint32_t sys_cap_mint(std::uint32_t src_cap, std::uint32_t new_rights);
 int sys_cap_delete(std::uint32_t cap_id);
 
 // Process/thread management
+int sys_tcb_configure(std::uint32_t tcb_cap, std::uint32_t cspace_cap,
+                      std::uint32_t vspace_cap, std::uint64_t rip,
+                      std::uint64_t user_rsp);
 int sys_tcb_resume(std::uint32_t tcb_cap);
 int sys_tcb_suspend(std::uint32_t tcb_cap);
 std::uint32_t sys_cspace_create();
@@ -56,5 +88,10 @@ int sys_ioport_write(std::uint32_t ioport_cap, std::uint16_t port, std::uint64_t
 // Well-known capability slot constants
 static constexpr std::uint32_t CAP_SELF_VSPACE = 0;
 static constexpr std::uint32_t CAP_UNTYPED = 240;
+static constexpr std::uint32_t CAP_AHCI_MMIO = 241;
+static constexpr std::uint32_t CAP_XHCI_MMIO = 242;
+static constexpr std::uint32_t CAP_BOOTINFO = 243;
+static constexpr std::uint32_t CAP_INITRD = 244;
+static constexpr std::uint32_t CAP_SELF_CSPACE = 245;
 
 } // namespace oz

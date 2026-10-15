@@ -3,13 +3,21 @@
 #include "core/Thread.hpp"
 #include <cstdint>
 
+#include "core/VSpace.hpp"
+#include "utils/utils.hpp"
+
 namespace oz {
 
-// Forward declarations
-class VSpace;
 class CSpace;
 
-class TCB : public KernelObject {
+extern "C" void enter_user_mode(std::uint64_t rip, std::uint64_t user_rsp, std::uint64_t rflags);
+
+inline void user_thread_entry(void* arg) {
+    Thread* t = static_cast<Thread*>(arg);
+    enter_user_mode(t->user_rip, t->user_rsp, 0x202);
+}
+
+class TCB : public KernelObject, public PhysicalAddressProvider {
 private:
     Thread* thread_;
     bool owned_;  // If true, TCB owns the thread and will schedule cleanup on destruction
@@ -47,6 +55,7 @@ public:
     bool resume() {
         if (!thread_) return false;
         if (thread_->state == ThreadState::Ready || thread_->state == ThreadState::Running) return false;
+        thread_->state = ThreadState::Ready;
         if (queue_thread_fn_) {
             queue_thread_fn_(thread_);
             return true;
@@ -72,13 +81,41 @@ public:
     // entry: user-space entry point, stack_top: user stack pointer
     bool setRegisters(std::uint64_t entry, std::uint64_t stack_top) {
         if (!thread_) return false;
-        // Store in thread's user_data process if available
-        // For now, these are stored as thread metadata
-        // The actual register setup happens when the thread is first scheduled
+        thread_->user_rip = entry;
+        thread_->user_rsp = stack_top;
         return true;
     }
 
-    // Configure: associate VSpace and CSpace with the thread's process
+    // Configure: associate VSpace, CSpace, and execution context
+    bool configure(CSpace* cspace, VSpace* vspace, std::uint64_t rip, std::uint64_t user_rsp) {
+        if (!thread_) return false;
+        thread_->cspace = cspace;
+        if (vspace && vspace->getPhysicalPML4() != 0) {
+            thread_->pml4_phys = createPhysicalAddress<PageTable>(vspace->getPhysicalPML4());
+        }
+        thread_->user_rip = rip;
+        thread_->user_rsp = user_rsp;
+        thread_->state = ThreadState::Blocked;
+
+        // Set up stack for switch_context
+        std::uint64_t rsp = reinterpret_cast<std::uint64_t>(thread_->stack_base) + thread_->stack_size;
+        rsp &= ~15ULL; // 16-byte align
+
+        rsp -= sizeof(ThreadContext);
+        thread_->rsp = reinterpret_cast<void*>(rsp);
+
+        ThreadContext* ctx = reinterpret_cast<ThreadContext*>(rsp);
+        ctx->rip = reinterpret_cast<std::uint64_t>(&thread_stub);
+        ctx->r12 = reinterpret_cast<std::uint64_t>(&user_thread_entry);
+        ctx->rbx = reinterpret_cast<std::uint64_t>(thread_);
+        ctx->r13 = 0;
+        ctx->r14 = 0;
+        ctx->r15 = 0;
+        ctx->rbp = 0;
+
+        return true;
+    }
+
     bool configure(void* process_ptr) {
         if (!thread_) return false;
         thread_->user_data = process_ptr;

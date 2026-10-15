@@ -1,16 +1,27 @@
 #include "syscall.hpp"
+#include "loader.hpp"
 #include "../common/utils/BootInfo.hpp"
 #include "../common/ipc/Protocol.hpp"
 
 // Cap slot assignments for init:
+//   0: CAP_SELF_VSPACE
 //   1: write to console (sys_write uses this)
-//   2: send to AHCI (MMIO address)
+//   2: send to AHCI (control)
 //   3: send to VFS (file operation requests)
 //   4: recv from VFS (file operation responses)
+//   240: CAP_UNTYPED
+//   241: CAP_AHCI_MMIO
+//   242: CAP_XHCI_MMIO
+//   243: CAP_BOOTINFO
+//   244: CAP_INITRD
+//   245: CAP_SELF_CSPACE
 
 static constexpr std::uint32_t CAP_AHCI_SEND = 2;
 static constexpr std::uint32_t CAP_VFS_SEND = 3;
 static constexpr std::uint32_t CAP_VFS_RECV = 4;
+
+static constexpr std::uint64_t BOOTINFO_VADDR = 0x600000000000ULL;
+static constexpr std::uint64_t INITRD_VADDR   = 0x500000000000ULL;
 
 // Helper: send a VFS file open request
 static int vfs_open(const char* path) {
@@ -52,7 +63,6 @@ static std::size_t vfs_read(int handle, std::size_t offset, char* buf, std::size
     if (resp.data[0] != 0) return 0;
     
     std::size_t bytes_read = static_cast<std::size_t>(resp.data[1]);
-    // Data is packed in resp.data[2..3]
     const char* src = reinterpret_cast<const char*>(&resp.data[2]);
     std::size_t to_copy = bytes_read > 16 ? 16 : bytes_read;
     if (to_copy > size) to_copy = size;
@@ -90,34 +100,163 @@ static void vfs_close(int handle) {
 }
 
 extern "C" void _start() {
-    oz::sys_write("Hello from init process (Ring 3)!\n\r");
-    
-    // Map BootInfo Frame (slot 243) into our VSpace
-    static constexpr std::uint64_t BOOTINFO_VIRT = 0x600000000000;
-    if (oz::sys_vspace_map(oz::CAP_SELF_VSPACE, 243, BOOTINFO_VIRT, 0x00) != 0) {
-        // 0x00 = read-only
-        oz::sys_write("Failed to map BootInfo!\n\r");
+    oz::sys_debug_print("[Init] OZ OS Root Server started (Ring 3)!\n\r");
+
+    // 1. Map BootInfo Frame (slot 243) into our VSpace
+    if (oz::sys_vspace_map(oz::CAP_SELF_VSPACE, oz::CAP_BOOTINFO, BOOTINFO_VADDR, 0x00) != 0) {
+        oz::sys_debug_print("[Init] ERROR: Failed to map BootInfo!\n\r");
         oz::sys_exit(1);
     }
-    
-    const volatile auto* boot_info = reinterpret_cast<const volatile oz::BootInfo*>(BOOTINFO_VIRT);
-    std::uint64_t ahci_abar = boot_info->ahci_abar_phys;
-    
-    // Send AHCI MMIO address to AHCI driver
+    const volatile auto* boot_info = reinterpret_cast<const volatile oz::BootInfo*>(BOOTINFO_VADDR);
+    std::uint64_t initrd_size = boot_info->initrd_size;
+    std::uint64_t ahci_abar_phys = boot_info->ahci_abar_phys;
+    std::uint64_t xhci_bar_phys = boot_info->xhci_bar_phys;
+
+    // 2. Map InitRD Frame (slot 244) into our VSpace
+    if (initrd_size > 0) {
+        if (oz::sys_vspace_map(oz::CAP_SELF_VSPACE, oz::CAP_INITRD, INITRD_VADDR, 0x00) != 0) {
+            oz::sys_debug_print("[Init] ERROR: Failed to map InitRD!\n\r");
+            oz::sys_exit(1);
+        }
+    }
+    const std::uint8_t* initrd_ptr = reinterpret_cast<const std::uint8_t*>(INITRD_VADDR + boot_info->initrd_offset);
+
+    // 3. Spawn Console Server
+    oz::loader::TarFile cons_file = oz::loader::tar_find_file(initrd_ptr, initrd_size, "console");
+    if (!cons_file.data) {
+        oz::sys_debug_print("[Init] ERROR: console not found in initrd!\n\r");
+        oz::sys_exit(1);
+    }
+    auto cons_proc = oz::loader::spawn_process(oz::CAP_UNTYPED, oz::CAP_SELF_VSPACE, cons_file.data, cons_file.size);
+    if (!cons_proc.success) {
+        oz::sys_debug_print("[Init] ERROR: Failed to spawn console process!\n\r");
+        oz::sys_exit(1);
+    }
+
+    std::uint32_t cons_send = 0;
+    std::uint32_t cons_recv = 0;
+    oz::sys_channel_create(&cons_send, &cons_recv);
+
+    int cs_res = oz::sys_cspace_cap_insert(cons_proc.cspace_cap, 1, cons_recv, static_cast<std::uint32_t>(oz::CapRights::READ));
+    oz::sys_cspace_cap_insert(cons_proc.cspace_cap, oz::CAP_UNTYPED, oz::CAP_UNTYPED, static_cast<std::uint32_t>(oz::CapRights::ALL));
+    int resume_res = oz::sys_tcb_resume(cons_proc.tcb_cap);
+
+    int self_res = oz::sys_cspace_cap_insert(oz::CAP_SELF_CSPACE, 1, cons_send, static_cast<std::uint32_t>(oz::CapRights::WRITE | oz::CapRights::GRANT));
+    (void)cs_res; (void)resume_res; (void)self_res;
+
+    oz::sys_write("Hello from init process (Ring 3)!\n\r");
+    oz::sys_write("[Init] Console server spawned successfully.\n\r");
+
+    // 4. Spawn AHCI Driver
+    oz::loader::TarFile ahci_file = oz::loader::tar_find_file(initrd_ptr, initrd_size, "ahci");
+    if (!ahci_file.data) {
+        oz::sys_write("[Init] ERROR: ahci not found in initrd!\n\r");
+        oz::sys_exit(1);
+    }
+    auto ahci_proc = oz::loader::spawn_process(oz::CAP_UNTYPED, oz::CAP_SELF_VSPACE, ahci_file.data, ahci_file.size);
+    if (!ahci_proc.success) {
+        oz::sys_write("[Init] ERROR: Failed to spawn ahci process!\n\r");
+        oz::sys_exit(1);
+    }
+
+    std::uint32_t init_ahci_send = 0;
+    std::uint32_t ahci_init_recv = 0;
+    oz::sys_channel_create(&init_ahci_send, &ahci_init_recv);
+    oz::sys_cspace_cap_insert(oz::CAP_SELF_CSPACE, CAP_AHCI_SEND, init_ahci_send, static_cast<std::uint32_t>(oz::CapRights::WRITE | oz::CapRights::GRANT));
+
+    std::uint32_t vfs_ahci_send = 0;
+    std::uint32_t ahci_vfs_recv = 0;
+    oz::sys_channel_create(&vfs_ahci_send, &ahci_vfs_recv);
+
+    std::uint32_t ahci_vfs_send = 0;
+    std::uint32_t vfs_ahci_recv = 0;
+    oz::sys_channel_create(&ahci_vfs_send, &vfs_ahci_recv);
+
+    // Shared buffer (16 pages = 64KB) for block I/O
+    std::uint32_t shared_buf_frame = oz::sys_frame_alloc(oz::CAP_UNTYPED, 16);
+
+    oz::sys_cspace_cap_insert(ahci_proc.cspace_cap, 1, cons_send, static_cast<std::uint32_t>(oz::CapRights::WRITE | oz::CapRights::GRANT));
+    oz::sys_cspace_cap_insert(ahci_proc.cspace_cap, 2, ahci_init_recv, static_cast<std::uint32_t>(oz::CapRights::READ));
+    oz::sys_cspace_cap_insert(ahci_proc.cspace_cap, 3, ahci_vfs_recv, static_cast<std::uint32_t>(oz::CapRights::READ));
+    oz::sys_cspace_cap_insert(ahci_proc.cspace_cap, 4, ahci_vfs_send, static_cast<std::uint32_t>(oz::CapRights::WRITE | oz::CapRights::GRANT));
+    oz::sys_cspace_cap_insert(ahci_proc.cspace_cap, oz::CAP_UNTYPED, oz::CAP_UNTYPED, static_cast<std::uint32_t>(oz::CapRights::ALL));
+    if (ahci_abar_phys != 0) {
+        oz::sys_cspace_cap_insert(ahci_proc.cspace_cap, 241, oz::CAP_AHCI_MMIO, static_cast<std::uint32_t>(oz::CapRights::ALL));
+    }
+    oz::sys_cspace_cap_insert(ahci_proc.cspace_cap, 242, shared_buf_frame, static_cast<std::uint32_t>(oz::CapRights::ALL));
+
+    oz::sys_tcb_resume(ahci_proc.tcb_cap);
+    oz::sys_write("[Init] AHCI server spawned successfully.\n\r");
+
+    // 5. Spawn VFS Server
+    oz::loader::TarFile vfs_file = oz::loader::tar_find_file(initrd_ptr, initrd_size, "vfs");
+    if (!vfs_file.data) {
+        oz::sys_write("[Init] ERROR: vfs not found in initrd!\n\r");
+        oz::sys_exit(1);
+    }
+    auto vfs_proc = oz::loader::spawn_process(oz::CAP_UNTYPED, oz::CAP_SELF_VSPACE, vfs_file.data, vfs_file.size);
+    if (!vfs_proc.success) {
+        oz::sys_write("[Init] ERROR: Failed to spawn vfs process!\n\r");
+        oz::sys_exit(1);
+    }
+
+    std::uint32_t init_vfs_send = 0;
+    std::uint32_t vfs_init_recv = 0;
+    oz::sys_channel_create(&init_vfs_send, &vfs_init_recv);
+
+    std::uint32_t vfs_init_send = 0;
+    std::uint32_t init_vfs_recv = 0;
+    oz::sys_channel_create(&vfs_init_send, &init_vfs_recv);
+
+    oz::sys_cspace_cap_insert(oz::CAP_SELF_CSPACE, CAP_VFS_SEND, init_vfs_send, static_cast<std::uint32_t>(oz::CapRights::WRITE | oz::CapRights::GRANT));
+    oz::sys_cspace_cap_insert(oz::CAP_SELF_CSPACE, CAP_VFS_RECV, init_vfs_recv, static_cast<std::uint32_t>(oz::CapRights::READ));
+
+    oz::sys_cspace_cap_insert(vfs_proc.cspace_cap, 1, cons_send, static_cast<std::uint32_t>(oz::CapRights::WRITE | oz::CapRights::GRANT));
+    oz::sys_cspace_cap_insert(vfs_proc.cspace_cap, 2, vfs_ahci_send, static_cast<std::uint32_t>(oz::CapRights::WRITE | oz::CapRights::GRANT));
+    oz::sys_cspace_cap_insert(vfs_proc.cspace_cap, 3, vfs_ahci_recv, static_cast<std::uint32_t>(oz::CapRights::READ));
+    oz::sys_cspace_cap_insert(vfs_proc.cspace_cap, 4, vfs_init_recv, static_cast<std::uint32_t>(oz::CapRights::READ));
+    oz::sys_cspace_cap_insert(vfs_proc.cspace_cap, 5, vfs_init_send, static_cast<std::uint32_t>(oz::CapRights::WRITE | oz::CapRights::GRANT));
+    oz::sys_cspace_cap_insert(vfs_proc.cspace_cap, oz::CAP_UNTYPED, oz::CAP_UNTYPED, static_cast<std::uint32_t>(oz::CapRights::ALL));
+    oz::sys_cspace_cap_insert(vfs_proc.cspace_cap, 242, shared_buf_frame, static_cast<std::uint32_t>(oz::CapRights::ALL));
+
+    oz::sys_tcb_resume(vfs_proc.tcb_cap);
+    oz::sys_write("[Init] VFS server spawned successfully.\n\r");
+
+    // 6. Spawn xHCI Server
+    oz::loader::TarFile xhci_file = oz::loader::tar_find_file(initrd_ptr, initrd_size, "xhci");
+    if (xhci_file.data) {
+        auto xhci_proc = oz::loader::spawn_process(oz::CAP_UNTYPED, oz::CAP_SELF_VSPACE, xhci_file.data, xhci_file.size);
+        if (xhci_proc.success) {
+            std::uint32_t irq_send = 0;
+            std::uint32_t irq_recv = 0;
+            oz::sys_channel_create(&irq_send, &irq_recv);
+
+            std::uint32_t irq_handler = oz::sys_irq_handler_create(0x40, irq_send);
+
+            oz::sys_cspace_cap_insert(xhci_proc.cspace_cap, 1, cons_send, static_cast<std::uint32_t>(oz::CapRights::WRITE | oz::CapRights::GRANT));
+            oz::sys_cspace_cap_insert(xhci_proc.cspace_cap, 2, irq_recv, static_cast<std::uint32_t>(oz::CapRights::READ));
+            oz::sys_cspace_cap_insert(xhci_proc.cspace_cap, 3, irq_handler, static_cast<std::uint32_t>(oz::CapRights::ALL));
+            oz::sys_cspace_cap_insert(xhci_proc.cspace_cap, oz::CAP_UNTYPED, oz::CAP_UNTYPED, static_cast<std::uint32_t>(oz::CapRights::ALL));
+            if (xhci_bar_phys != 0) {
+                oz::sys_cspace_cap_insert(xhci_proc.cspace_cap, 241, oz::CAP_XHCI_MMIO, static_cast<std::uint32_t>(oz::CapRights::ALL));
+            }
+
+            oz::sys_tcb_resume(xhci_proc.tcb_cap);
+            oz::sys_write("[Init] xHCI driver spawned successfully.\n\r");
+        }
+    }
+
+    // 7. Send AHCI MMIO address to AHCI driver
     oz::IPCMessage msg{};
-    msg.data[0] = ahci_abar;
-    
+    msg.data[0] = ahci_abar_phys;
     if (oz::sys_channel_send(CAP_AHCI_SEND, &msg)) {
         oz::sys_write("Sent AHCI MMIO address to ahci server.\n\r");
     } else {
         oz::sys_write("Failed to send AHCI MMIO address!\n\r");
     }
-    
-    // Wait a bit for VFS to initialize (it needs AHCI to be ready first)
-    // In a real system, we'd use a synchronization mechanism.
-    // For now, the blocking IPC will handle ordering.
+
+    // 8. Attempt file operations via VFS
     oz::sys_write("Attempting to open test.txt via VFS...\n\r");
-    
     int handle = vfs_open("test.txt");
     if (handle >= 0) {
         oz::sys_write("File opened! handle=");
@@ -126,7 +265,6 @@ extern "C" void _start() {
         
         std::size_t size = vfs_get_size(handle);
         oz::sys_write("File size: ");
-        // Simple number to string
         char size_str[16];
         int pos = 0;
         if (size == 0) {
@@ -148,7 +286,6 @@ extern "C" void _start() {
         size_str[pos] = '\0';
         oz::sys_write(size_str);
         
-        // Read first 16 bytes
         char buf[17] = {};
         std::size_t bytes = vfs_read(handle, 0, buf, 16);
         buf[bytes] = '\0';
@@ -161,9 +298,8 @@ extern "C" void _start() {
     } else {
         oz::sys_write("test.txt not found (this is OK if disk has no test.txt).\n\r");
     }
-    
+
     oz::sys_write("Init process completed. Idling...\n\r");
-    
     while (true) {
         __asm__ volatile("pause");
     }

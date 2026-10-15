@@ -114,6 +114,7 @@ public:
             0, stack_base, stack_size, PageBlock<>{nullptr}, 0
         );
         thread->is_untyped_backed = true;
+        thread->state = ThreadState::Blocked;
 
         TCB* tcb = new (tcb_mem) TCB(thread, true, queue_thread_fn, true);
         return tcb;
