@@ -5,7 +5,8 @@
 
 namespace oz {
 
-template <typename Accessor>
+class Scheduler;
+
 class Mutex {
 private:
     Spinlock spinlock;
@@ -18,9 +19,8 @@ private:
 public:
     Mutex() = default;
     
-    void lock() {
+    void lock(Scheduler& scheduler) {
         spinlock.lock();
-        auto& scheduler = Accessor::getScheduler();
         
         if (!locked) {
             locked = true;
@@ -44,9 +44,8 @@ public:
         }
     }
 
-    void unlock() {
+    void unlock(Scheduler& scheduler) {
         spinlock.lock();
-        auto& scheduler = Accessor::getScheduler();
         
         if (wait_queue_head) {
             Thread* woke = wait_queue_head;

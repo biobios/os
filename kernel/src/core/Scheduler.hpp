@@ -9,7 +9,6 @@
 
 namespace oz {
 
-template <typename Accessor>
 class Scheduler {
 private:
     Thread* ready_queue_head = nullptr;
@@ -54,7 +53,7 @@ public:
         ctx->rip = reinterpret_cast<std::uint64_t>(&thread_stub);
         ctx->r12 = reinterpret_cast<std::uint64_t>(entry);
         ctx->rbx = reinterpret_cast<std::uint64_t>(arg);
-        ctx->r13 = reinterpret_cast<std::uint64_t>(&Scheduler<Accessor>::exit_thread_stub);
+        ctx->r13 = reinterpret_cast<std::uint64_t>(&Scheduler::exit_thread_stub);
         ctx->r14 = reinterpret_cast<std::uint64_t>(this); // Pass scheduler ptr
         ctx->r15 = 0;
         ctx->rbp = 0;
@@ -249,6 +248,6 @@ public:
     Thread* getCurrentThread() { return current_thread; }
 };
 
-static_assert(scheduler<Scheduler<void>> || true); // Just a note
+static_assert(scheduler<Scheduler>);
 
 } // namespace oz

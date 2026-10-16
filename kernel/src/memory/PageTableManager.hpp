@@ -3,7 +3,6 @@
 #include <cstddef>
 #include <cstdint>
 #include "memory/Address.hpp"
-#include "memory/IFrameManager.hpp"
 #include "memory/PageTable.hpp"
 
 namespace oz {
@@ -27,7 +26,6 @@ namespace oz {
 // 0xffffffffa0000000 ~ 0xffffffffe0000000 : カーネルモジュール領域 (1GB)
 // 0xffffffffe0000000 ~ 0xffffffffffffffff : reserved (512MB)
 
-template <frame_manager_accessor Accessor>
 class PageTableManager : public PhysicalAddressProvider {
 public:
     struct TranslateResult {

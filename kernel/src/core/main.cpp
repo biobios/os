@@ -106,16 +106,11 @@ public:
     }
 };
 
-struct Settings {
-    using FrameManager = oz::x86_64::FrameManager;
-    template <typename Accessor>
-    using SchedulerFunctor = oz::Scheduler<Accessor>;
-};
-
 __attribute__((interrupt))
 static void timerInterruptHandler(void* frame) {
+    (void)frame;
     oz::x86_64::notifyEndOfInterrupt();
-    oz::KernelStorage<Settings>::kernel_storage.kernel.scheduler.tick();
+    oz::Kernel::instance().getScheduler().tick();
 }
 
 extern "C" void kernel_main(oz_boot::PlatformInfo* platformInfoPhys) {
@@ -148,13 +143,13 @@ extern "C" void kernel_main(oz_boot::PlatformInfo* platformInfoPhys) {
     oz::initSyscall();
 
     // 10. Initialize and run Kernel
-    using KStorage = oz::KernelStorage<Settings>;
-    new (&KStorage::kernel_storage.kernel) KStorage::Kernel{platformInfo};
+    alignas(oz::Kernel) static std::uint8_t kernel_buffer[sizeof(oz::Kernel)];
+    auto* kernel = new (kernel_buffer) oz::Kernel(platformInfo);
     
     // Register timer interrupt handler
     oz::x86_64::setInterruptDescriptor(32, reinterpret_cast<void*>(timerInterruptHandler));
 
-    KStorage::kernel_storage.kernel.run();
+    kernel->run();
 
     while (1) __asm__ volatile("hlt");
 }

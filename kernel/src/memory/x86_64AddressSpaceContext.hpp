@@ -3,7 +3,6 @@
 #include <cstddef>
 #include <cstdint>
 #include "memory/Address.hpp"
-#include "memory/IFrameManager.hpp"
 #include "memory/PageTable.hpp"
 #include "memory/PageTableManager.hpp"
 #include "memory/MemoryFlags.hpp"
@@ -11,12 +10,11 @@
 
 namespace oz {
 
-template <frame_manager_accessor Accessor>
 class x86_64AddressSpaceContext : public PhysicalAddressProvider {
 private:
     PageTable* pml4_virt;
     PhysicalAddress<PageTable> pml4_phys;
-    PageTableManager<Accessor> pt_manager;
+    PageTableManager pt_manager;
 
 public:
     x86_64AddressSpaceContext(PageTable* pml4_v, PhysicalAddress<PageTable> pml4_p)
@@ -40,19 +38,6 @@ public:
         }
 
         return x86_64AddressSpaceContext(new_pml4_virt, new_pml4_phys);
-    }
-
-    static x86_64AddressSpaceContext cloneProcessSpace(const x86_64AddressSpaceContext& kernel_space) {
-        constexpr auto& fm = Accessor::getFrameManager();
-
-        PageBlock pml4_block = fm.allocateBlock(0);
-        if (!pml4_block) {
-            return x86_64AddressSpaceContext(nullptr, PhysicalAddressProvider::nullPhysicalAddress<PageTable>());
-        }
-        pml4_block.setOwner(PageOwnerType::PAGE_TABLE);
-
-        PhysicalAddress<PageTable> new_pml4_phys = physical_address_cast<PageTable>(fm.getPhysicalAddress(pml4_block));
-        return createFromPhysical(new_pml4_phys, kernel_space);
     }
 
     bool isValid() const {
@@ -105,7 +90,7 @@ public:
 
     PhysicalAddress<PageTable> getPhysicalPML4() const { return pml4_phys; }
     PageTable* getVirtualPML4() const { return pml4_virt; }
-    PageTableManager<Accessor>& getPageTableManager() { return pt_manager; }
+    PageTableManager& getPageTableManager() { return pt_manager; }
 };
 
 } // namespace oz

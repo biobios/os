@@ -4,18 +4,13 @@
 #include <memory>
 #include "core/Thread.hpp"
 #include "memory/AddressSpace.hpp"
-
 #include "core/Capability.hpp"
 
 namespace oz {
 
-template <typename KernelAccessor>
 class Process {
 public:
-    using AddressSpaceType = ProcessAddressSpace<
-        KernelAccessor,
-        x86_64AddressSpaceContext<KernelAccessor>
-    >;
+    using AddressSpaceType = ProcessAddressSpace;
 
     std::uint64_t pid;
     AddressSpaceType address_space;

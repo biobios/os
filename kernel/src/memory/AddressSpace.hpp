@@ -4,14 +4,15 @@
 #include <memory>
 #include <utility>
 #include "memory/Address.hpp"
-#include "memory/IFrameManager.hpp"
 #include "memory/MemoryFlags.hpp"
 #include "memory/x86_64AddressSpaceContext.hpp"
 
 namespace oz {
 
-template <frame_manager_accessor Accessor, typename ArchContext = x86_64AddressSpaceContext<Accessor>>
 class KernelAddressSpace {
+public:
+    using ArchContext = x86_64AddressSpaceContext;
+
 private:
     ArchContext arch_ctx;
 
@@ -27,21 +28,18 @@ public:
     const ArchContext& getArchContext() const { return arch_ctx; }
 };
 
-template <frame_manager_accessor Accessor, typename ArchContext = x86_64AddressSpaceContext<Accessor>>
 class ProcessAddressSpace {
+public:
+    using ArchContext = x86_64AddressSpaceContext;
+
 private:
     ArchContext arch_ctx;
 
 public:
     explicit ProcessAddressSpace(ArchContext ctx) : arch_ctx(std::move(ctx)) {}
 
-    static ProcessAddressSpace createFromPhysical(PhysicalAddress<PageTable> pml4_phys, const KernelAddressSpace<Accessor, ArchContext>& kernel_space) {
+    static ProcessAddressSpace createFromPhysical(PhysicalAddress<PageTable> pml4_phys, const KernelAddressSpace& kernel_space) {
         ArchContext new_ctx = ArchContext::createFromPhysical(pml4_phys, kernel_space.getArchContext());
-        return ProcessAddressSpace(std::move(new_ctx));
-    }
-
-    static ProcessAddressSpace create(const KernelAddressSpace<Accessor, ArchContext>& kernel_space) {
-        ArchContext new_ctx = ArchContext::cloneProcessSpace(kernel_space.getArchContext());
         return ProcessAddressSpace(std::move(new_ctx));
     }
 
