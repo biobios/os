@@ -29,7 +29,18 @@ public:
     Scheduler& getScheduler() { return scheduler; }
 
 private:
+    struct BootDevices {
+        std::uint64_t ahci_abar_phys{0};
+        std::uint64_t xhci_bar_phys{0};
+    };
+
+    void initSyscallAndStubs();
+    BootDevices probeBootDevices();
+    const oz_boot::BootModuleInfo* findBootModule(const char* name);
+    Thread* loadRootServerFromInitrd(UntypedMemory& boot_untyped, const oz_boot::BootModuleInfo* initrd_file);
     Thread* loadProcessFromElfBuffer(UntypedMemory& boot_untyped, const std::uint8_t* file_buf, std::size_t file_size);
+    void setupRootServerCaps(Thread* init_thread, UntypedMemory& boot_untyped, const BootDevices& devices, const oz_boot::BootModuleInfo* initrd_file);
+    void setupIdleThread();
 
     x86_64::FrameManager fm;
     PageTableManager pt_manager;
