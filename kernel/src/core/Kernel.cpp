@@ -8,8 +8,7 @@
 #include "core/Frame.hpp"
 #include "core/IOPort.hpp"
 #include "core/IRQDispatch.hpp"
-#include "core/IRQHandler.hpp"
-#include "core/Process.hpp"
+#include "core/TCB.hpp"
 #include "core/Syscall.hpp"
 #include "core/UntypedMemory.hpp"
 #include "core/VSpace.hpp"
@@ -47,11 +46,7 @@ void Kernel::run() {
     };
     oz::g_get_current_cspace_func = []() -> CSpace* {
         auto* thread = Kernel::instance().scheduler.getCurrentThread();
-        if (!thread) return nullptr;
-        if (thread->cspace) return thread->cspace;
-        if (!thread->user_data) return nullptr;
-        auto* proc = static_cast<Process*>(thread->user_data);
-        return proc->cspace;
+        return thread ? thread->cspace : nullptr;
     };
     oz::g_get_current_thread_func = []() -> Thread* {
         return Kernel::instance().scheduler.getCurrentThread();
@@ -62,40 +57,8 @@ void Kernel::run() {
     oz::g_unblock_thread_func = [](Thread* t) {
         Kernel::instance().scheduler.queueThread(t);
     };
-    oz::g_create_thread_func = nullptr;
     oz::g_queue_thread_func = [](Thread* t) {
         Kernel::instance().scheduler.queueThread(t);
-    };
-    oz::g_create_vspace_func = [](UntypedMemory* untyped) -> VSpaceCreateResult {
-        if (!untyped) return {nullptr, nullptr};
-        std::uintptr_t pml4_phys = 0;
-        void* pml4_mem = untyped->allocateBytes(4096, 4096, pml4_phys);
-        if (!pml4_mem) return {nullptr, nullptr};
-
-        auto user_as = ProcessAddressSpace::createFromPhysical(
-            createPhysicalAddress<PageTable>(pml4_phys),
-            Kernel::instance().kernel_space);
-        if (!user_as.isValid()) return {nullptr, nullptr};
-        auto* as_obj = untyped->allocateObject<ProcessAddressSpace>(std::move(user_as));
-        if (!as_obj) return {nullptr, nullptr};
-        return {as_obj, reinterpret_cast<void*>(pml4_phys)};
-    };
-    oz::g_vspace_map_fn = [](void* as, std::uintptr_t virt, std::uintptr_t phys, std::uint64_t flags) -> bool {
-        MemoryFlags mem_flags = MemoryFlags::Present | MemoryFlags::User;
-        if (flags & 0x01) mem_flags = mem_flags | MemoryFlags::Writable;
-        if (flags & 0x02) mem_flags = mem_flags | MemoryFlags::Executable;
-        if (flags & 0x10) mem_flags = mem_flags | MemoryFlags::CacheDisable;
-        return static_cast<ProcessAddressSpace*>(as)->mapUser(virt, phys, mem_flags);
-    };
-    oz::g_vspace_unmap_fn = [](void* as, std::uintptr_t virt) -> bool {
-        return static_cast<ProcessAddressSpace*>(as)->unmapUser(virt);
-    };
-    oz::g_vspace_install_pt_fn = [](void* as, std::uintptr_t virt, std::uintptr_t pt_phys, std::uint8_t level) -> bool {
-        return static_cast<ProcessAddressSpace*>(as)->installPageTable(
-            virt, createPhysicalAddress<PageTable>(pt_phys), level);
-    };
-    oz::g_vspace_missing_level_fn = [](void* as, std::uintptr_t virt) -> std::uint8_t {
-        return static_cast<ProcessAddressSpace*>(as)->getMissingTableLevel(virt);
     };
     // Phase 4: IRQ handler dispatch table (maps vector -> IRQHandler*)
     oz::g_register_irq_handler_fn = [](std::uint8_t vector, IRQHandler* handler) {
@@ -242,22 +205,12 @@ void Kernel::run() {
     }
 
     if (init_thread) {
-        auto* init_proc = static_cast<Process*>(init_thread->user_data);
+        CSpace* init_cspace = init_thread->cspace;
         
         auto free_fn = [](void* cleanup_data) {
             auto& fm = Kernel::instance().fm;
             fm.freeBlock(static_cast<PageFrameDescriptor*>(cleanup_data));
         };
-
-        // 1. Setup VSpace (Slot 0)
-        auto* vspace = boot_untyped.allocateObject<VSpace>(
-            &init_proc->address_space, g_vspace_map_fn, g_vspace_unmap_fn,
-            init_proc->address_space.getArchContext().getPhysicalPML4().get(),
-            g_vspace_install_pt_fn, g_vspace_missing_level_fn
-        );
-        Capability vspace_cap(vspace, CapRights::ALL);
-        init_proc->cspace->insert(0, vspace_cap);
-        vspace->release();
 
         // 2. Setup 64MB UntypedMemory for Init (Slot 240, for backwards compatibility)
         auto ut_block = fm.allocateBlock(14); // 16384 pages = 64MB
@@ -265,7 +218,7 @@ void Kernel::run() {
         auto* untyped = boot_untyped.allocateObject<UntypedMemory>(
             ut_phys, 16384 * 4096, nullptr, nullptr, false, true);
         Capability untyped_cap(untyped, CapRights::ALL);
-        init_proc->cspace->insert(240, untyped_cap);
+        init_cspace->insert(240, untyped_cap);
         untyped->release();
 
         // 2.5 Transfer all remaining physical memory to Init as UntypedMemory capabilities (Slots 200..)
@@ -278,7 +231,7 @@ void Kernel::run() {
                 base, size, nullptr, nullptr, false, true);
             if (ut_obj) {
                 Capability ut_c(ut_obj, CapRights::ALL);
-                init_proc->cspace->insert(untyped_start_slot + untyped_count, ut_c);
+                init_cspace->insert(untyped_start_slot + untyped_count, ut_c);
                 ut_obj->release();
                 untyped_count++;
             }
@@ -289,7 +242,7 @@ void Kernel::run() {
         if (ahci_abar_phys != 0) {
             auto* abar_frame = boot_untyped.allocateObject<Frame>(ahci_abar_phys, 4096, true);
             Capability abar_cap(abar_frame, CapRights::ALL);
-            init_proc->cspace->insert(241, abar_cap);
+            init_cspace->insert(241, abar_cap);
             abar_frame->release();
         }
 
@@ -297,7 +250,7 @@ void Kernel::run() {
         if (xhci_bar_phys != 0) {
             auto* xhci_mmio_frame = boot_untyped.allocateObject<Frame>(xhci_bar_phys, 16 * 4096, true);
             Capability mmio_cap(xhci_mmio_frame, CapRights::ALL);
-            init_proc->cspace->insert(242, mmio_cap);
+            init_cspace->insert(242, mmio_cap);
             xhci_mmio_frame->release();
         }
 
@@ -326,7 +279,7 @@ void Kernel::run() {
             auto* bootinfo_frame = boot_untyped.allocateObject<Frame>(bootinfo_phys, 4096, false,
                 pfd, free_fn);
             Capability bootinfo_cap(bootinfo_frame, CapRights::READ);
-            init_proc->cspace->insert(243, bootinfo_cap);
+            init_cspace->insert(243, bootinfo_cap);
             bootinfo_frame->release();
             dprint("[Kernel] BootInfo capability created.\n\r");
         }
@@ -338,15 +291,15 @@ void Kernel::run() {
             std::size_t initrd_pages = (initrd_file->size + initrd_offset + 4095) / 4096;
             auto* initrd_frame = boot_untyped.allocateObject<Frame>(initrd_aligned_phys, initrd_pages * 4096, true);
             Capability initrd_cap(initrd_frame, CapRights::READ);
-            init_proc->cspace->insert(244, initrd_cap);
+            init_cspace->insert(244, initrd_cap);
             initrd_frame->release();
             dprint("[Kernel] InitRD Frame capability created.\n\r");
         }
 
         // 7. Setup Self CSpace capability (Slot 245)
-        auto* cs_cap_obj = boot_untyped.allocateObject<CSpaceCap>(init_proc->cspace, false);
+        auto* cs_cap_obj = boot_untyped.allocateObject<CSpaceCap>(init_cspace, false);
         Capability cs_cap(cs_cap_obj, CapRights::ALL);
-        init_proc->cspace->insert(245, cs_cap);
+        init_cspace->insert(245, cs_cap);
         cs_cap_obj->release();
 
         // 8. Setup FrameBuffer capability (Slot 246)
@@ -355,7 +308,7 @@ void Kernel::run() {
         if (fb_phys != 0 && fb_size != 0) {
             auto* fb_frame = boot_untyped.allocateObject<Frame>(fb_phys, fb_size, true);
             Capability fb_cap(fb_frame, CapRights::ALL);
-            init_proc->cspace->insert(246, fb_cap);
+            init_cspace->insert(246, fb_cap);
             fb_frame->release();
             dprint("[Kernel] FrameBuffer capability created.\n\r");
         }
@@ -475,32 +428,32 @@ Thread* Kernel::loadProcessFromElfBuffer(UntypedMemory& boot_untyped, const std:
     user_as.mapUser(stack_virt, stack_phys0, MemoryFlags::Present | MemoryFlags::Writable | MemoryFlags::User);
     user_as.mapUser(stack_virt + 4096, stack_phys1, MemoryFlags::Present | MemoryFlags::Writable | MemoryFlags::User);
     
-    auto* proc = boot_untyped.allocateObject<Process>(1, std::move(user_as), nullptr, entry_point, boot_untyped.allocateObject<CSpace>());
-    if (!proc) return nullptr;
+    auto* as_obj = boot_untyped.allocateObject<ProcessAddressSpace>(std::move(user_as));
+    if (!as_obj) return nullptr;
+
+    auto* init_cspace = boot_untyped.allocateObject<CSpace>();
+    if (!init_cspace) return nullptr;
+
+    // Slot 0: VSpace
+    auto* vspace = boot_untyped.allocateObject<VSpace>(
+        as_obj,
+        as_obj->getArchContext().getPhysicalPML4().get()
+    );
+    Capability vspace_cap(vspace, CapRights::ALL);
+    init_cspace->insert(0, vspace_cap);
+    vspace->release();
 
     TCB* user_tcb = boot_untyped.retypeTCB();
     if (!user_tcb) return nullptr;
     Thread* user_thread = user_tcb->getThread();
 
-    scheduler.setupThreadContext(user_thread, [](void* arg) {
-        auto* proc_ptr = static_cast<Process*>(arg);
-        
-        auto* current_thread = Kernel::instance().scheduler.getCurrentThread();
-        std::uint64_t kernel_stack_top = reinterpret_cast<std::uint64_t>(current_thread->stack_base) + current_thread->stack_size;
-        
-        setSyscallKernelStack(kernel_stack_top);
-        x86_64::setKernelStack(kernel_stack_top);
-        
-        proc_ptr->activate();
-        
-        std::uintptr_t stack_top = 0x700000000000;
-        enter_user_mode(proc_ptr->entry_point, stack_top - 8, 0x202);
-    }, proc);
-    
-    user_thread->pml4_phys = proc->address_space.getArchContext().getPhysicalPML4();
-    user_thread->user_data = proc;
-    user_thread->cspace = proc->cspace;
+    user_thread->pml4_phys = as_obj->getArchContext().getPhysicalPML4();
+    user_thread->cspace = init_cspace;
+    user_thread->user_rip = entry_point;
+    user_thread->user_rsp = 0x700000000000 - 8;
     user_thread->cleanup = nullptr;
+
+    scheduler.setupThreadContext(user_thread, user_thread_entry, user_thread);
 
     return user_thread;
 }

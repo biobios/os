@@ -12,19 +12,15 @@
 #include "core/IRQHandler.hpp"
 #include "core/IOPort.hpp"
 
+#include "core/Kernel.hpp"
+
 namespace oz {
 void (*g_exit_thread_func)() = nullptr;
 CSpace* (*g_get_current_cspace_func)() = nullptr;
 Thread* (*g_get_current_thread_func)() = nullptr;
 void (*g_block_thread_func)() = nullptr;
 void (*g_unblock_thread_func)(Thread*) = nullptr;
-Thread* (*g_create_thread_func)(void (*entry)(void*), void* arg) = nullptr;
 void (*g_queue_thread_func)(Thread* t) = nullptr;
-VSpaceCreateResult (*g_create_vspace_func)(UntypedMemory*) = nullptr;
-bool (*g_vspace_map_fn)(void*, std::uintptr_t, std::uintptr_t, std::uint64_t) = nullptr;
-bool (*g_vspace_unmap_fn)(void*, std::uintptr_t) = nullptr;
-bool (*g_vspace_install_pt_fn)(void*, std::uintptr_t, std::uintptr_t, std::uint8_t) = nullptr;
-std::uint8_t (*g_vspace_missing_level_fn)(void*, std::uintptr_t) = nullptr;
 void (*g_register_irq_handler_fn)(std::uint8_t, IRQHandler*) = nullptr;
 void (*g_eoi_fn)() = nullptr;
 std::uint8_t (*g_read_io8_fn)(std::uint16_t) = nullptr;
@@ -375,20 +371,24 @@ extern "C" std::uint64_t handleSyscall(std::uint64_t rdi, std::uint64_t rsi, std
     } else if (syscall_number == 17) {
         // vspace_create
         CSpace* cspace = get_cspace();
-        if (!cspace || !g_create_vspace_func) return -1;
+        if (!cspace) return -1;
         
         UntypedMemory* untyped = get_cap_typed<UntypedMemory>(
             cspace, 240, ObjectType::UntypedMemory, CapRights::WRITE);
         if (!untyped) return -1;
         
-        VSpaceCreateResult result = g_create_vspace_func(untyped);
-        if (!result.address_space) return -1;
+        std::uintptr_t pml4_phys = 0;
+        void* pml4_mem = untyped->allocateBytes(4096, 4096, pml4_phys);
+        if (!pml4_mem) return -1;
+
+        auto user_as = ProcessAddressSpace::createFromPhysical(
+            VSpace::createPhysicalAddress<PageTable>(pml4_phys),
+            Kernel::instance().getKernelSpace());
+        if (!user_as.isValid()) return -1;
+        auto* as_obj = untyped->allocateObject<ProcessAddressSpace>(std::move(user_as));
+        if (!as_obj) return -1;
         
-        auto* vspace = untyped->allocateObject<VSpace>(
-            result.address_space, g_vspace_map_fn, g_vspace_unmap_fn,
-            reinterpret_cast<std::uintptr_t>(result.pml4_phys),
-            g_vspace_install_pt_fn, g_vspace_missing_level_fn
-        );
+        auto* vspace = untyped->allocateObject<VSpace>(as_obj, pml4_phys);
         if (!vspace) return -1;
         Capability vs_cap(vspace, CapRights::ALL);
         CapID new_id = cspace->add(vs_cap);

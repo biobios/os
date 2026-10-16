@@ -15,22 +15,8 @@ extern Thread* (*g_get_current_thread_func)();
 extern void (*g_block_thread_func)();           // Block current thread and switch to next
 extern void (*g_unblock_thread_func)(Thread*);   // Wake up a blocked thread
 
-// For process/thread management (Phase 3)
-// Creates a new thread with kernel stack, returns Thread*
-extern Thread* (*g_create_thread_func)(void (*entry)(void*), void* arg);
 // Queues a thread into the scheduler
 extern void (*g_queue_thread_func)(Thread* t);
-// Creates a new VSpace (cloned from kernel space), returns opaque ptr + map/unmap fns
-struct VSpaceCreateResult {
-    void* address_space;  // ProcessAddressSpace*
-    void* pml4_phys;      // Physical address of PML4
-};
-extern VSpaceCreateResult (*g_create_vspace_func)(UntypedMemory* untyped);
-// Global VSpace map/unmap function pointers (set by Kernel.hpp, used by Syscall.cpp)
-extern bool (*g_vspace_map_fn)(void*, std::uintptr_t, std::uintptr_t, std::uint64_t);
-extern bool (*g_vspace_unmap_fn)(void*, std::uintptr_t);
-extern bool (*g_vspace_install_pt_fn)(void*, std::uintptr_t, std::uintptr_t, std::uint8_t);
-extern std::uint8_t (*g_vspace_missing_level_fn)(void*, std::uintptr_t);
 
 // For hardware resource management (Phase 4)
 class IRQHandler;

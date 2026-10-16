@@ -9,7 +9,6 @@
 #include "hardware/x86_64.hpp"
 #include "hardware/Serial.hpp"
 #include "core/Syscall.hpp"
-#include "core/Process.hpp"
 
 // Early boot page tables
 extern "C" {

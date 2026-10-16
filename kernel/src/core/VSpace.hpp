@@ -1,52 +1,48 @@
 #pragma once
-#include "core/Capability.hpp"
+
 #include <cstdint>
+#include "core/Capability.hpp"
+#include "memory/AddressSpace.hpp"
 
 namespace oz {
 
-// Forward declaration - MemoryFlags is defined in memory/MemoryFlags.hpp
-class MemoryFlags;
-
-class VSpace : public KernelObject {
+class VSpace : public KernelObject, public PhysicalAddressProvider {
 private:
-    void* address_space_;  // ProcessAddressSpace<KernelAccessor>*
+    ProcessAddressSpace* address_space_{nullptr};
     std::uintptr_t pml4_phys_{0};
-    bool (*map_fn_)(void* as, std::uintptr_t virt, std::uintptr_t phys, std::uint64_t flags);
-    bool (*unmap_fn_)(void* as, std::uintptr_t virt);
-    bool (*install_pt_fn_)(void* as, std::uintptr_t virt, std::uintptr_t pt_phys, std::uint8_t level){nullptr};
-    std::uint8_t (*missing_level_fn_)(void* as, std::uintptr_t virt){nullptr};
 
 public:
-    VSpace(void* as,
-           bool (*map_fn)(void*, std::uintptr_t, std::uintptr_t, std::uint64_t),
-           bool (*unmap_fn)(void*, std::uintptr_t),
-           std::uintptr_t pml4_phys = 0,
-           bool (*install_pt_fn)(void*, std::uintptr_t, std::uintptr_t, std::uint8_t) = nullptr,
-           std::uint8_t (*missing_level_fn)(void*, std::uintptr_t) = nullptr)
+    using PhysicalAddressProvider::createPhysicalAddress;
+
+    VSpace(ProcessAddressSpace* as, std::uintptr_t pml4_phys)
         : KernelObject(ObjectType::VSpace),
-          address_space_(as), pml4_phys_(pml4_phys), map_fn_(map_fn), unmap_fn_(unmap_fn),
-          install_pt_fn_(install_pt_fn), missing_level_fn_(missing_level_fn) {}
+          address_space_(as), pml4_phys_(pml4_phys) {}
 
     std::uintptr_t getPhysicalPML4() const { return pml4_phys_; }
+    ProcessAddressSpace* getAddressSpace() const { return address_space_; }
 
     bool mapUser(std::uintptr_t virt, std::uintptr_t phys, std::uint64_t flags) {
-        if (!map_fn_) return false;
-        return map_fn_(address_space_, virt, phys, flags);
+        if (!address_space_) return false;
+        MemoryFlags mem_flags = MemoryFlags::Present | MemoryFlags::User;
+        if (flags & 0x01) mem_flags = mem_flags | MemoryFlags::Writable;
+        if (flags & 0x02) mem_flags = mem_flags | MemoryFlags::Executable;
+        if (flags & 0x10) mem_flags = mem_flags | MemoryFlags::CacheDisable;
+        return address_space_->mapUser(virt, phys, mem_flags);
     }
 
     bool unmapUser(std::uintptr_t virt) {
-        if (!unmap_fn_) return false;
-        return unmap_fn_(address_space_, virt);
+        if (!address_space_) return false;
+        return address_space_->unmapUser(virt);
     }
 
     bool installPageTable(std::uintptr_t virt, std::uintptr_t pt_phys, std::uint8_t level) {
-        if (!install_pt_fn_) return false;
-        return install_pt_fn_(address_space_, virt, pt_phys, level);
+        if (!address_space_) return false;
+        return address_space_->installPageTable(virt, createPhysicalAddress<PageTable>(pt_phys), level);
     }
 
     std::uint8_t getMissingTableLevel(std::uintptr_t virt) const {
-        if (!missing_level_fn_) return 0;
-        return missing_level_fn_(address_space_, virt);
+        if (!address_space_) return 0;
+        return address_space_->getMissingTableLevel(virt);
     }
 };
 
