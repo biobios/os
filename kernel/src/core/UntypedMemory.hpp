@@ -5,6 +5,7 @@
 #include "core/TCB.hpp"
 #include "core/CSpaceCap.hpp"
 #include "core/Channel.hpp"
+#include "core/PageTableObject.hpp"
 #include "memory/Address.hpp"
 #include <cstdint>
 #include <cstddef>
@@ -25,6 +26,7 @@ private:
     void* cleanup_data_{nullptr};
     FreeFn free_fn_{nullptr};
 
+public:
     void* allocateBytes(std::size_t bytes, std::size_t alignment, std::uintptr_t& out_phys) {
         std::size_t aligned_watermark = (watermark_ + (alignment - 1)) & ~(alignment - 1);
         if (aligned_watermark + bytes > size_) {
@@ -35,7 +37,6 @@ private:
         return reinterpret_cast<void*>(out_phys + DIRECT_MAP_OFFSET);
     }
 
-public:
     UntypedMemory(std::uintptr_t phys_base, std::size_t size,
                   void* cleanup_data = nullptr, FreeFn free_fn = nullptr,
                   bool is_device = false, bool untyped = false)
@@ -91,6 +92,24 @@ public:
 
         // Construct Frame object with placement new
         return new (meta_mem) Frame(frame_phys, num_pages * 4096, is_device_, nullptr, nullptr, true);
+    }
+
+    // Retype into a PageTable (x86-64 intermediate paging structure: 4096 bytes)
+    PageTableObject* retypePageTable() {
+        // 1. Allocate metadata (PageTableObject struct)
+        std::uintptr_t meta_phys = 0;
+        void* meta_mem = allocateBytes(sizeof(PageTableObject), alignof(PageTableObject), meta_phys);
+        if (!meta_mem) return nullptr;
+
+        // 2. Allocate 4096-aligned physical page for table entries
+        std::uintptr_t pt_phys = 0;
+        void* pt_mem = allocateBytes(4096, 4096, pt_phys);
+        if (!pt_mem) {
+            watermark_ = meta_phys - phys_base_;
+            return nullptr;
+        }
+
+        return new (meta_mem) PageTableObject(pt_phys, true);
     }
 
     // Retype into a TCB (Thread Control Block) with integrated 8KB kernel stack

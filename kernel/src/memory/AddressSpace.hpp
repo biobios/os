@@ -35,6 +35,11 @@ private:
 public:
     explicit ProcessAddressSpace(ArchContext ctx) : arch_ctx(std::move(ctx)) {}
 
+    static ProcessAddressSpace createFromPhysical(PhysicalAddress<PageTable> pml4_phys, const KernelAddressSpace<Accessor, ArchContext>& kernel_space) {
+        ArchContext new_ctx = ArchContext::createFromPhysical(pml4_phys, kernel_space.getArchContext());
+        return ProcessAddressSpace(std::move(new_ctx));
+    }
+
     static ProcessAddressSpace create(const KernelAddressSpace<Accessor, ArchContext>& kernel_space) {
         ArchContext new_ctx = ArchContext::cloneProcessSpace(kernel_space.getArchContext());
         return ProcessAddressSpace(std::move(new_ctx));
@@ -42,6 +47,14 @@ public:
 
     bool isValid() const {
         return arch_ctx.isValid();
+    }
+
+    bool installPageTable(std::uintptr_t virt_addr, PhysicalAddress<PageTable> pt_phys, std::uint8_t level) {
+        return arch_ctx.installPageTable(virt_addr, pt_phys, level);
+    }
+
+    std::uint8_t getMissingTableLevel(std::uintptr_t virt_addr) const {
+        return arch_ctx.getMissingTableLevel(virt_addr);
     }
 
     bool mapUser(std::uintptr_t virt_addr, PhysicalAddress<void> phys_addr, MemoryFlags flags) {

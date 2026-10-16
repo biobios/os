@@ -43,8 +43,52 @@ public:
     PageTableManager(PageTable* pml4_virt)
         : pml4_table(pml4_virt) {}
 
+    std::uint8_t getMissingTableLevel(std::uintptr_t virt_addr) const {
+        if (!pml4_table) return 4;
+        std::size_t pml4_idx = paging::pml4Index(virt_addr);
+        if (!(*pml4_table)[pml4_idx].isPresent()) return 3; // PDPT missing
+        PageTable* pdpt = phys_to_virt(createPhysicalAddress<PageTable>((*pml4_table)[pml4_idx].getAddress()));
+        std::size_t pdpt_idx = paging::pdptIndex(virt_addr);
+        if (!(*pdpt)[pdpt_idx].isPresent()) return 2; // PD missing
+        PageTable* pd = phys_to_virt(createPhysicalAddress<PageTable>((*pdpt)[pdpt_idx].getAddress()));
+        std::size_t pd_idx   = paging::pdIndex(virt_addr);
+        if (!(*pd)[pd_idx].isPresent()) return 1; // PT missing
+        return 0; // All present
+    }
+
+    bool installPageTable(std::uintptr_t virt_addr, PhysicalAddress<PageTable> pt_phys, std::uint8_t level) {
+        if (!pml4_table) return false;
+
+        std::size_t pml4_idx = paging::pml4Index(virt_addr);
+        std::size_t pdpt_idx = paging::pdptIndex(virt_addr);
+        std::size_t pd_idx   = paging::pdIndex(virt_addr);
+
+        if (level == 3) {
+            // Install PDPT into PML4
+            if ((*pml4_table)[pml4_idx].isPresent()) return false;
+            (*pml4_table)[pml4_idx].set(pt_phys, PageFlags::Present | PageFlags::Writable | PageFlags::User);
+            return true;
+        } else if (level == 2) {
+            // Install PD into PDPT
+            if (!(*pml4_table)[pml4_idx].isPresent()) return false;
+            PageTable* pdpt = phys_to_virt(createPhysicalAddress<PageTable>((*pml4_table)[pml4_idx].getAddress()));
+            if ((*pdpt)[pdpt_idx].isPresent()) return false;
+            (*pdpt)[pdpt_idx].set(pt_phys, PageFlags::Present | PageFlags::Writable | PageFlags::User);
+            return true;
+        } else if (level == 1) {
+            // Install PT into PD
+            if (!(*pml4_table)[pml4_idx].isPresent()) return false;
+            PageTable* pdpt = phys_to_virt(createPhysicalAddress<PageTable>((*pml4_table)[pml4_idx].getAddress()));
+            if (!(*pdpt)[pdpt_idx].isPresent()) return false;
+            PageTable* pd = phys_to_virt(createPhysicalAddress<PageTable>((*pdpt)[pdpt_idx].getAddress()));
+            if ((*pd)[pd_idx].isPresent()) return false;
+            (*pd)[pd_idx].set(pt_phys, PageFlags::Present | PageFlags::Writable | PageFlags::User);
+            return true;
+        }
+        return false;
+    }
+
     bool mapPage(std::uintptr_t virt_addr, PhysicalAddress<void> phys_addr, PageFlags flags) {
-        constexpr auto& frame_manager = Accessor::getFrameManager();
         if (!pml4_table) return false;
 
         std::size_t pml4_idx = paging::pml4Index(virt_addr);
@@ -52,49 +96,13 @@ public:
         std::size_t pd_idx   = paging::pdIndex(virt_addr);
         std::size_t pt_idx   = paging::ptIndex(virt_addr);
 
-        // PML4 entry
-        if (!(*pml4_table)[pml4_idx].isPresent()) {
-            PageBlock block = frame_manager.allocateBlock(0);
-            if (!block) return false;
-            block.setOwner(PageOwnerType::PAGE_TABLE);
-
-            PhysicalAddress<PageTable> pdpt_phys = physical_address_cast<PageTable>(frame_manager.getPhysicalAddress(block));
-            PageTable* pdpt_virt = phys_to_virt(pdpt_phys);
-            pdpt_virt->clear();
-
-            (*pml4_table)[pml4_idx].set(pdpt_phys, PageFlags::Present | PageFlags::Writable | PageFlags::User);
-        }
-
+        if (!(*pml4_table)[pml4_idx].isPresent()) return false;
         PageTable* pdpt = phys_to_virt(createPhysicalAddress<PageTable>((*pml4_table)[pml4_idx].getAddress()));
 
-        // PDPT entry
-        if (!(*pdpt)[pdpt_idx].isPresent()) {
-            PageBlock block = frame_manager.allocateBlock(0);
-            if (!block) return false;
-            block.setOwner(PageOwnerType::PAGE_TABLE);
-
-            PhysicalAddress<PageTable> pd_phys = physical_address_cast<PageTable>(frame_manager.getPhysicalAddress(block));
-            PageTable* pd_virt = phys_to_virt(pd_phys);
-            pd_virt->clear();
-
-            (*pdpt)[pdpt_idx].set(pd_phys, PageFlags::Present | PageFlags::Writable | PageFlags::User);
-        }
-
+        if (!(*pdpt)[pdpt_idx].isPresent()) return false;
         PageTable* pd = phys_to_virt(createPhysicalAddress<PageTable>((*pdpt)[pdpt_idx].getAddress()));
 
-        // PD entry
-        if (!(*pd)[pd_idx].isPresent()) {
-            PageBlock block = frame_manager.allocateBlock(0);
-            if (!block) return false;
-            block.setOwner(PageOwnerType::PAGE_TABLE);
-
-            PhysicalAddress<PageTable> pt_phys = physical_address_cast<PageTable>(frame_manager.getPhysicalAddress(block));
-            PageTable* pt_virt = phys_to_virt(pt_phys);
-            pt_virt->clear();
-
-            (*pd)[pd_idx].set(pt_phys, PageFlags::Present | PageFlags::Writable | PageFlags::User);
-        }
-
+        if (!(*pd)[pd_idx].isPresent()) return false;
         PageTable* pt = phys_to_virt(createPhysicalAddress<PageTable>((*pd)[pd_idx].getAddress()));
 
         (*pt)[pt_idx].set(phys_addr, flags | PageFlags::Present);

@@ -104,7 +104,7 @@ extern "C" void _start() {
     oz::sys_debug_print("[Init] OZ OS Root Server started (Ring 3)!\n\r");
 
     // 1. Map BootInfo Frame (slot 243) into our VSpace
-    if (oz::sys_vspace_map(oz::CAP_SELF_VSPACE, oz::CAP_BOOTINFO, BOOTINFO_VADDR, 0x00) != 0) {
+    if (oz::sys_vspace_map_with_pagetables(oz::CAP_SELF_VSPACE, oz::CAP_UNTYPED, oz::CAP_BOOTINFO, BOOTINFO_VADDR, 0x00, 4096) != 0) {
         oz::sys_debug_print("[Init] ERROR: Failed to map BootInfo!\n\r");
         oz::sys_exit(1);
     }
@@ -113,9 +113,15 @@ extern "C" void _start() {
     std::uint64_t ahci_abar_phys = boot_info->ahci_abar_phys;
     std::uint64_t xhci_bar_phys = boot_info->xhci_bar_phys;
 
+    oz::sys_debug_print("[Init] BootInfo mapped! Untyped caps received: ");
+    char num_buf[4] = {static_cast<char>('0' + (boot_info->untyped_cap_count / 10)),
+                       static_cast<char>('0' + (boot_info->untyped_cap_count % 10)),
+                       '\n', '\r'};
+    oz::sys_debug_print(num_buf);
+
     // 2. Map InitRD Frame (slot 244) into our VSpace
     if (initrd_size > 0) {
-        if (oz::sys_vspace_map(oz::CAP_SELF_VSPACE, oz::CAP_INITRD, INITRD_VADDR, 0x00) != 0) {
+        if (oz::sys_vspace_map_with_pagetables(oz::CAP_SELF_VSPACE, oz::CAP_UNTYPED, oz::CAP_INITRD, INITRD_VADDR, 0x00, initrd_size) != 0) {
             oz::sys_debug_print("[Init] ERROR: Failed to map InitRD!\n\r");
             oz::sys_exit(1);
         }

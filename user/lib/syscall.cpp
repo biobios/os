@@ -61,8 +61,56 @@ std::size_t sys_write(const char* str) {
 }
 
 
+int sys_vspace_map_pagetable(std::uint32_t vspace_cap, std::uint32_t pagetable_cap,
+                             std::uint64_t virt_addr, std::uint32_t level) {
+    return static_cast<int>(syscall(25, vspace_cap, pagetable_cap, virt_addr, level, 0, 0));
+}
+
+int sys_vspace_ensure_pagetables_range(std::uint32_t vspace_cap, std::uint32_t untyped_cap,
+                                       std::uint64_t start_vaddr, std::uint64_t size) {
+    std::uint64_t end_vaddr = start_vaddr + size;
+    std::uint64_t cur = start_vaddr & ~0xFFFULL;
+    while (cur < end_vaddr) {
+        // Levels: 3 (PDPT), 2 (PD), 1 (PT)
+        const std::uint32_t levels[3] = {3U, 2U, 1U};
+        for (int i = 0; i < 3; ++i) {
+            std::uint32_t pt_cap = sys_untyped_retype(untyped_cap, static_cast<std::uint32_t>(ObjectType::PageTable), 0);
+            if (pt_cap != static_cast<std::uint32_t>(-1)) {
+                int res = sys_vspace_map_pagetable(vspace_cap, pt_cap, cur, levels[i]);
+                if (res != 0) {
+                    sys_cap_delete(pt_cap);
+                }
+            }
+        }
+        std::uint64_t next_2mb = (cur + 0x200000ULL) & ~0x1FFFFFULL;
+        if (next_2mb <= cur) cur += 4096;
+        else cur = next_2mb;
+    }
+    return 0;
+}
+
 int sys_vspace_map(std::uint32_t vspace_cap, std::uint32_t frame_cap,
                    std::uint64_t virt_addr, std::uint64_t flags) {
+    int res = static_cast<int>(syscall(4, vspace_cap, frame_cap, virt_addr, flags, 0, 0));
+    if (res == 0) return 0;
+
+    std::uint64_t size = sys_frame_size(frame_cap);
+    if (size == 0) size = 4096;
+
+    sys_vspace_ensure_pagetables_range(vspace_cap, CAP_UNTYPED, virt_addr, size);
+    return static_cast<int>(syscall(4, vspace_cap, frame_cap, virt_addr, flags, 0, 0));
+}
+
+int sys_vspace_map_with_pagetables(std::uint32_t vspace_cap, std::uint32_t untyped_cap,
+                                   std::uint32_t frame_cap, std::uint64_t virt_addr,
+                                   std::uint64_t flags, std::uint64_t size) {
+    if (size == 0) {
+        size = sys_frame_size(frame_cap);
+        if (size == 0) size = 4096;
+    }
+
+    // Proactively ensure intermediate page tables exist
+    sys_vspace_ensure_pagetables_range(vspace_cap, untyped_cap, virt_addr, size);
     return static_cast<int>(syscall(4, vspace_cap, frame_cap, virt_addr, flags, 0, 0));
 }
 
@@ -76,6 +124,10 @@ int sys_vspace_unmap(std::uint32_t vspace_cap, std::uint64_t virt_addr) {
 
 std::uint64_t sys_frame_phys_addr(std::uint32_t frame_cap) {
     return syscall(8, frame_cap, 0, 0, 0, 0, 0);
+}
+
+std::uint64_t sys_frame_size(std::uint32_t frame_cap) {
+    return syscall(26, frame_cap, 0, 0, 0, 0, 0);
 }
 
 void sys_debug_print(const char* str) {

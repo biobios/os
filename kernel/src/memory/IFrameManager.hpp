@@ -19,8 +19,9 @@ enum class PageOwnerType : std::uint8_t {
 };
 
 class DescriptorFlags : public ::utils::FlagClass<std::uint8_t, DescriptorFlags> {
-    constexpr explicit DescriptorFlags(std::uint8_t flags) : FlagClass(flags) {}
 public:
+    constexpr DescriptorFlags() : FlagClass(0) {}
+    constexpr explicit DescriptorFlags(std::uint8_t flags) : FlagClass(flags) {}
     static const DescriptorFlags NONE;
     static const DescriptorFlags FREE;
     static const DescriptorFlags HEAD;

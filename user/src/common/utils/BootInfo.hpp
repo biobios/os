@@ -12,6 +12,8 @@ struct BootInfo {
     std::uint64_t fb_size;
     std::uint32_t fb_width;
     std::uint32_t fb_height;
+    std::uint32_t untyped_cap_start; // First slot of UntypedMemory caps given to init
+    std::uint32_t untyped_cap_count; // Number of UntypedMemory caps
 };
 
 } // namespace oz

@@ -33,6 +33,7 @@ enum class ObjectType : std::uint8_t {
     CSpaceCap,
     IRQHandler,
     IOPort,
+    PageTable,
 };
 
 class KernelObject {

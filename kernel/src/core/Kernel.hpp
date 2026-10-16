@@ -138,12 +138,17 @@ void KernelStorage<KernelSettings>::Kernel::run() {
     };
     oz::g_create_vspace_func = [](UntypedMemory* untyped) -> VSpaceCreateResult {
         if (!untyped) return {nullptr, nullptr};
-        auto user_as = ProcessAddressSpace<KernelAccessor>::create(kernel_storage.kernel.kernel_space);
+        std::uintptr_t pml4_phys = 0;
+        void* pml4_mem = untyped->allocateBytes(4096, 4096, pml4_phys);
+        if (!pml4_mem) return {nullptr, nullptr};
+
+        auto user_as = ProcessAddressSpace<KernelAccessor>::createFromPhysical(
+            createPhysicalAddress<PageTable>(pml4_phys),
+            kernel_storage.kernel.kernel_space);
         if (!user_as.isValid()) return {nullptr, nullptr};
-        auto pml4 = user_as.getArchContext().getPhysicalPML4();
         auto* as_obj = untyped->allocateObject<ProcessAddressSpace<KernelAccessor>>(std::move(user_as));
         if (!as_obj) return {nullptr, nullptr};
-        return {as_obj, reinterpret_cast<void*>(pml4.get())};
+        return {as_obj, reinterpret_cast<void*>(pml4_phys)};
     };
     oz::g_vspace_map_fn = [](void* as, std::uintptr_t virt, std::uintptr_t phys, std::uint64_t flags) -> bool {
         MemoryFlags mem_flags = MemoryFlags::Present | MemoryFlags::User;
@@ -154,6 +159,13 @@ void KernelStorage<KernelSettings>::Kernel::run() {
     };
     oz::g_vspace_unmap_fn = [](void* as, std::uintptr_t virt) -> bool {
         return static_cast<Process<KernelAccessor>::AddressSpaceType*>(as)->unmapUser(virt);
+    };
+    oz::g_vspace_install_pt_fn = [](void* as, std::uintptr_t virt, std::uintptr_t pt_phys, std::uint8_t level) -> bool {
+        return static_cast<Process<KernelAccessor>::AddressSpaceType*>(as)->installPageTable(
+            virt, createPhysicalAddress<PageTable>(pt_phys), level);
+    };
+    oz::g_vspace_missing_level_fn = [](void* as, std::uintptr_t virt) -> std::uint8_t {
+        return static_cast<Process<KernelAccessor>::AddressSpaceType*>(as)->getMissingTableLevel(virt);
     };
     // Phase 4: IRQ handler dispatch table (maps vector -> IRQHandler*)
     oz::g_register_irq_handler_fn = [](std::uint8_t vector, IRQHandler* handler) {
@@ -251,9 +263,9 @@ void KernelStorage<KernelSettings>::Kernel::run() {
     // --- User Process Startup (Root Server) ---
     dprint("[Kernel] Loading init process from initrd...\n\r");
 
-    PageBlock boot_ut_block = fm.allocateBlock(5); // 32 pages = 128KB
+    PageBlock boot_ut_block = fm.allocateBlock(10); // 1024 pages = 4MB
     std::uintptr_t boot_ut_phys = fm.getPhysicalAddress(boot_ut_block).get();
-    UntypedMemory boot_untyped(boot_ut_phys, 32 * 4096, nullptr, nullptr, false, true);
+    UntypedMemory boot_untyped(boot_ut_phys, 1024 * 4096, nullptr, nullptr, false, true);
 
     const oz_boot::BootModuleInfo* initrd_file = nullptr;
     for (std::uint64_t i = 0; i < platform_info_->num_modules; ++i) {
@@ -316,20 +328,38 @@ void KernelStorage<KernelSettings>::Kernel::run() {
         // 1. Setup VSpace (Slot 0)
         auto* vspace = boot_untyped.allocateObject<VSpace>(
             &init_proc->address_space, g_vspace_map_fn, g_vspace_unmap_fn,
-            init_proc->address_space.getArchContext().getPhysicalPML4().get()
+            init_proc->address_space.getArchContext().getPhysicalPML4().get(),
+            g_vspace_install_pt_fn, g_vspace_missing_level_fn
         );
         Capability vspace_cap(vspace, CapRights::ALL);
         init_proc->cspace->insert(0, vspace_cap);
         vspace->release();
 
-        // 2. Setup 64MB UntypedMemory for Init (Slot 240)
+        // 2. Setup 64MB UntypedMemory for Init (Slot 240, for backwards compatibility)
         auto ut_block = fm.allocateBlock(14); // 16384 pages = 64MB
         std::uintptr_t ut_phys = fm.getPhysicalAddress(ut_block).get();
         auto* untyped = boot_untyped.allocateObject<UntypedMemory>(
-            ut_phys, 16384 * 4096, ut_block.getDescriptor(), free_fn);
+            ut_phys, 16384 * 4096, nullptr, nullptr, false, true);
         Capability untyped_cap(untyped, CapRights::ALL);
         init_proc->cspace->insert(240, untyped_cap);
         untyped->release();
+
+        // 2.5 Transfer all remaining physical memory to Init as UntypedMemory capabilities (Slots 200..)
+        std::uint32_t untyped_start_slot = 200;
+        std::uint32_t untyped_count = 0;
+        fm.forEachRemainingRegion([&](std::uintptr_t base, std::size_t size) {
+            if (size < 64 * 1024) return;
+            if (untyped_start_slot + untyped_count >= 240) return;
+            auto* ut_obj = boot_untyped.allocateObject<UntypedMemory>(
+                base, size, nullptr, nullptr, false, true);
+            if (ut_obj) {
+                Capability ut_c(ut_obj, CapRights::ALL);
+                init_proc->cspace->insert(untyped_start_slot + untyped_count, ut_c);
+                ut_obj->release();
+                untyped_count++;
+            }
+        });
+        dprint("[Kernel] Transferred system physical memory to Init as UntypedMemory caps.\n\r");
 
         // 3. AHCI MMIO Frame (Slot 241)
         if (ahci_abar_phys != 0) {
@@ -366,6 +396,8 @@ void KernelStorage<KernelSettings>::Kernel::run() {
             bootinfo_virt->fb_size = platform_info_->frame_buffer_size;
             bootinfo_virt->fb_width = platform_info_->frame_buffer_horizontal;
             bootinfo_virt->fb_height = platform_info_->frame_buffer_vertical;
+            bootinfo_virt->untyped_cap_start = untyped_start_slot;
+            bootinfo_virt->untyped_cap_count = untyped_count;
 
             auto* bootinfo_frame = boot_untyped.allocateObject<Frame>(bootinfo_phys, 4096, false,
                 pfd, free_fn);
@@ -435,8 +467,29 @@ void KernelStorage<KernelSettings>::Kernel::run() {
 template <typename KernelSettings>
 Thread* KernelStorage<KernelSettings>::Kernel::loadProcessFromElfBuffer(UntypedMemory& boot_untyped, const std::uint8_t* file_buf, std::size_t file_size) {
     (void)file_size;
-    auto user_as = ProcessAddressSpace<KernelAccessor>::create(kernel_space);
+
+    std::uintptr_t init_pml4_phys = 0;
+    void* init_pml4_mem = boot_untyped.allocateBytes(4096, 4096, init_pml4_phys);
+    if (!init_pml4_mem) return nullptr;
+
+    auto user_as = ProcessAddressSpace<KernelAccessor>::createFromPhysical(
+        createPhysicalAddress<PageTable>(init_pml4_phys), kernel_space);
     if (!user_as.isValid()) return nullptr;
+
+    auto ensure_pt = [&](std::uintptr_t vaddr) -> bool {
+        for (std::uint8_t lvl = 3; lvl >= 1; --lvl) {
+            if (user_as.getMissingTableLevel(vaddr) == lvl) {
+                std::uintptr_t pt_phys = 0;
+                void* pt_mem = boot_untyped.allocateBytes(4096, 4096, pt_phys);
+                if (!pt_mem) return false;
+                utils::memset(pt_mem, 0, 4096);
+                if (!user_as.installPageTable(vaddr, createPhysicalAddress<PageTable>(pt_phys), lvl)) {
+                    return false;
+                }
+            }
+        }
+        return true;
+    };
 
     auto* elf_header = reinterpret_cast<const elf::Elf64_Ehdr*>(file_buf);
     if (!elf::isValidElf(elf_header)) {
@@ -458,16 +511,16 @@ Thread* KernelStorage<KernelSettings>::Kernel::loadProcessFromElfBuffer(UntypedM
             std::uint64_t map_size = (memsz + vaddr_offset + 0xFFF) & ~0xFFFULL;
             
             for (std::uint64_t p = 0; p < map_size; p += 4096) {
-                auto block = fm.allocateBlock(0);
-                if (block) {
-                    std::uint64_t paddr = fm.getPhysicalAddress(block).get();
+                std::uintptr_t paddr = 0;
+                void* virt_ptr = boot_untyped.allocateBytes(4096, 4096, paddr);
+                if (virt_ptr) {
                     MemoryFlags flags = MemoryFlags::Present | MemoryFlags::User;
                     if (phdr_table[i].p_flags & elf::PF_W) flags = flags | MemoryFlags::Writable;
                     if (phdr_table[i].p_flags & elf::PF_X) flags = flags | MemoryFlags::Executable;
                     
+                    if (!ensure_pt(vaddr_aligned + p)) return nullptr;
                     user_as.mapUser(vaddr_aligned + p, paddr, flags);
                     
-                    void* virt_ptr = phys_to_virt(createPhysicalAddress<void>(paddr));
                     utils::memset(virt_ptr, 0, 4096);
                     
                     std::uint64_t page_vaddr_start = vaddr_aligned + p;
@@ -489,14 +542,16 @@ Thread* KernelStorage<KernelSettings>::Kernel::loadProcessFromElfBuffer(UntypedM
         }
     }
 
-    auto stack_block = fm.allocateBlock(1); // 2 pages
-    if (!stack_block) return nullptr;
+    std::uintptr_t stack_phys0 = 0;
+    void* stack_mem0 = boot_untyped.allocateBytes(4096, 4096, stack_phys0);
+    std::uintptr_t stack_phys1 = 0;
+    void* stack_mem1 = boot_untyped.allocateBytes(4096, 4096, stack_phys1);
+    if (!stack_mem0 || !stack_mem1) return nullptr;
 
-    void* stack_phys = reinterpret_cast<void*>(fm.getPhysicalAddress(stack_block).get());
     std::uintptr_t stack_virt = 0x700000000000 - 8192;
-    
-    user_as.mapUser(stack_virt, reinterpret_cast<std::uintptr_t>(stack_phys), MemoryFlags::Present | MemoryFlags::Writable | MemoryFlags::User);
-    user_as.mapUser(stack_virt + 4096, reinterpret_cast<std::uintptr_t>(stack_phys) + 4096, MemoryFlags::Present | MemoryFlags::Writable | MemoryFlags::User);
+    if (!ensure_pt(stack_virt)) return nullptr;
+    user_as.mapUser(stack_virt, stack_phys0, MemoryFlags::Present | MemoryFlags::Writable | MemoryFlags::User);
+    user_as.mapUser(stack_virt + 4096, stack_phys1, MemoryFlags::Present | MemoryFlags::Writable | MemoryFlags::User);
     
     auto* proc = boot_untyped.allocateObject<Process<KernelAccessor>>(1, std::move(user_as), nullptr, entry_point, boot_untyped.allocateObject<CSpace>());
     if (!proc) return nullptr;

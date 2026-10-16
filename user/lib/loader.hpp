@@ -104,7 +104,7 @@ inline SpawnedProcess spawn_process(
         if (seg_frame == static_cast<std::uint32_t>(-1)) return result;
 
         // Map into parent's staging area (Read/Write = 0x01)
-        if (sys_vspace_map(self_vspace_cap, seg_frame, staging_vaddr, 0x01) != 0) {
+        if (sys_vspace_map_with_pagetables(self_vspace_cap, untyped_cap, seg_frame, staging_vaddr, 0x01, map_size) != 0) {
             return result;
         }
 
@@ -126,7 +126,7 @@ inline SpawnedProcess spawn_process(
         std::uint64_t flags = 0;
         if (phdr[i].p_flags & elf::PF_W) flags |= 0x01; // Writable
         if (phdr[i].p_flags & elf::PF_X) flags |= 0x02; // Executable
-        if (sys_vspace_map(result.vspace_cap, seg_frame, vaddr_aligned, flags) != 0) {
+        if (sys_vspace_map_with_pagetables(result.vspace_cap, untyped_cap, seg_frame, vaddr_aligned, flags, map_size) != 0) {
             return result;
         }
     }
@@ -139,7 +139,7 @@ inline SpawnedProcess spawn_process(
     std::uint32_t stack_frame = sys_frame_alloc(untyped_cap, STACK_SIZE / 4096);
     if (stack_frame == static_cast<std::uint32_t>(-1)) return result;
 
-    if (sys_vspace_map(result.vspace_cap, stack_frame, stack_base_vaddr, 0x01) != 0) {
+    if (sys_vspace_map_with_pagetables(result.vspace_cap, untyped_cap, stack_frame, stack_base_vaddr, 0x01, STACK_SIZE) != 0) {
         return result;
     }
 

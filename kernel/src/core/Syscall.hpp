@@ -29,6 +29,8 @@ extern VSpaceCreateResult (*g_create_vspace_func)(UntypedMemory* untyped);
 // Global VSpace map/unmap function pointers (set by Kernel.hpp, used by Syscall.cpp)
 extern bool (*g_vspace_map_fn)(void*, std::uintptr_t, std::uintptr_t, std::uint64_t);
 extern bool (*g_vspace_unmap_fn)(void*, std::uintptr_t);
+extern bool (*g_vspace_install_pt_fn)(void*, std::uintptr_t, std::uintptr_t, std::uint8_t);
+extern std::uint8_t (*g_vspace_missing_level_fn)(void*, std::uintptr_t);
 
 // For hardware resource management (Phase 4)
 class IRQHandler;

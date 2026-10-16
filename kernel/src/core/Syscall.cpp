@@ -8,6 +8,7 @@
 #include "core/UntypedMemory.hpp"
 #include "core/TCB.hpp"
 #include "core/CSpaceCap.hpp"
+#include "core/PageTableObject.hpp"
 #include "core/IRQHandler.hpp"
 #include "core/IOPort.hpp"
 
@@ -22,6 +23,8 @@ void (*g_queue_thread_func)(Thread* t) = nullptr;
 VSpaceCreateResult (*g_create_vspace_func)(UntypedMemory*) = nullptr;
 bool (*g_vspace_map_fn)(void*, std::uintptr_t, std::uintptr_t, std::uint64_t) = nullptr;
 bool (*g_vspace_unmap_fn)(void*, std::uintptr_t) = nullptr;
+bool (*g_vspace_install_pt_fn)(void*, std::uintptr_t, std::uintptr_t, std::uint8_t) = nullptr;
+std::uint8_t (*g_vspace_missing_level_fn)(void*, std::uintptr_t) = nullptr;
 void (*g_register_irq_handler_fn)(std::uint8_t, IRQHandler*) = nullptr;
 void (*g_eoi_fn)() = nullptr;
 std::uint8_t (*g_read_io8_fn)(std::uint16_t) = nullptr;
@@ -202,12 +205,6 @@ extern "C" std::uint64_t handleSyscall(std::uint64_t rdi, std::uint64_t rsi, std
         std::size_t frame_size = frame->size();
         for (std::size_t offset = 0; offset < frame_size; offset += 4096) {
             if (!vspace->mapUser(virt + offset, phys + offset, r10)) {
-                char hb[17];
-                dprint("[vspace_map] mapUser failed virt=0x");
-                oz::utils::to_hex(virt + offset, hb); dprint(hb);
-                dprint(" phys=0x");
-                oz::utils::to_hex(phys + offset, hb); dprint(hb);
-                dprint("\n\r");
                 return -1;
             }
         }
@@ -389,7 +386,8 @@ extern "C" std::uint64_t handleSyscall(std::uint64_t rdi, std::uint64_t rsi, std
         
         auto* vspace = untyped->allocateObject<VSpace>(
             result.address_space, g_vspace_map_fn, g_vspace_unmap_fn,
-            reinterpret_cast<std::uintptr_t>(result.pml4_phys)
+            reinterpret_cast<std::uintptr_t>(result.pml4_phys),
+            g_vspace_install_pt_fn, g_vspace_missing_level_fn
         );
         if (!vspace) return -1;
         Capability vs_cap(vspace, CapRights::ALL);
@@ -516,6 +514,8 @@ extern "C" std::uint64_t handleSyscall(std::uint64_t rdi, std::uint64_t rsi, std
 
         if (target_type == ObjectType::Frame) {
             obj = untyped->retypeFrame(rdx); // rdx = num_pages
+        } else if (target_type == ObjectType::PageTable) {
+            obj = untyped->retypePageTable();
         } else if (target_type == ObjectType::TCB) {
             obj = untyped->retypeTCB(g_queue_thread_func);
         } else if (target_type == ObjectType::CSpaceCap) {
@@ -553,6 +553,41 @@ extern "C" std::uint64_t handleSyscall(std::uint64_t rdi, std::uint64_t rsi, std
 
         untyped->revoke();
         return 0;
+    } else if (syscall_number == 25) {
+        // vspace_map_pagetable(vspace_cap, pt_cap, virt_addr, level)
+        CSpace* cspace = get_cspace();
+        if (!cspace) return -1;
+
+        VSpace* vspace = get_cap_typed<VSpace>(
+            cspace, static_cast<CapID>(rdi), ObjectType::VSpace, CapRights::WRITE);
+        if (!vspace) return -1;
+
+        PageTableObject* pt_obj = get_cap_typed<PageTableObject>(
+            cspace, static_cast<CapID>(rsi), ObjectType::PageTable, CapRights::WRITE);
+        if (!pt_obj) return -1;
+
+        if (pt_obj->isMapped()) return -1;
+
+        std::uintptr_t virt = rdx;
+        std::uint8_t level = static_cast<std::uint8_t>(r10); // 1: PT, 2: PD, 3: PDPT
+        if (level < 1 || level > 3) return -1;
+
+        if (!vspace->installPageTable(virt, pt_obj->physicalAddress(), level)) {
+            return -1;
+        }
+
+        pt_obj->setMapped(true, level);
+        return 0;
+    } else if (syscall_number == 26) {
+        // frame_size(frame_cap)
+        CSpace* cspace = get_cspace();
+        if (!cspace) return 0;
+
+        Frame* frame = get_cap_typed<Frame>(
+            cspace, static_cast<CapID>(rdi), ObjectType::Frame, CapRights::READ);
+        if (!frame) return 0;
+
+        return static_cast<std::uint64_t>(frame->size());
     }
     
     return static_cast<std::uint64_t>(-1);

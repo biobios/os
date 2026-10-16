@@ -31,6 +31,7 @@ enum class ObjectType : std::uint32_t {
     CSpaceCap = 6,
     IRQHandler = 7,
     IOPort = 8,
+    PageTable = 9,
 };
 
 extern "C" {
@@ -52,9 +53,17 @@ bool sys_channel_create(std::uint32_t* out_cap0, std::uint32_t* out_cap1);
 // Capability-based memory management
 int sys_vspace_map(std::uint32_t vspace_cap, std::uint32_t frame_cap,
                    std::uint64_t virt_addr, std::uint64_t flags);
+int sys_vspace_map_pagetable(std::uint32_t vspace_cap, std::uint32_t pagetable_cap,
+                             std::uint64_t virt_addr, std::uint32_t level);
+int sys_vspace_ensure_pagetables_range(std::uint32_t vspace_cap, std::uint32_t untyped_cap,
+                                       std::uint64_t start_vaddr, std::uint64_t size);
+int sys_vspace_map_with_pagetables(std::uint32_t vspace_cap, std::uint32_t untyped_cap,
+                                   std::uint32_t frame_cap, std::uint64_t virt_addr,
+                                   std::uint64_t flags, std::uint64_t size);
 std::uint32_t sys_frame_alloc(std::uint32_t untyped_cap, std::uint64_t num_pages);
 int sys_vspace_unmap(std::uint32_t vspace_cap, std::uint64_t virt_addr);
 std::uint64_t sys_frame_phys_addr(std::uint32_t frame_cap);
+std::uint64_t sys_frame_size(std::uint32_t frame_cap);
 
 std::uint32_t sys_untyped_retype(std::uint32_t untyped_cap, std::uint32_t target_type, std::uint64_t arg);
 int sys_untyped_revoke(std::uint32_t untyped_cap);

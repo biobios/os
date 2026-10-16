@@ -22,16 +22,10 @@ public:
     x86_64AddressSpaceContext(PageTable* pml4_v, PhysicalAddress<PageTable> pml4_p)
         : pml4_virt(pml4_v), pml4_phys(pml4_p), pt_manager(pml4_v) {}
 
-    static x86_64AddressSpaceContext cloneProcessSpace(const x86_64AddressSpaceContext& kernel_space) {
-        constexpr auto& fm = Accessor::getFrameManager();
-
-        PageBlock pml4_block = fm.allocateBlock(0);
-        if (!pml4_block) {
+    static x86_64AddressSpaceContext createFromPhysical(PhysicalAddress<PageTable> new_pml4_phys, const x86_64AddressSpaceContext& kernel_space) {
+        if (new_pml4_phys.get() == 0) {
             return x86_64AddressSpaceContext(nullptr, PhysicalAddressProvider::nullPhysicalAddress<PageTable>());
         }
-        pml4_block.setOwner(PageOwnerType::PAGE_TABLE);
-
-        PhysicalAddress<PageTable> new_pml4_phys = physical_address_cast<PageTable>(fm.getPhysicalAddress(pml4_block));
         PageTable* new_pml4_virt = phys_to_virt(new_pml4_phys);
         const PageTable* k_pml4_virt = kernel_space.getVirtualPML4();
 
@@ -46,6 +40,19 @@ public:
         }
 
         return x86_64AddressSpaceContext(new_pml4_virt, new_pml4_phys);
+    }
+
+    static x86_64AddressSpaceContext cloneProcessSpace(const x86_64AddressSpaceContext& kernel_space) {
+        constexpr auto& fm = Accessor::getFrameManager();
+
+        PageBlock pml4_block = fm.allocateBlock(0);
+        if (!pml4_block) {
+            return x86_64AddressSpaceContext(nullptr, PhysicalAddressProvider::nullPhysicalAddress<PageTable>());
+        }
+        pml4_block.setOwner(PageOwnerType::PAGE_TABLE);
+
+        PhysicalAddress<PageTable> new_pml4_phys = physical_address_cast<PageTable>(fm.getPhysicalAddress(pml4_block));
+        return createFromPhysical(new_pml4_phys, kernel_space);
     }
 
     bool isValid() const {
@@ -65,6 +72,16 @@ public:
         if ((flags & MemoryFlags::CacheDisable) != MemoryFlags::None) pflags |= PageFlags::CacheDisable;
         if ((flags & MemoryFlags::Executable) == MemoryFlags::None) pflags |= PageFlags::NoExecute;
         return pflags;
+    }
+
+    bool installPageTable(std::uintptr_t virt_addr, PhysicalAddress<PageTable> pt_phys, std::uint8_t level) {
+        if (virt_addr >= 0x0000800000000000ULL) return false;
+        return pt_manager.installPageTable(virt_addr, pt_phys, level);
+    }
+
+    std::uint8_t getMissingTableLevel(std::uintptr_t virt_addr) const {
+        if (virt_addr >= 0x0000800000000000ULL) return 4;
+        return pt_manager.getMissingTableLevel(virt_addr);
     }
 
     bool mapUser(std::uintptr_t virt_addr, PhysicalAddress<void> phys_addr, MemoryFlags flags) {

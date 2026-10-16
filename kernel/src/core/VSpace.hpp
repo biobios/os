@@ -13,14 +13,19 @@ private:
     std::uintptr_t pml4_phys_{0};
     bool (*map_fn_)(void* as, std::uintptr_t virt, std::uintptr_t phys, std::uint64_t flags);
     bool (*unmap_fn_)(void* as, std::uintptr_t virt);
+    bool (*install_pt_fn_)(void* as, std::uintptr_t virt, std::uintptr_t pt_phys, std::uint8_t level){nullptr};
+    std::uint8_t (*missing_level_fn_)(void* as, std::uintptr_t virt){nullptr};
 
 public:
     VSpace(void* as,
            bool (*map_fn)(void*, std::uintptr_t, std::uintptr_t, std::uint64_t),
            bool (*unmap_fn)(void*, std::uintptr_t),
-           std::uintptr_t pml4_phys = 0)
+           std::uintptr_t pml4_phys = 0,
+           bool (*install_pt_fn)(void*, std::uintptr_t, std::uintptr_t, std::uint8_t) = nullptr,
+           std::uint8_t (*missing_level_fn)(void*, std::uintptr_t) = nullptr)
         : KernelObject(ObjectType::VSpace),
-          address_space_(as), pml4_phys_(pml4_phys), map_fn_(map_fn), unmap_fn_(unmap_fn) {}
+          address_space_(as), pml4_phys_(pml4_phys), map_fn_(map_fn), unmap_fn_(unmap_fn),
+          install_pt_fn_(install_pt_fn), missing_level_fn_(missing_level_fn) {}
 
     std::uintptr_t getPhysicalPML4() const { return pml4_phys_; }
 
@@ -32,6 +37,16 @@ public:
     bool unmapUser(std::uintptr_t virt) {
         if (!unmap_fn_) return false;
         return unmap_fn_(address_space_, virt);
+    }
+
+    bool installPageTable(std::uintptr_t virt, std::uintptr_t pt_phys, std::uint8_t level) {
+        if (!install_pt_fn_) return false;
+        return install_pt_fn_(address_space_, virt, pt_phys, level);
+    }
+
+    std::uint8_t getMissingTableLevel(std::uintptr_t virt) const {
+        if (!missing_level_fn_) return 0;
+        return missing_level_fn_(address_space_, virt);
     }
 };
 
