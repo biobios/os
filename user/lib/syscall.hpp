@@ -93,5 +93,6 @@ static constexpr std::uint32_t CAP_XHCI_MMIO = 242;
 static constexpr std::uint32_t CAP_BOOTINFO = 243;
 static constexpr std::uint32_t CAP_INITRD = 244;
 static constexpr std::uint32_t CAP_SELF_CSPACE = 245;
+static constexpr std::uint32_t CAP_FRAMEBUFFER = 246;
 
 } // namespace oz

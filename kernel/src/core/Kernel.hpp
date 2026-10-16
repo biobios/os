@@ -4,11 +4,9 @@
 #include "../../user/src/common/utils/BootInfo.hpp"
 
 #include "memory/AddressSpace.hpp"
-#include "graphics/Graphics.hpp"
 #include "memory/PageTable.hpp"
 #include "memory/PageTableManager.hpp"
 #include "memory/paging.hpp"
-#include "shell/Shell.hpp"
 #include "core/bootStructures.hpp"
 #include "drivers/pci/PCIUtils.hpp"
 #include "hardware/ACPIUtils.hpp"
@@ -71,15 +69,10 @@ struct KernelStorage {
     class Kernel : public PhysicalAddressProvider {
         using Settings = KernelAccessor::Settings;
     public:
-        Graphics g;
-        Shell sh;
-
-    public:
         Settings::FrameManager fm;
         PageTableManager<KernelAccessor> pt_manager;
         KernelAddressSpace<KernelAccessor> kernel_space;
         Settings::Scheduler scheduler;
-        Mutex<KernelAccessor> graphics_mutex;
         oz_boot::PlatformInfo* platform_info_;
 
         Kernel(oz_boot::PlatformInfo* platformInfo);
@@ -106,16 +99,11 @@ struct KernelStorage {
 
 template <typename KernelSettings>
 KernelStorage<KernelSettings>::Kernel::Kernel(oz_boot::PlatformInfo* platformInfo)
-    : g(static_cast<Pixel*>(platformInfo->frame_buffer_base),
-        platformInfo->frame_buffer_size, platformInfo->frame_buffer_horizontal,
-        platformInfo->frame_buffer_vertical)
-    , sh(&g)
-    , fm(&platformInfo->memory_map, oz::paging::x86_64::page_sizes[0])
+    : fm(&platformInfo->memory_map, oz::paging::x86_64::page_sizes[0])
     , pt_manager(getMasterPML4())
     , kernel_space(getMasterPML4(), createPhysicalAddress<PageTable>(reinterpret_cast<std::uintptr_t>(getMasterPML4()) - oz::KERNEL_VIRT_OFFSET))
     , platform_info_(platformInfo)
 {
-    setShellPtr(&sh);
 }
 
 template <typename KernelSettings>
@@ -184,9 +172,7 @@ void KernelStorage<KernelSettings>::Kernel::run() {
     oz::g_write_io8_fn = oz::x86_64::writeIO8;
     oz::g_write_io16_fn = oz::x86_64::writeIO16;
     oz::g_write_io32_fn = oz::x86_64::writeIO32;
-    g.clearScreen();
-    sh.printString("Finish init\n\rStart Kernel in Higher-Half!\n\r");
-    sh.repaint();
+    dprint("[Kernel] Finish init\n\r[Kernel] Start Kernel in Higher-Half!\n\r");
 
 
 
@@ -220,8 +206,7 @@ void KernelStorage<KernelSettings>::Kernel::run() {
             
             PCIUtils::PCIFunction xhci_func = mcfgWrapper.findFunction(0x0C, 0x03, 0x30);
             if (xhci_func) {
-                sh.printString("Found xHCI Controller! Setting up for user space...\n\r");
-                sh.repaint();
+                dprint("[Kernel] Found xHCI Controller! Setting up for user space...\n\r");
                 std::uint32_t bar0 = xhci_func.header->BaseAddressRegister[0];
                 std::uint32_t bar1 = xhci_func.header->BaseAddressRegister[1];
                 xhci_bar_phys = bar0 & ~0xFULL;
@@ -264,8 +249,7 @@ void KernelStorage<KernelSettings>::Kernel::run() {
     
 
     // --- User Process Startup (Root Server) ---
-    sh.printString("Loading init process from initrd...\n\r");
-    sh.repaint();
+    dprint("[Kernel] Loading init process from initrd...\n\r");
 
     PageBlock boot_ut_block = fm.allocateBlock(5); // 32 pages = 128KB
     std::uintptr_t boot_ut_phys = fm.getPhysicalAddress(boot_ut_block).get();
@@ -378,13 +362,17 @@ void KernelStorage<KernelSettings>::Kernel::run() {
             bootinfo_virt->xhci_bar_phys = xhci_bar_phys;
             bootinfo_virt->initrd_size = initrd_file ? initrd_file->size : 0;
             bootinfo_virt->initrd_offset = initrd_offset;
+            bootinfo_virt->fb_phys_addr = reinterpret_cast<std::uintptr_t>(platform_info_->frame_buffer_base) - oz::DIRECT_MAP_OFFSET;
+            bootinfo_virt->fb_size = platform_info_->frame_buffer_size;
+            bootinfo_virt->fb_width = platform_info_->frame_buffer_horizontal;
+            bootinfo_virt->fb_height = platform_info_->frame_buffer_vertical;
 
             auto* bootinfo_frame = boot_untyped.allocateObject<Frame>(bootinfo_phys, 4096, false,
                 pfd, free_fn);
             Capability bootinfo_cap(bootinfo_frame, CapRights::READ);
             init_proc->cspace->insert(243, bootinfo_cap);
             bootinfo_frame->release();
-            sh.printString("BootInfo capability created.\n\r");
+            dprint("[Kernel] BootInfo capability created.\n\r");
         }
 
         // 6. Setup InitRD Frame capability (Slot 244)
@@ -396,7 +384,7 @@ void KernelStorage<KernelSettings>::Kernel::run() {
             Capability initrd_cap(initrd_frame, CapRights::READ);
             init_proc->cspace->insert(244, initrd_cap);
             initrd_frame->release();
-            sh.printString("InitRD Frame capability created.\n\r");
+            dprint("[Kernel] InitRD Frame capability created.\n\r");
         }
 
         // 7. Setup Self CSpace capability (Slot 245)
@@ -405,12 +393,22 @@ void KernelStorage<KernelSettings>::Kernel::run() {
         init_proc->cspace->insert(245, cs_cap);
         cs_cap_obj->release();
 
+        // 8. Setup FrameBuffer capability (Slot 246)
+        std::uintptr_t fb_phys = reinterpret_cast<std::uintptr_t>(platform_info_->frame_buffer_base) - oz::DIRECT_MAP_OFFSET;
+        std::uint64_t fb_size = platform_info_->frame_buffer_size;
+        if (fb_phys != 0 && fb_size != 0) {
+            auto* fb_frame = boot_untyped.allocateObject<Frame>(fb_phys, fb_size, true);
+            Capability fb_cap(fb_frame, CapRights::ALL);
+            init_proc->cspace->insert(246, fb_cap);
+            fb_frame->release();
+            dprint("[Kernel] FrameBuffer capability created.\n\r");
+        }
+
         scheduler.queueThread(init_thread);
-        sh.printString("Init process loaded successfully.\n\r");
+        dprint("[Kernel] Init process loaded successfully.\n\r");
     } else {
-        sh.printString("Failed to load init process!\n\r");
+        dprint("[Kernel] Failed to load init process!\n\r");
     }
-    sh.repaint();
     // ---------------------------
     
     // Create Idle / Reaper thread (static allocation)

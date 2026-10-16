@@ -15,6 +15,7 @@
 //   243: CAP_BOOTINFO
 //   244: CAP_INITRD
 //   245: CAP_SELF_CSPACE
+//   246: CAP_FRAMEBUFFER
 
 static constexpr std::uint32_t CAP_AHCI_SEND = 2;
 static constexpr std::uint32_t CAP_VFS_SEND = 3;
@@ -146,6 +147,42 @@ extern "C" void _start() {
 
     oz::sys_write("Hello from init process (Ring 3)!\n\r");
     oz::sys_write("[Init] Console server spawned successfully.\n\r");
+
+    // 3.5 Spawn Display Server (GUI mode)
+    oz::loader::TarFile disp_file = oz::loader::tar_find_file(initrd_ptr, initrd_size, "display");
+    if (disp_file.data) {
+        auto disp_proc = oz::loader::spawn_process(oz::CAP_UNTYPED, oz::CAP_SELF_VSPACE, disp_file.data, disp_file.size);
+        if (disp_proc.success) {
+            std::uint32_t init_disp_send = 0;
+            std::uint32_t disp_init_recv = 0;
+            oz::sys_channel_create(&init_disp_send, &disp_init_recv);
+
+            // Slot 1: console send (sys_write)
+            oz::sys_cspace_cap_insert(disp_proc.cspace_cap, 1, cons_send, static_cast<std::uint32_t>(oz::CapRights::WRITE | oz::CapRights::GRANT));
+            // Slot 2: display recv (IPC commands)
+            oz::sys_cspace_cap_insert(disp_proc.cspace_cap, 2, disp_init_recv, static_cast<std::uint32_t>(oz::CapRights::READ));
+            // Slot 240: Untyped
+            oz::sys_cspace_cap_insert(disp_proc.cspace_cap, oz::CAP_UNTYPED, oz::CAP_UNTYPED, static_cast<std::uint32_t>(oz::CapRights::ALL));
+            // Slot 246: FrameBuffer
+            oz::sys_cspace_cap_insert(disp_proc.cspace_cap, oz::CAP_FRAMEBUFFER, oz::CAP_FRAMEBUFFER, static_cast<std::uint32_t>(oz::CapRights::ALL));
+
+            oz::sys_tcb_resume(disp_proc.tcb_cap);
+            oz::sys_write("[Init] Display server spawned successfully.\n\r");
+
+            // Send framebuffer info to Display Server
+            oz::IPCMessage config_msg{};
+            config_msg.data[0] = boot_info->fb_width;
+            config_msg.data[1] = boot_info->fb_height;
+            config_msg.data[2] = boot_info->fb_size;
+            config_msg.data[3] = boot_info->fb_phys_addr;
+            oz::sys_channel_send(init_disp_send, &config_msg);
+            oz::sys_write("[Init] Sent framebuffer config to Display server.\n\r");
+        } else {
+            oz::sys_write("[Init] ERROR: Failed to spawn display server!\n\r");
+        }
+    } else {
+        oz::sys_write("[Init] WARNING: display not found in initrd!\n\r");
+    }
 
     // 4. Spawn AHCI Driver
     oz::loader::TarFile ahci_file = oz::loader::tar_find_file(initrd_ptr, initrd_size, "ahci");

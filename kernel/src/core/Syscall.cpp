@@ -573,6 +573,7 @@ void initSyscall() {
 
 void setSyscallKernelStack(std::uint64_t rsp) {
     g_syscall_context.kernel_rsp = rsp;
+    oz::x86_64::writeMSR(oz::x86_64::MSR_KERNEL_GS_BASE, reinterpret_cast<std::uint64_t>(&g_syscall_context));
 }
 
 __attribute__((naked)) void syscall_entry() {

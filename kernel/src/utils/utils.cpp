@@ -1,10 +1,5 @@
 #include "utils/utils.hpp"
-#include "shell/Shell.hpp"
 #include "hardware/Serial.hpp"
-
-namespace {
-oz::Shell* sh;
-}
 
 void oz::utils::to_hex(std::uint64_t num, char* str) {
     std::int64_t i;
@@ -22,9 +17,6 @@ void oz::utils::to_hex(std::uint64_t num, char* str) {
     str[2*sizeof(num)] = '\0';
 }
 
-void setShellPtr(oz::Shell* shell) {
-    sh = shell;
-}
 
 void dprint(const char* str) {
     oz::hardware::Serial::writeString(str);
