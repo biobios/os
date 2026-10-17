@@ -184,6 +184,16 @@ namespace {
         oz::x86_64::notifyEndOfInterrupt();
     }
 
+    __attribute__((interrupt))
+    void timerInterruptStub(oz::x86_64::ExceptionFrame* frame) {
+        (void)frame;
+        oz::x86_64::notifyEndOfInterrupt();
+        auto tick_fn = oz::irq::getTimerTickFn();
+        if (tick_fn) {
+            tick_fn();
+        }
+    }
+
 #define IRQ_STUB(N) \
     __attribute__((interrupt)) \
     void irqStub##N(oz::x86_64::ExceptionFrame* frame) { \
@@ -201,6 +211,7 @@ namespace {
 }
 
 void oz::x86_64::initIRQStubs() {
+    setInterruptDescriptor(APIC_TIMER_VECTOR, reinterpret_cast<void*>(timerInterruptStub));
 #define SET_STUB(N) setInterruptDescriptor(0x##N, reinterpret_cast<void*>(irqStub##N))
     SET_STUB(30); SET_STUB(31); SET_STUB(32); SET_STUB(33);
     SET_STUB(34); SET_STUB(35); SET_STUB(36); SET_STUB(37);

@@ -1,15 +1,4 @@
-#include <cstdint>
-#include <cstddef>
-
-// Forward declarations for syscalls
-namespace oz {
-extern "C" {
-std::uint32_t sys_frame_alloc(std::uint32_t untyped_cap, std::uint64_t num_pages);
-int sys_vspace_map(std::uint32_t vspace_cap, std::uint32_t frame_cap,
-                   std::uint64_t virt_addr, std::uint64_t flags);
-std::uint64_t sys_frame_phys_addr(std::uint32_t frame_cap);
-}
-}
+#include "syscall.hpp"
 
 namespace {
     std::uint8_t* heap_ptr = nullptr;
@@ -35,7 +24,7 @@ void* malloc(std::size_t size) {
         if (frame_cap == 0xFFFFFFFF) return nullptr;
         
         // Map Frame into our VSpace
-        if (oz::sys_vspace_map(CAP_SELF_VSPACE, frame_cap, heap_virt, 0x01) != 0) {
+        if (oz::sys_vspace_map_with_pagetables(CAP_SELF_VSPACE, CAP_UNTYPED, frame_cap, heap_virt, 0x01, pages * 4096) != 0) {
             return nullptr; // 0x01 = writable
         }
         

@@ -75,10 +75,10 @@ inline SpawnedProcess spawn_process(
     }
 
     // 1. Create CSpace and VSpace for child
-    result.cspace_cap = sys_cspace_create();
+    result.cspace_cap = sys_cspace_create(untyped_cap);
     if (result.cspace_cap == static_cast<std::uint32_t>(-1)) return result;
 
-    result.vspace_cap = sys_vspace_create();
+    result.vspace_cap = sys_vspace_create(untyped_cap);
     if (result.vspace_cap == static_cast<std::uint32_t>(-1)) return result;
 
     // 2. Retype a TCB from UntypedMemory

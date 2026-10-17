@@ -33,7 +33,7 @@ extern "C" void _start() {
     
     // Map xHCI MMIO from Frame cap slot 241
     static constexpr std::uint64_t MMIO_VIRT = 0x200000000000;
-    if (oz::sys_vspace_map(oz::CAP_SELF_VSPACE, 241, MMIO_VIRT, 0x10 | 0x01) != 0) {
+    if (oz::sys_vspace_map_with_pagetables(oz::CAP_SELF_VSPACE, oz::CAP_UNTYPED, 241, MMIO_VIRT, 0x10 | 0x01, 16 * 4096) != 0) {
         oz::sys_debug_print("Failed to map xHCI MMIO!\n\r");
         oz::sys_exit(1);
     }

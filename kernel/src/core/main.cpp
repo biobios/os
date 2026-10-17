@@ -105,13 +105,6 @@ public:
     }
 };
 
-__attribute__((interrupt))
-static void timerInterruptHandler(void* frame) {
-    (void)frame;
-    oz::x86_64::notifyEndOfInterrupt();
-    oz::Kernel::instance().getScheduler().tick();
-}
-
 extern "C" void kernel_main(oz_boot::PlatformInfo* platformInfoPhys) {
     // 6. Convert PlatformInfo pointer to direct map virtual address
     oz_boot::PlatformInfo* platformInfo = oz::phys_to_virt(BootInfoProvider::getPhys(platformInfoPhys));
@@ -127,11 +120,11 @@ extern "C" void kernel_main(oz_boot::PlatformInfo* platformInfoPhys) {
     if (platformInfo->RSDP) {
         platformInfo->RSDP = oz::phys_to_virt(BootInfoProvider::getPhys(platformInfo->RSDP));
     
-    for (std::uint64_t i = 0; i < platformInfo->num_modules; ++i) {
-        platformInfo->modules[i].base_address = reinterpret_cast<std::uint64_t>(
-            oz::phys_to_virt(BootInfoProvider::getPhys(reinterpret_cast<void*>(platformInfo->modules[i].base_address)))
-        );
-    }
+        for (std::uint64_t i = 0; i < platformInfo->num_modules; ++i) {
+            platformInfo->modules[i].base_address = reinterpret_cast<std::uint64_t>(
+                oz::phys_to_virt(BootInfoProvider::getPhys(reinterpret_cast<void*>(platformInfo->modules[i].base_address)))
+            );
+        }
     }
 
     // 9. Initialize architecture specifics
@@ -144,9 +137,6 @@ extern "C" void kernel_main(oz_boot::PlatformInfo* platformInfoPhys) {
     // 10. Initialize and run Kernel
     alignas(oz::Kernel) static std::uint8_t kernel_buffer[sizeof(oz::Kernel)];
     auto* kernel = new (kernel_buffer) oz::Kernel(platformInfo);
-    
-    // Register timer interrupt handler
-    oz::x86_64::setInterruptDescriptor(32, reinterpret_cast<void*>(timerInterruptHandler));
 
     kernel->run();
 

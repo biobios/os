@@ -67,6 +67,9 @@ void Kernel::initSyscallAndStubs() {
     oz::irq::setUnblockFn([](Thread* t) {
         Kernel::instance().scheduler.queueThread(t);
     });
+    oz::irq::setTimerTickFn([]() {
+        Kernel::instance().scheduler.tick();
+    });
     oz::g_eoi_fn = []() {
         oz::x86_64::notifyEndOfInterrupt();
     };
@@ -351,7 +354,7 @@ void Kernel::run() {
 
     // Start APIC Timer for preemption
     scheduler.initMainThread();
-    oz::x86_64::initAPICTimer(32);
+    oz::x86_64::initAPICTimer(oz::x86_64::APIC_TIMER_VECTOR);
 
     while (1) {
         __asm__ volatile("sti; hlt");

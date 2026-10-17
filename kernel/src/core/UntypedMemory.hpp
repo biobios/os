@@ -114,20 +114,31 @@ public:
 
     // Retype into a TCB (Thread Control Block) with integrated 8KB kernel stack
     TCB* retypeTCB(void (*queue_thread_fn)(Thread*) = nullptr) {
+        static constexpr std::size_t TCB_BLOCK_SIZE       = 8192;
+        static constexpr std::size_t TCB_OBJECT_OFFSET    = 0;
+        static constexpr std::size_t TCB_MAX_SIZE         = 64;
+        static constexpr std::size_t THREAD_OBJECT_OFFSET = 64;
+        static constexpr std::size_t THREAD_MAX_SIZE      = 512 - 64; // 448 bytes
+        static constexpr std::size_t STACK_OFFSET         = 512;
+        static constexpr std::size_t STACK_SIZE           = TCB_BLOCK_SIZE - STACK_OFFSET; // 7680 bytes
+
+        static_assert(sizeof(TCB) <= TCB_MAX_SIZE, "TCB size exceeds allocation slot");
+        static_assert(sizeof(Thread) <= THREAD_MAX_SIZE, "Thread size exceeds allocation slot");
+
         // Allocate 8192 bytes (4096-aligned)
         std::uintptr_t block_phys = 0;
-        void* block_mem = allocateBytes(8192, 4096, block_phys);
+        void* block_mem = allocateBytes(TCB_BLOCK_SIZE, 4096, block_phys);
         if (!block_mem) return nullptr;
 
         // Memory layout within this 8KB block:
-        //   [0 .. sizeof(TCB)]: TCB object
-        //   [64 .. 64 + sizeof(Thread)]: Thread object
-        //   [512 .. 8192]: Kernel stack (7680 bytes)
+        //   [0 .. 64): TCB object
+        //   [64 .. 512): Thread object
+        //   [512 .. 8192): Kernel stack (7680 bytes)
         std::uint8_t* base = reinterpret_cast<std::uint8_t*>(block_mem);
-        void* tcb_mem = base;
-        void* thread_mem = base + 64;
-        void* stack_base = base + 512;
-        std::size_t stack_size = 8192 - 512;
+        void* tcb_mem = base + TCB_OBJECT_OFFSET;
+        void* thread_mem = base + THREAD_OBJECT_OFFSET;
+        void* stack_base = base + STACK_OFFSET;
+        std::size_t stack_size = STACK_SIZE;
 
         Thread* thread = new (thread_mem) Thread(
             0, stack_base, stack_size, PageBlock<>{nullptr}, 0

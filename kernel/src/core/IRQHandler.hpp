@@ -42,13 +42,11 @@ public:
         if (!notification_ep_ || notification_ep_->is_peer_closed()) return nullptr;
         acknowledged_ = false;
 
-        // Send a minimal notification message
-        IPCMessage msg{};
-        msg.data[0] = irq_vector_;  // IRQ vector number
-        notification_ep_->send(msg);
+        ChannelEndpoint* peer = notification_ep_->get_peer();
+        if (!peer) return nullptr;
 
-        // Return a waiter to unblock
-        return notification_ep_->notify_peer_waiters();
+        peer->set_notification(irq_vector_);
+        return peer->pop_recv_waiter();
     }
 
     // Acknowledge the interrupt (user-space calls this after handling)

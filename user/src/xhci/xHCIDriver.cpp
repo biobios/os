@@ -73,7 +73,7 @@ DmaPage Controller::allocPage() {
     static std::uint64_t bump_virt = 0x300000000000;
     auto cap = oz::sys_frame_alloc(240, 1);
     auto phys = oz::sys_frame_phys_addr(cap);
-    oz::sys_vspace_map(0, cap, bump_virt, 0x01 | 0x02); // Read/write
+    oz::sys_vspace_map_with_pagetables(0, 240, cap, bump_virt, 0x01 | 0x02, 4096); // Read/write
     DmaPage p{(void*)bump_virt, phys};
     bump_virt += 4096;
     return p;

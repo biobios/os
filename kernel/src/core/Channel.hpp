@@ -3,20 +3,19 @@
 #include "core/Capability.hpp"
 #include <cstdint>
 
-
 namespace oz {
 
 struct IPCMessage {
-    std::uint64_t data[4];
-    CapID transferred_cap;
+    std::uint64_t data[4]{};
+    CapID transferred_cap{0};
     bool has_cap{false};
 };
 
-// Internal message stored in the channel queue (kernel-side only)
+// Internal message transferred between endpoints (kernel-side only)
 // Carries the actual Capability object when a cap is being transferred
 struct InternalIPCMessage {
-    IPCMessage user_msg;
-    Capability attached_cap; // Valid only when user_msg.has_cap is true
+    IPCMessage user_msg{};
+    Capability attached_cap{}; // Valid only when user_msg.has_cap is true
 };
 
 // Forward declaration
@@ -24,94 +23,87 @@ class Thread;
 
 class ChannelEndpoint : public KernelObject {
 private:
-    static constexpr std::size_t QUEUE_SIZE = 16;
-    InternalIPCMessage msg_queue[QUEUE_SIZE];
-    std::size_t q_head{0};
-    std::size_t q_tail{0};
-    std::size_t q_size{0};
     ChannelEndpoint* peer{nullptr};
 
     // Waiter list for threads blocked on recv on THIS endpoint
-    Thread* waiter_head{nullptr};
-    Thread* waiter_tail{nullptr};
+    Thread* recv_waiter_head{nullptr};
+    Thread* recv_waiter_tail{nullptr};
+
+    // Waiter list for threads blocked on send on THIS endpoint
+    Thread* send_waiter_head{nullptr};
+    Thread* send_waiter_tail{nullptr};
+
+    // Temporary handoff buffer when receiver was already waiting
+    InternalIPCMessage rendezvous_msg{};
+    bool has_rendezvous_msg{false};
+
+    // For asynchronous interrupt notifications (IRQs)
+    bool has_pending_notification{false};
+    std::uint64_t pending_notification_data{0};
 
 public:
     explicit ChannelEndpoint(bool untyped = false) : KernelObject(ObjectType::ChannelEndpoint, untyped) {}
     
-    ~ChannelEndpoint() override {
-        if (peer) {
-            peer->on_peer_closed();
-        }
-    }
+    ~ChannelEndpoint() override;
 
     void set_peer(ChannelEndpoint* p) {
         peer = p;
     }
 
-    void on_peer_closed() {
-        peer = nullptr;
-    }
+    void on_peer_closed();
 
     bool is_peer_closed() const {
         return peer == nullptr;
     }
 
-    // Send a message (with optional cap) to the peer endpoint
-    bool send(const InternalIPCMessage& msg) {
-        if (!peer) return false;
-        peer->enqueue(msg);
+    ChannelEndpoint* get_peer() const {
+        return peer;
+    }
+
+    // Recv waiter management
+    void add_recv_waiter(Thread* thread);
+    Thread* pop_recv_waiter();
+    bool has_recv_waiters() const { return recv_waiter_head != nullptr; }
+
+    // Send waiter management
+    void add_send_waiter(Thread* thread);
+    Thread* pop_send_waiter();
+    bool has_send_waiters() const { return send_waiter_head != nullptr; }
+
+    // Rendezvous handoff message
+    void set_rendezvous_msg(const InternalIPCMessage& msg) {
+        rendezvous_msg = msg;
+        has_rendezvous_msg = true;
+    }
+
+    bool pop_rendezvous_msg(InternalIPCMessage& out_msg) {
+        if (!has_rendezvous_msg) return false;
+        out_msg = rendezvous_msg;
+        rendezvous_msg = InternalIPCMessage{};
+        has_rendezvous_msg = false;
         return true;
     }
 
-    // Legacy send without cap (for backward compat)
-    bool send(const IPCMessage& msg) {
-        InternalIPCMessage internal;
-        internal.user_msg = msg;
-        // attached_cap is default-constructed (invalid)
-        return send(internal);
+    bool has_rendezvous() const {
+        return has_rendezvous_msg;
     }
 
-    // Pop a waiter from the PEER's wait list (called after send)
-    // Returns a thread that was blocked on recv on the peer endpoint
-    Thread* notify_peer_waiters() {
-        if (!peer) return nullptr;
-        return peer->pop_waiter();
+    // Pending notifications (for IRQs)
+    void set_notification(std::uint64_t data) {
+        has_pending_notification = true;
+        pending_notification_data = data;
     }
 
-    void enqueue(const InternalIPCMessage& msg) {
-        if (q_size >= QUEUE_SIZE) return;
-        msg_queue[q_tail] = msg;
-        q_tail = (q_tail + 1) % QUEUE_SIZE;
-        q_size++;
-    }
-
-    bool receive(InternalIPCMessage& out_msg) {
-        if (q_size == 0) {
-            return false;
-        }
-        out_msg = msg_queue[q_head];
-        msg_queue[q_head] = InternalIPCMessage{}; // Clear the slot (release any cap ref)
-        q_head = (q_head + 1) % QUEUE_SIZE;
-        q_size--;
+    bool check_and_clear_notification(std::uint64_t& data) {
+        if (!has_pending_notification) return false;
+        data = pending_notification_data;
+        has_pending_notification = false;
+        pending_notification_data = 0;
         return true;
     }
 
-    // Legacy receive (drops cap info)
-    bool receive(IPCMessage& out_msg) {
-        InternalIPCMessage internal;
-        if (!receive(internal)) return false;
-        out_msg = internal.user_msg;
-        return true;
-    }
-
-    // Add a thread to THIS endpoint's waiter list
-    void add_waiter(Thread* thread);
-
-    // Remove and return the first waiting thread from THIS endpoint
-    Thread* pop_waiter();
-
-    bool has_waiters() const {
-        return waiter_head != nullptr;
+    bool has_notification() const {
+        return has_pending_notification;
     }
 };
 

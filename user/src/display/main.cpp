@@ -30,7 +30,7 @@ public:
 
         // Map FrameBuffer capability (Slot 246) into self VSpace at FB_VADDR
         // flags: 0x01 (Writable)
-        int res = oz::sys_vspace_map(oz::CAP_SELF_VSPACE, oz::CAP_FRAMEBUFFER, FB_VADDR, 0x01);
+        int res = oz::sys_vspace_map_with_pagetables(oz::CAP_SELF_VSPACE, oz::CAP_UNTYPED, oz::CAP_FRAMEBUFFER, FB_VADDR, 0x01, size);
         if (res != 0) {
             oz::sys_debug_print("[Display] ERROR: Failed to map FrameBuffer!\n\r");
             return false;

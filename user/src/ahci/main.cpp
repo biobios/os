@@ -14,7 +14,7 @@ extern "C" void _start() {
     
     // Map ABAR MMIO from device Frame cap (slot 241)
     static constexpr std::uint64_t ABAR_VIRT = 0x200000000000; // Fixed virtual address for MMIO
-    if (oz::sys_vspace_map(oz::CAP_SELF_VSPACE, 241, ABAR_VIRT, 0x10 | 0x01) != 0) {
+    if (oz::sys_vspace_map_with_pagetables(oz::CAP_SELF_VSPACE, oz::CAP_UNTYPED, 241, ABAR_VIRT, 0x10 | 0x01, 4096) != 0) {
         // 0x10 = cache disable, 0x01 = writable
         oz::sys_write("Failed to map AHCI ABAR!\n\r");
         oz::sys_exit(1);
@@ -28,13 +28,19 @@ extern "C" void _start() {
     
     oz::AHCI::AHCIPortDevice* dev = ahci.getFirstSataDevice();
     if (!dev) {
-        oz::sys_write("No SATA device found!\n\r");
-        oz::sys_exit(1);
+        oz::sys_write("No SATA device found! Serving error responses.\n\r");
+        while (true) {
+            oz::IPCMessage req{};
+            if (!oz::sys_channel_recv(3, &req)) continue;
+            oz::IPCMessage resp{};
+            resp.data[0] = 1; // error
+            oz::sys_channel_send(4, &resp);
+        }
     }
     
     // Map shared buffer for block I/O
     static constexpr std::uint64_t SHARED_BUF_VIRT = 0x210000000000;
-    if (oz::sys_vspace_map(oz::CAP_SELF_VSPACE, 242, SHARED_BUF_VIRT, 0x01) != 0) {
+    if (oz::sys_vspace_map_with_pagetables(oz::CAP_SELF_VSPACE, oz::CAP_UNTYPED, 242, SHARED_BUF_VIRT, 0x01, 16 * 4096) != 0) {
         oz::sys_write("Failed to map shared buffer!\n\r");
         oz::sys_exit(1);
     }

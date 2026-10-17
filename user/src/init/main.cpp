@@ -142,7 +142,7 @@ extern "C" void _start() {
 
     std::uint32_t cons_send = 0;
     std::uint32_t cons_recv = 0;
-    oz::sys_channel_create(&cons_send, &cons_recv);
+    oz::sys_channel_create(oz::CAP_UNTYPED, &cons_send, &cons_recv);
 
     int cs_res = oz::sys_cspace_cap_insert(cons_proc.cspace_cap, 1, cons_recv, static_cast<std::uint32_t>(oz::CapRights::READ));
     oz::sys_cspace_cap_insert(cons_proc.cspace_cap, oz::CAP_UNTYPED, oz::CAP_UNTYPED, static_cast<std::uint32_t>(oz::CapRights::ALL));
@@ -161,7 +161,7 @@ extern "C" void _start() {
         if (disp_proc.success) {
             std::uint32_t init_disp_send = 0;
             std::uint32_t disp_init_recv = 0;
-            oz::sys_channel_create(&init_disp_send, &disp_init_recv);
+            oz::sys_channel_create(oz::CAP_UNTYPED, &init_disp_send, &disp_init_recv);
 
             // Slot 1: console send (sys_write)
             oz::sys_cspace_cap_insert(disp_proc.cspace_cap, 1, cons_send, static_cast<std::uint32_t>(oz::CapRights::WRITE | oz::CapRights::GRANT));
@@ -204,16 +204,16 @@ extern "C" void _start() {
 
     std::uint32_t init_ahci_send = 0;
     std::uint32_t ahci_init_recv = 0;
-    oz::sys_channel_create(&init_ahci_send, &ahci_init_recv);
+    oz::sys_channel_create(oz::CAP_UNTYPED, &init_ahci_send, &ahci_init_recv);
     oz::sys_cspace_cap_insert(oz::CAP_SELF_CSPACE, CAP_AHCI_SEND, init_ahci_send, static_cast<std::uint32_t>(oz::CapRights::WRITE | oz::CapRights::GRANT));
 
     std::uint32_t vfs_ahci_send = 0;
     std::uint32_t ahci_vfs_recv = 0;
-    oz::sys_channel_create(&vfs_ahci_send, &ahci_vfs_recv);
+    oz::sys_channel_create(oz::CAP_UNTYPED, &vfs_ahci_send, &ahci_vfs_recv);
 
     std::uint32_t ahci_vfs_send = 0;
     std::uint32_t vfs_ahci_recv = 0;
-    oz::sys_channel_create(&ahci_vfs_send, &vfs_ahci_recv);
+    oz::sys_channel_create(oz::CAP_UNTYPED, &ahci_vfs_send, &vfs_ahci_recv);
 
     // Shared buffer (16 pages = 64KB) for block I/O
     std::uint32_t shared_buf_frame = oz::sys_frame_alloc(oz::CAP_UNTYPED, 16);
@@ -245,11 +245,11 @@ extern "C" void _start() {
 
     std::uint32_t init_vfs_send = 0;
     std::uint32_t vfs_init_recv = 0;
-    oz::sys_channel_create(&init_vfs_send, &vfs_init_recv);
+    oz::sys_channel_create(oz::CAP_UNTYPED, &init_vfs_send, &vfs_init_recv);
 
     std::uint32_t vfs_init_send = 0;
     std::uint32_t init_vfs_recv = 0;
-    oz::sys_channel_create(&vfs_init_send, &init_vfs_recv);
+    oz::sys_channel_create(oz::CAP_UNTYPED, &vfs_init_send, &init_vfs_recv);
 
     oz::sys_cspace_cap_insert(oz::CAP_SELF_CSPACE, CAP_VFS_SEND, init_vfs_send, static_cast<std::uint32_t>(oz::CapRights::WRITE | oz::CapRights::GRANT));
     oz::sys_cspace_cap_insert(oz::CAP_SELF_CSPACE, CAP_VFS_RECV, init_vfs_recv, static_cast<std::uint32_t>(oz::CapRights::READ));
@@ -272,9 +272,9 @@ extern "C" void _start() {
         if (xhci_proc.success) {
             std::uint32_t irq_send = 0;
             std::uint32_t irq_recv = 0;
-            oz::sys_channel_create(&irq_send, &irq_recv);
+            oz::sys_channel_create(oz::CAP_UNTYPED, &irq_send, &irq_recv);
 
-            std::uint32_t irq_handler = oz::sys_irq_handler_create(0x40, irq_send);
+            std::uint32_t irq_handler = oz::sys_irq_handler_create(oz::CAP_UNTYPED, 0x40, irq_send);
 
             oz::sys_cspace_cap_insert(xhci_proc.cspace_cap, 1, cons_send, static_cast<std::uint32_t>(oz::CapRights::WRITE | oz::CapRights::GRANT));
             oz::sys_cspace_cap_insert(xhci_proc.cspace_cap, 2, irq_recv, static_cast<std::uint32_t>(oz::CapRights::READ));

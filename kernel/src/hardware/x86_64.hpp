@@ -54,6 +54,7 @@ constexpr std::uint16_t USER_CS32 = 3 * 8;
 constexpr std::uint16_t USER_DS = 4 * 8;
 constexpr std::uint16_t USER_CS = 5 * 8;
 constexpr std::uint16_t TSS_SELECTOR = 6 * 8;
+constexpr std::uint8_t APIC_TIMER_VECTOR = 32;
 
 void initGDTR();
 void setKernelStack(std::uint64_t rsp);

@@ -28,6 +28,7 @@ enum class ThreadState {
     Running,
     Blocked,
     BlockedOnRecv,
+    BlockedOnSend,
     Dead
 };
 
@@ -56,6 +57,9 @@ public:
 
     // For saving user RSP during blocking syscalls
     std::uint64_t syscall_user_rsp{0};
+
+    // For synchronous rendezvous IPC send
+    InternalIPCMessage send_msg{};
 
     // For blocking IPC recv
     CapID recv_cap_id{0};

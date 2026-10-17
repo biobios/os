@@ -88,6 +88,8 @@ extern "C" std::uint64_t handleSyscall(std::uint64_t rdi, std::uint64_t rsi, std
         ChannelEndpoint* ep = get_cap_typed<ChannelEndpoint>(
             cspace, static_cast<CapID>(rdi), ObjectType::ChannelEndpoint, CapRights::WRITE);
         if (!ep || ep->is_peer_closed()) return -1;
+        ChannelEndpoint* peer = ep->get_peer();
+        if (!peer) return -1;
 
         // Build internal message with optional cap attachment
         InternalIPCMessage internal;
@@ -109,14 +111,41 @@ extern "C" std::uint64_t handleSyscall(std::uint64_t rdi, std::uint64_t rsi, std
             cspace->remove(msg->transferred_cap);
         }
 
-        if (!ep->send(internal)) return -1;
-
-        // Wake up a thread blocked on recv on the peer endpoint
-        Thread* waiter = ep->notify_peer_waiters();
-        if (waiter && g_unblock_thread_func) {
-            g_unblock_thread_func(waiter);
+        // Synchronous rendezvous: check if a receiver is already waiting on peer
+        Thread* receiver = peer->pop_recv_waiter();
+        if (receiver) {
+            if (internal.attached_cap.is_valid() && receiver->cspace) {
+                CapID new_id = receiver->cspace->add(internal.attached_cap);
+                if (new_id == INVALID_CAP_ID) {
+                    internal.user_msg.has_cap = false;
+                } else {
+                    internal.user_msg.transferred_cap = new_id;
+                    internal.user_msg.has_cap = true;
+                }
+                internal.attached_cap = Capability();
+            }
+            peer->set_rendezvous_msg(internal);
+            receiver->state = ThreadState::Ready;
+            if (g_unblock_thread_func) {
+                g_unblock_thread_func(receiver);
+            }
+            return 0;
         }
-        
+
+        // No receiver is waiting: sender must block until rendezvous
+        if (!g_get_current_thread_func || !g_block_thread_func) return -1;
+        Thread* current = g_get_current_thread_func();
+        if (!current) return -1;
+
+        current->send_msg = internal;
+        current->state = ThreadState::BlockedOnSend;
+        ep->add_send_waiter(current);
+
+        g_block_thread_func();
+
+        // Woken up after receiver accepted the message
+        current->send_msg = InternalIPCMessage{};
+        if (ep->is_peer_closed()) return -1;
         return 0;
     } else if (syscall_number == 2) {
         // channel_recv
@@ -128,60 +157,78 @@ extern "C" std::uint64_t handleSyscall(std::uint64_t rdi, std::uint64_t rsi, std
         ChannelEndpoint* ep = get_cap_typed<ChannelEndpoint>(
             cspace, static_cast<CapID>(rdi), ObjectType::ChannelEndpoint, CapRights::READ);
         if (!ep) return -1;
-        
-        // Helper: process a received internal message (extract cap if present)
-        auto deliver_message = [&](InternalIPCMessage& internal) -> bool {
-            *msg = internal.user_msg;
-            if (internal.attached_cap.is_valid()) {
-                // Insert the transferred cap into receiver's CSpace
-                CapID new_id = cspace->add(internal.attached_cap);
+
+        // 1. Check for pending asynchronous notifications (e.g. IRQ)
+        std::uint64_t notif_data = 0;
+        if (ep->check_and_clear_notification(notif_data)) {
+            msg->data[0] = notif_data;
+            msg->data[1] = 0;
+            msg->data[2] = 0;
+            msg->data[3] = 0;
+            msg->has_cap = false;
+            return 0;
+        }
+
+        ChannelEndpoint* peer = ep->get_peer();
+
+        // 2. Synchronous rendezvous: check if a sender is already waiting on peer
+        Thread* sender = peer ? peer->pop_send_waiter() : nullptr;
+        if (sender) {
+            *msg = sender->send_msg.user_msg;
+            if (sender->send_msg.attached_cap.is_valid()) {
+                CapID new_id = cspace->add(sender->send_msg.attached_cap);
+                sender->send_msg.attached_cap = Capability();
                 if (new_id == INVALID_CAP_ID) {
-                    // CSpace is full - cap is lost
                     msg->has_cap = false;
                 } else {
                     msg->transferred_cap = new_id;
                     msg->has_cap = true;
                 }
             }
-            return true;
-        };
-        
-        // Fast path: message already available
-        InternalIPCMessage internal;
-        if (ep->receive(internal)) {
-            deliver_message(internal);
+            sender->state = ThreadState::Ready;
+            if (g_unblock_thread_func) {
+                g_unblock_thread_func(sender);
+            }
             return 0;
         }
-        
-        // No message - block the current thread
+
+        // 3. No sender is waiting: receiver must block
         if (!g_get_current_thread_func || !g_block_thread_func) return -1;
-        
         Thread* current = g_get_current_thread_func();
         if (!current) return -1;
-        
+
         current->state = ThreadState::BlockedOnRecv;
-        ep->add_waiter(current);
-        
-        // This switches to another thread; returns when we're woken up
+        ep->add_recv_waiter(current);
+
         g_block_thread_func();
-        
-        // Woken up by a sender - try to receive the message
-        if (ep->receive(internal)) {
-            deliver_message(internal);
+
+        // Woken up by sender or notification
+        if (ep->check_and_clear_notification(notif_data)) {
+            msg->data[0] = notif_data;
+            msg->data[1] = 0;
+            msg->data[2] = 0;
+            msg->data[3] = 0;
+            msg->has_cap = false;
             return 0;
         }
-        
-        // Peer may have closed
+
+        InternalIPCMessage internal;
+        if (ep->pop_rendezvous_msg(internal)) {
+            *msg = internal.user_msg;
+            return 0;
+        }
+
+        if (ep->is_peer_closed()) return -1;
         return -1;
     } else if (syscall_number == 3) {
-        // channel_create
+        // channel_create(untyped_cap, out0, out1)
         CSpace* cspace = get_cspace();
         if (!cspace) return -1;
-        if (!is_user_buffer(rdi, sizeof(CapID))) return -1;
         if (!is_user_buffer(rsi, sizeof(CapID))) return -1;
-        CapID* out0 = reinterpret_cast<CapID*>(rdi);
-        CapID* out1 = reinterpret_cast<CapID*>(rsi);
-        if (sys_channel_create(cspace, out0, out1)) return 0;
+        if (!is_user_buffer(rdx, sizeof(CapID))) return -1;
+        CapID* out0 = reinterpret_cast<CapID*>(rsi);
+        CapID* out1 = reinterpret_cast<CapID*>(rdx);
+        if (sys_channel_create(cspace, static_cast<CapID>(rdi), out0, out1)) return 0;
         return -1;
     } else if (syscall_number == 4) {
         // vspace_map
@@ -333,12 +380,12 @@ extern "C" std::uint64_t handleSyscall(std::uint64_t rdi, std::uint64_t rsi, std
         if (!tcb->suspend()) return -1;
         return 0;
     } else if (syscall_number == 15) {
-        // cspace_create
+        // cspace_create(untyped_cap)
         CSpace* cspace = get_cspace();
         if (!cspace) return -1;
         
         UntypedMemory* untyped = get_cap_typed<UntypedMemory>(
-            cspace, 240, ObjectType::UntypedMemory, CapRights::WRITE);
+            cspace, static_cast<CapID>(rdi), ObjectType::UntypedMemory, CapRights::WRITE);
         if (!untyped) return -1;
         
         CSpaceCap* cs_cap_obj = untyped->retypeCSpace();
@@ -369,12 +416,12 @@ extern "C" std::uint64_t handleSyscall(std::uint64_t rdi, std::uint64_t rsi, std
         if (!target_cs->insertCap(static_cast<CapID>(rsi), minted)) return -1;
         return 0;
     } else if (syscall_number == 17) {
-        // vspace_create
+        // vspace_create(untyped_cap)
         CSpace* cspace = get_cspace();
         if (!cspace) return -1;
         
         UntypedMemory* untyped = get_cap_typed<UntypedMemory>(
-            cspace, 240, ObjectType::UntypedMemory, CapRights::WRITE);
+            cspace, static_cast<CapID>(rdi), ObjectType::UntypedMemory, CapRights::WRITE);
         if (!untyped) return -1;
         
         std::uintptr_t pml4_phys = 0;
@@ -397,18 +444,18 @@ extern "C" std::uint64_t handleSyscall(std::uint64_t rdi, std::uint64_t rsi, std
         if (new_id == INVALID_CAP_ID) return static_cast<std::uint64_t>(-1);
         return static_cast<std::uint64_t>(new_id);
     } else if (syscall_number == 18) {
-        // irq_handler_create
+        // irq_handler_create(untyped_cap, vector, notification_ep_cap)
         CSpace* cspace = get_cspace();
         if (!cspace || !g_register_irq_handler_fn || !g_eoi_fn) return -1;
         
         UntypedMemory* untyped = get_cap_typed<UntypedMemory>(
-            cspace, 240, ObjectType::UntypedMemory, CapRights::WRITE);
+            cspace, static_cast<CapID>(rdi), ObjectType::UntypedMemory, CapRights::WRITE);
         if (!untyped) return -1;
         
-        std::uint8_t vector = static_cast<std::uint8_t>(rdi);
+        std::uint8_t vector = static_cast<std::uint8_t>(rsi);
         
         ChannelEndpoint* ep = get_cap_typed<ChannelEndpoint>(
-            cspace, static_cast<CapID>(rsi), ObjectType::ChannelEndpoint, CapRights::WRITE);
+            cspace, static_cast<CapID>(rdx), ObjectType::ChannelEndpoint, CapRights::WRITE);
         if (!ep) return -1;
         
         auto* handler = untyped->allocateObject<IRQHandler>(vector, g_register_irq_handler_fn, g_eoi_fn);
@@ -434,17 +481,17 @@ extern "C" std::uint64_t handleSyscall(std::uint64_t rdi, std::uint64_t rsi, std
         if (!handler->acknowledge()) return -1;
         return 0;
     } else if (syscall_number == 20) {
-        // ioport_create
+        // ioport_create(untyped_cap, base_port, port_count)
         CSpace* cspace = get_cspace();
         if (!cspace) return -1;
         
         UntypedMemory* untyped = get_cap_typed<UntypedMemory>(
-            cspace, 240, ObjectType::UntypedMemory, CapRights::WRITE);
+            cspace, static_cast<CapID>(rdi), ObjectType::UntypedMemory, CapRights::WRITE);
         if (!untyped) return -1;
         
         auto* ioport = untyped->allocateObject<IOPort>(
-            static_cast<std::uint16_t>(rdi),
             static_cast<std::uint16_t>(rsi),
+            static_cast<std::uint16_t>(rdx),
             g_read_io8_fn, g_read_io16_fn, g_read_io32_fn,
             g_write_io8_fn, g_write_io16_fn, g_write_io32_fn
         );
@@ -616,6 +663,7 @@ __attribute__((naked)) void syscall_entry() {
         "swapgs\n"
         "movq %rsp, %gs:0\n"
         "movq %gs:8, %rsp\n"
+        "pushq %gs:0\n"        // Save user RSP on thread's own kernel stack
         
         "pushq %rbp\n"
 
@@ -632,8 +680,6 @@ __attribute__((naked)) void syscall_entry() {
         "andq $-16, %rsp\n"
         
         "movq %r10, %rcx\n"
-        "movq %r8, %r8\n"
-        "movq %r9, %r9\n"
         "pushq $0\n" 
         "pushq %rax\n"
 
@@ -651,8 +697,7 @@ __attribute__((naked)) void syscall_entry() {
         "popq %rcx\n"
         
         "popq %rbp\n"
-
-        "movq %gs:0, %rsp\n"
+        "popq %rsp\n"          // Restore user RSP from kernel stack
         "swapgs\n"
         "sysretq\n"
     );

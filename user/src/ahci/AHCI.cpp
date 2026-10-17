@@ -82,7 +82,7 @@ void Controller::probePorts() {
             
             // Issue COMRESET via SControl
             port->sctl = (port->sctl & ~0x0F) | 0x01; // DET = 1 (COMRESET)
-            for (volatile int t = 0; t < 100000; t++) {} // Small delay
+            for (int t = 0; t < 100000; t++) { __asm__ volatile("pause"); } // Small delay
             port->sctl &= ~0x0F; // DET = 0 (No action)
             
             // Wait for device detection
@@ -112,24 +112,43 @@ void Controller::probePorts() {
             }
             
             if (det == 3 && ipm == 1) { // Device present and active
-                for (int t = 0; t < 100000000; t++) {
+                std::uint32_t sig = port->sig;
+                if (sig == SATA_SIG_ATAPI) {
+                    char dbg[64] = "[AHCI] Port X is ATAPI device, skipping.\n\r";
+                    dbg[12] = '0' + static_cast<char>(i);
+                    sys_write(dbg);
+                    continue;
+                }
+
+                bool ready = false;
+                for (int t = 0; t < 100000; t++) {
                     port->serr = 0xFFFFFFFF; // Clear SError
                     std::uint32_t tfd = port->tfd;
-                    if ((tfd & (0x80 | 0x08)) == 0) break; // Not busy and no error
+                    if ((tfd & (0x80 | 0x08)) == 0) {
+                        ready = true;
+                        break; // Not busy and no error
+                    }
                     __asm__ volatile("pause");
                 }
+                if (!ready) {
+                    char dbg[64] = "[AHCI] Port X busy timeout, skipping.\n\r";
+                    dbg[12] = '0' + static_cast<char>(i);
+                    sys_write(dbg);
+                    continue;
+                }
+
                 // print: sig
+                sig = port->sig;
                 {
                     char dbg[64] = "[AHCI] Port X: sig=XXXXXXXX\n\r";
                     dbg[12] = '0' + static_cast<char>(i);
                     const char hx[] = "0123456789ABCDEF";
-                    std::uint32_t sig = port->sig;
                     for (int h = 0; h < 8; h++) {
                         dbg[19 + h] = hx[(sig >> (28 - h * 4)) & 0xF];
                     }
                     sys_write(dbg);
                 }
-                if (port->sig == SATA_SIG_ATA) {
+                if (sig == SATA_SIG_ATA) {
                     ports[i] = std::make_unique<AHCIPortDevice>(this, port, i);
                     if (!ports[i]->initialize()) {
                         ports[i].reset();
@@ -174,7 +193,7 @@ bool AHCIPortDevice::initialize() {
     
     // 2. Allocate memory for command list
     std::uint32_t cl_cap = sys_frame_alloc(CAP_UNTYPED, 1);
-    if (sys_vspace_map(CAP_SELF_VSPACE, cl_cap, bump_virt, 0x01) != 0) return false;
+    if (sys_vspace_map_with_pagetables(CAP_SELF_VSPACE, CAP_UNTYPED, cl_cap, bump_virt, 0x01, 4096) != 0) return false;
     cmd_list = reinterpret_cast<HBA_CMD_HEADER volatile*>(bump_virt);
     oz::utils::memset((void*)cmd_list, 0, 4096);
     
@@ -185,7 +204,7 @@ bool AHCIPortDevice::initialize() {
 
     // 3. Allocate memory for FIS receive area
     std::uint32_t fb_cap = sys_frame_alloc(CAP_UNTYPED, 1);
-    if (sys_vspace_map(CAP_SELF_VSPACE, fb_cap, bump_virt, 0x01) != 0) return false;
+    if (sys_vspace_map_with_pagetables(CAP_SELF_VSPACE, CAP_UNTYPED, fb_cap, bump_virt, 0x01, 4096) != 0) return false;
     fis_recv = reinterpret_cast<void*>(bump_virt);
     oz::utils::memset((void*)fis_recv, 0, 4096);
     
@@ -199,7 +218,7 @@ bool AHCIPortDevice::initialize() {
         cmd_list[i].prdtl = 8; // 8 PRDT entries max per command table
         
         std::uint32_t ct_cap = sys_frame_alloc(CAP_UNTYPED, 1);
-        if (sys_vspace_map(CAP_SELF_VSPACE, ct_cap, bump_virt, 0x01) != 0) return false;
+        if (sys_vspace_map_with_pagetables(CAP_SELF_VSPACE, CAP_UNTYPED, ct_cap, bump_virt, 0x01, 4096) != 0) return false;
         cmd_tbl[i] = reinterpret_cast<HBA_CMD_TBL volatile*>(bump_virt);
         oz::utils::memset((void*)cmd_tbl[i], 0, 4096);
         
@@ -219,7 +238,7 @@ bool AHCIPortDevice::initialize() {
     dma_buffer_size = 65536;
     std::uint32_t dma_cap = sys_frame_alloc(CAP_UNTYPED, 16);
     if (!dma_cap) return false;
-    if (sys_vspace_map(CAP_SELF_VSPACE, dma_cap, bump_virt, 0x01) != 0) return false;
+    if (sys_vspace_map_with_pagetables(CAP_SELF_VSPACE, CAP_UNTYPED, dma_cap, bump_virt, 0x01, 16 * 4096) != 0) return false;
     
     dma_buffer_phys = sys_frame_phys_addr(dma_cap);
     dma_buffer = (void*)bump_virt;

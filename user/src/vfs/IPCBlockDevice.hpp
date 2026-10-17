@@ -25,7 +25,7 @@ public:
     bool initialize() {
         // Map shared buffer Frame (slot 242) into our VSpace
         static constexpr std::uint64_t SHARED_BUF_VIRT = 0x200000000000;
-        if (sys_vspace_map(oz::CAP_SELF_VSPACE, 242, SHARED_BUF_VIRT, 0x01) != 0) {
+        if (sys_vspace_map_with_pagetables(oz::CAP_SELF_VSPACE, oz::CAP_UNTYPED, 242, SHARED_BUF_VIRT, 0x01, 16 * 4096) != 0) {
             return false; // 0x01 = writable
         }
         shared_buf = reinterpret_cast<void*>(SHARED_BUF_VIRT);

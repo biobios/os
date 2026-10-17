@@ -10,5 +10,7 @@ namespace irq {
     IRQHandler* getHandler(std::uint8_t vector);
     void setUnblockFn(void (*fn)(Thread*));
     void (*getUnblockFn())(Thread*);
+    void setTimerTickFn(void (*fn)());
+    void (*getTimerTickFn())();
 }
 }
