@@ -51,6 +51,16 @@ public:
 
     Thread* getThread() const { return thread_; }
 
+    void setFaultEndpoint(ChannelEndpoint* ep) {
+        if (thread_) {
+            thread_->fault_ep = ep;
+        }
+    }
+
+    ChannelEndpoint* getFaultEndpoint() const {
+        return thread_ ? thread_->fault_ep : nullptr;
+    }
+
     // Resume: queue thread into scheduler
     bool resume() {
         if (!thread_) return false;

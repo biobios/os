@@ -57,7 +57,29 @@ public:
     }
     std::size_t remainingPages() const { return remainingBytes() / 4096; }
 
+    void revokeRecursive(KernelObject* node) {
+        if (!node) return;
+        while (node->cdtFirstChild()) {
+            revokeRecursive(node->cdtFirstChild());
+        }
+        node->markRevoked();
+        if (node->objectType() == ObjectType::ChannelEndpoint) {
+            auto* ep = static_cast<ChannelEndpoint*>(node);
+            ep->on_peer_closed();
+        } else if (node->objectType() == ObjectType::TCB) {
+            auto* tcb = static_cast<TCB*>(node);
+            if (tcb->getThread()) {
+                tcb->getThread()->state = ThreadState::Dead;
+            }
+        }
+        this->removeChild(node);
+        node->release();
+    }
+
     void revoke() {
+        while (cdt_first_child_) {
+            revokeRecursive(cdt_first_child_);
+        }
         watermark_ = 0;
     }
 
@@ -69,6 +91,7 @@ public:
         T* obj = new (obj_mem) T(static_cast<Args&&>(args)...);
         if constexpr (std::is_base_of_v<KernelObject, T>) {
             obj->setUntypedBacked(true);
+            this->addChild(obj);
         }
         return obj;
     }
@@ -91,7 +114,9 @@ public:
         }
 
         // Construct Frame object with placement new
-        return new (meta_mem) Frame(frame_phys, num_pages * 4096, is_device_, nullptr, nullptr, true);
+        auto* frame = new (meta_mem) Frame(frame_phys, num_pages * 4096, is_device_, nullptr, nullptr, true);
+        this->addChild(frame);
+        return frame;
     }
 
     // Retype into a PageTable (x86-64 intermediate paging structure: 4096 bytes)
@@ -109,16 +134,18 @@ public:
             return nullptr;
         }
 
-        return new (meta_mem) PageTableObject(pt_phys, true);
+        auto* pt = new (meta_mem) PageTableObject(pt_phys, true);
+        this->addChild(pt);
+        return pt;
     }
 
     // Retype into a TCB (Thread Control Block) with integrated 8KB kernel stack
     TCB* retypeTCB(void (*queue_thread_fn)(Thread*) = nullptr) {
         static constexpr std::size_t TCB_BLOCK_SIZE       = 8192;
         static constexpr std::size_t TCB_OBJECT_OFFSET    = 0;
-        static constexpr std::size_t TCB_MAX_SIZE         = 64;
-        static constexpr std::size_t THREAD_OBJECT_OFFSET = 64;
-        static constexpr std::size_t THREAD_MAX_SIZE      = 512 - 64; // 448 bytes
+        static constexpr std::size_t TCB_MAX_SIZE         = 128;
+        static constexpr std::size_t THREAD_OBJECT_OFFSET = 128;
+        static constexpr std::size_t THREAD_MAX_SIZE      = 512 - 128; // 384 bytes
         static constexpr std::size_t STACK_OFFSET         = 512;
         static constexpr std::size_t STACK_SIZE           = TCB_BLOCK_SIZE - STACK_OFFSET; // 7680 bytes
 
@@ -147,6 +174,7 @@ public:
         thread->state = ThreadState::Blocked;
 
         TCB* tcb = new (tcb_mem) TCB(thread, true, queue_thread_fn, true);
+        this->addChild(tcb);
         return tcb;
     }
 
@@ -164,7 +192,9 @@ public:
         }
 
         CSpace* cs = new (cs_mem) CSpace();
-        return new (meta_mem) CSpaceCap(cs, false, true);
+        auto* cscap = new (meta_mem) CSpaceCap(cs, false, true);
+        this->addChild(cscap);
+        return cscap;
     }
 
     // Retype into a ChannelEndpoint pair
@@ -186,6 +216,9 @@ public:
         ChannelEndpoint* ep1 = new (mem1) ChannelEndpoint(true);
         ep0->set_peer(ep1);
         ep1->set_peer(ep0);
+
+        this->addChild(ep0);
+        this->addChild(ep1);
 
         *out0 = ep0;
         *out1 = ep1;

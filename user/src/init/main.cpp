@@ -20,9 +20,12 @@
 static constexpr std::uint32_t CAP_AHCI_SEND = 2;
 static constexpr std::uint32_t CAP_VFS_SEND = 3;
 static constexpr std::uint32_t CAP_VFS_RECV = 4;
+static constexpr std::uint32_t CAP_VFS_SHARED_BUF = 5;
 
 static constexpr std::uint64_t BOOTINFO_VADDR = 0x600000000000ULL;
 static constexpr std::uint64_t INITRD_VADDR   = 0x500000000000ULL;
+static constexpr std::uint64_t VFS_SHARED_BUF_VIRT = 0x300000000000ULL;
+static char* g_vfs_shared_buf = nullptr;
 
 // Helper: send a VFS file open request
 static int vfs_open(const char* path) {
@@ -48,29 +51,58 @@ static int vfs_open(const char* path) {
     return -1;
 }
 
-// Helper: read from a VFS file
+// Helper: read from a VFS file using shared buffer (up to 64KB per chunk)
 static std::size_t vfs_read(int handle, std::size_t offset, char* buf, std::size_t size) {
-    oz::IPCMessage req{};
-    req.data[0] = static_cast<std::uint64_t>(oz::ipc::VfsCmd::READ);
-    req.data[1] = static_cast<std::uint64_t>(handle);
-    req.data[2] = static_cast<std::uint64_t>(offset);
-    req.data[3] = static_cast<std::uint64_t>(size);
-    
-    oz::sys_channel_send(CAP_VFS_SEND, &req);
-    
-    oz::IPCMessage resp{};
-    oz::sys_channel_recv(CAP_VFS_RECV, &resp);
-    
-    if (resp.data[0] != 0) return 0;
-    
-    std::size_t bytes_read = static_cast<std::size_t>(resp.data[1]);
-    const char* src = reinterpret_cast<const char*>(&resp.data[2]);
-    std::size_t to_copy = bytes_read > 16 ? 16 : bytes_read;
-    if (to_copy > size) to_copy = size;
-    for (std::size_t i = 0; i < to_copy; i++) {
-        buf[i] = src[i];
+    if (!g_vfs_shared_buf) {
+        oz::IPCMessage req{};
+        req.data[0] = static_cast<std::uint64_t>(oz::ipc::VfsCmd::READ);
+        req.data[1] = static_cast<std::uint64_t>(handle);
+        req.data[2] = static_cast<std::uint64_t>(offset);
+        req.data[3] = static_cast<std::uint64_t>(size);
+        
+        oz::sys_channel_send(CAP_VFS_SEND, &req);
+        
+        oz::IPCMessage resp{};
+        oz::sys_channel_recv(CAP_VFS_RECV, &resp);
+        
+        if (resp.data[0] != 0) return 0;
+        
+        std::size_t bytes_read = static_cast<std::size_t>(resp.data[1]);
+        const char* src = reinterpret_cast<const char*>(&resp.data[2]);
+        std::size_t to_copy = bytes_read > 16 ? 16 : bytes_read;
+        if (to_copy > size) to_copy = size;
+        for (std::size_t i = 0; i < to_copy; i++) {
+            buf[i] = src[i];
+        }
+        return to_copy;
     }
-    return to_copy;
+
+    std::size_t total_read = 0;
+    while (total_read < size) {
+        std::size_t chunk = size - total_read;
+        if (chunk > 64 * 1024) chunk = 64 * 1024;
+
+        oz::IPCMessage req{};
+        req.data[0] = static_cast<std::uint64_t>(oz::ipc::VfsCmd::READ);
+        req.data[1] = static_cast<std::uint64_t>(handle);
+        req.data[2] = static_cast<std::uint64_t>(offset + total_read);
+        req.data[3] = static_cast<std::uint64_t>(chunk);
+
+        oz::IPCMessage resp{};
+        oz::sys_channel_send(CAP_VFS_SEND, &req);
+        oz::sys_channel_recv(CAP_VFS_RECV, &resp);
+
+        if (resp.data[0] != 0) break;
+        std::size_t bytes_read = static_cast<std::size_t>(resp.data[1]);
+        if (bytes_read == 0) break;
+
+        for (std::size_t i = 0; i < bytes_read; i++) {
+            buf[total_read + i] = g_vfs_shared_buf[i];
+        }
+        total_read += bytes_read;
+        if (bytes_read < chunk) break;
+    }
+    return total_read;
 }
 
 // Helper: get file size
@@ -262,10 +294,53 @@ extern "C" void _start() {
     oz::sys_cspace_cap_insert(vfs_proc.cspace_cap, oz::CAP_UNTYPED, oz::CAP_UNTYPED, static_cast<std::uint32_t>(oz::CapRights::ALL));
     oz::sys_cspace_cap_insert(vfs_proc.cspace_cap, 242, shared_buf_frame, static_cast<std::uint32_t>(oz::CapRights::ALL));
 
+    // Shared buffer for VFS client data transfer (16 pages = 64KB)
+    std::uint32_t vfs_client_frame = oz::sys_frame_alloc(oz::CAP_UNTYPED, 16);
+    oz::sys_cspace_cap_insert(vfs_proc.cspace_cap, 243, vfs_client_frame, static_cast<std::uint32_t>(oz::CapRights::ALL));
+    oz::sys_cspace_cap_insert(oz::CAP_SELF_CSPACE, CAP_VFS_SHARED_BUF, vfs_client_frame, static_cast<std::uint32_t>(oz::CapRights::ALL));
+
+    if (oz::sys_vspace_map_with_pagetables(oz::CAP_SELF_VSPACE, oz::CAP_UNTYPED, CAP_VFS_SHARED_BUF, VFS_SHARED_BUF_VIRT, 0x01, 16 * 4096) == 0) {
+        g_vfs_shared_buf = reinterpret_cast<char*>(VFS_SHARED_BUF_VIRT);
+        oz::sys_write("[Init] Mapped VFS client shared buffer (64KB).\n\r");
+    }
+
     oz::sys_tcb_resume(vfs_proc.tcb_cap);
     oz::sys_write("[Init] VFS server spawned successfully.\n\r");
 
-    // 6. Spawn xHCI Server
+    // 6. Spawn Interactive Shell Server
+    std::uint32_t xhci_key_send = cons_send;
+    oz::loader::TarFile shell_file = oz::loader::tar_find_file(initrd_ptr, initrd_size, "shell");
+    if (shell_file.data) {
+        auto shell_proc = oz::loader::spawn_process(oz::CAP_UNTYPED, oz::CAP_SELF_VSPACE, shell_file.data, shell_file.size);
+        if (shell_proc.success) {
+            std::uint32_t shell_input_send = 0;
+            std::uint32_t shell_input_recv = 0;
+            oz::sys_channel_create(oz::CAP_UNTYPED, &shell_input_send, &shell_input_recv);
+            xhci_key_send = shell_input_send;
+
+            // Slot 0: Self VSpace
+            oz::sys_cspace_cap_insert(shell_proc.cspace_cap, 0, shell_proc.vspace_cap, static_cast<std::uint32_t>(oz::CapRights::ALL));
+            // Slot 1: Console Send
+            oz::sys_cspace_cap_insert(shell_proc.cspace_cap, 1, cons_send, static_cast<std::uint32_t>(oz::CapRights::WRITE | oz::CapRights::GRANT));
+            // Slot 2: Shell Input Recv (from xHCI)
+            oz::sys_cspace_cap_insert(shell_proc.cspace_cap, 2, shell_input_recv, static_cast<std::uint32_t>(oz::CapRights::READ));
+            // Slot 3: VFS Send
+            oz::sys_cspace_cap_insert(shell_proc.cspace_cap, 3, init_vfs_send, static_cast<std::uint32_t>(oz::CapRights::WRITE | oz::CapRights::GRANT));
+            // Slot 4: VFS Recv
+            oz::sys_cspace_cap_insert(shell_proc.cspace_cap, 4, init_vfs_recv, static_cast<std::uint32_t>(oz::CapRights::READ));
+            // Slot 5: VFS Shared Buffer
+            oz::sys_cspace_cap_insert(shell_proc.cspace_cap, 5, vfs_client_frame, static_cast<std::uint32_t>(oz::CapRights::ALL));
+            // Slot 240: Untyped
+            oz::sys_cspace_cap_insert(shell_proc.cspace_cap, oz::CAP_UNTYPED, oz::CAP_UNTYPED, static_cast<std::uint32_t>(oz::CapRights::ALL));
+
+            oz::sys_tcb_resume(shell_proc.tcb_cap);
+            oz::sys_write("[Init] Interactive Shell spawned successfully.\n\r");
+        } else {
+            oz::sys_write("[Init] ERROR: Failed to spawn shell process!\n\r");
+        }
+    }
+
+    // 7. Spawn xHCI Server
     oz::loader::TarFile xhci_file = oz::loader::tar_find_file(initrd_ptr, initrd_size, "xhci");
     if (xhci_file.data) {
         auto xhci_proc = oz::loader::spawn_process(oz::CAP_UNTYPED, oz::CAP_SELF_VSPACE, xhci_file.data, xhci_file.size);
@@ -276,7 +351,7 @@ extern "C" void _start() {
 
             std::uint32_t irq_handler = oz::sys_irq_handler_create(oz::CAP_UNTYPED, 0x40, irq_send);
 
-            oz::sys_cspace_cap_insert(xhci_proc.cspace_cap, 1, cons_send, static_cast<std::uint32_t>(oz::CapRights::WRITE | oz::CapRights::GRANT));
+            oz::sys_cspace_cap_insert(xhci_proc.cspace_cap, 1, xhci_key_send, static_cast<std::uint32_t>(oz::CapRights::WRITE | oz::CapRights::GRANT));
             oz::sys_cspace_cap_insert(xhci_proc.cspace_cap, 2, irq_recv, static_cast<std::uint32_t>(oz::CapRights::READ));
             oz::sys_cspace_cap_insert(xhci_proc.cspace_cap, 3, irq_handler, static_cast<std::uint32_t>(oz::CapRights::ALL));
             oz::sys_cspace_cap_insert(xhci_proc.cspace_cap, oz::CAP_UNTYPED, oz::CAP_UNTYPED, static_cast<std::uint32_t>(oz::CapRights::ALL));

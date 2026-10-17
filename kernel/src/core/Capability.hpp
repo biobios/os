@@ -43,14 +43,62 @@ protected:
     std::uint32_t ref_count{1};
     ObjectType obj_type_{ObjectType::Unknown};
     bool is_untyped_backed_{false};
+    bool is_revoked_{false};
+
+    KernelObject* cdt_parent_{nullptr};
+    KernelObject* cdt_first_child_{nullptr};
+    KernelObject* cdt_next_sibling_{nullptr};
+    KernelObject* cdt_prev_sibling_{nullptr};
+
 public:
     explicit KernelObject(ObjectType t = ObjectType::Unknown, bool untyped = false)
         : obj_type_(t), is_untyped_backed_(untyped) {}
-    virtual ~KernelObject() = default;
+    virtual ~KernelObject() {
+        detachFromParent();
+    }
 
     ObjectType objectType() const { return obj_type_; }
     bool isUntypedBacked() const { return is_untyped_backed_; }
     void setUntypedBacked(bool untyped) { is_untyped_backed_ = untyped; }
+
+    bool isRevoked() const { return is_revoked_; }
+    void markRevoked() { is_revoked_ = true; }
+
+    KernelObject* cdtParent() const { return cdt_parent_; }
+    KernelObject* cdtFirstChild() const { return cdt_first_child_; }
+    KernelObject* cdtNextSibling() const { return cdt_next_sibling_; }
+
+    void addChild(KernelObject* child) {
+        if (!child || child == this) return;
+        child->cdt_parent_ = this;
+        child->cdt_next_sibling_ = cdt_first_child_;
+        child->cdt_prev_sibling_ = nullptr;
+        if (cdt_first_child_) {
+            cdt_first_child_->cdt_prev_sibling_ = child;
+        }
+        cdt_first_child_ = child;
+    }
+
+    void removeChild(KernelObject* child) {
+        if (!child) return;
+        if (child->cdt_prev_sibling_) {
+            child->cdt_prev_sibling_->cdt_next_sibling_ = child->cdt_next_sibling_;
+        } else if (cdt_first_child_ == child) {
+            cdt_first_child_ = child->cdt_next_sibling_;
+        }
+        if (child->cdt_next_sibling_) {
+            child->cdt_next_sibling_->cdt_prev_sibling_ = child->cdt_prev_sibling_;
+        }
+        child->cdt_parent_ = nullptr;
+        child->cdt_next_sibling_ = nullptr;
+        child->cdt_prev_sibling_ = nullptr;
+    }
+
+    void detachFromParent() {
+        if (cdt_parent_) {
+            cdt_parent_->removeChild(this);
+        }
+    }
 
     void add_ref() { ref_count++; }
     void release() {
@@ -127,7 +175,7 @@ struct Capability {
         }
     }
 
-    bool is_valid() const { return object != nullptr; }
+    bool is_valid() const { return object != nullptr && !object->isRevoked(); }
 };
 
 using CapID = std::uint32_t;
@@ -152,6 +200,9 @@ public:
 
     Capability get(CapID id) const {
         if (id < MAX_CAPS) {
+            if (slots[id].object && slots[id].object->isRevoked()) {
+                return Capability();
+            }
             return slots[id];
         }
         return Capability();

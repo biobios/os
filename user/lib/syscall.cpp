@@ -38,6 +38,14 @@ bool sys_channel_create(std::uint32_t untyped_cap, std::uint32_t* out_cap0, std:
     return syscall(3, untyped_cap, reinterpret_cast<std::uint64_t>(out_cap0), reinterpret_cast<std::uint64_t>(out_cap1), 0, 0, 0) == 0;
 }
 
+bool sys_call(std::uint32_t cap_id, const IPCMessage* send_msg, IPCMessage* recv_msg) {
+    return syscall(27, cap_id, reinterpret_cast<std::uint64_t>(send_msg), reinterpret_cast<std::uint64_t>(recv_msg), 0, 0, 0) == 0;
+}
+
+bool sys_reply_recv(std::uint32_t cap_id, const IPCMessage* reply_msg, IPCMessage* recv_msg) {
+    return syscall(28, cap_id, reinterpret_cast<std::uint64_t>(reply_msg), reinterpret_cast<std::uint64_t>(recv_msg), 0, 0, 0) == 0;
+}
+
 std::size_t sys_write(const char* str) {
     IPCMessage msg;
     msg.has_cap = false;
@@ -147,6 +155,10 @@ int sys_tcb_resume(std::uint32_t tcb_cap) {
 
 int sys_tcb_suspend(std::uint32_t tcb_cap) {
     return static_cast<int>(syscall(14, tcb_cap, 0, 0, 0, 0, 0));
+}
+
+int sys_tcb_set_fault_endpoint(std::uint32_t tcb_cap, std::uint32_t ep_cap) {
+    return static_cast<int>(syscall(29, tcb_cap, ep_cap, 0, 0, 0, 0));
 }
 
 std::uint32_t sys_cspace_create(std::uint32_t untyped_cap) {

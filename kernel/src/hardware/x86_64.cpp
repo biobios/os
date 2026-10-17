@@ -8,6 +8,8 @@
 #include "core/IRQDispatch.hpp"
 #include "core/IRQHandler.hpp"
 #include "core/Thread.hpp"
+#include "core/Syscall.hpp"
+#include "core/Channel.hpp"
 #include "utils/utils.hpp"
 
 namespace {
@@ -128,15 +130,111 @@ namespace{
     __attribute__((interrupt))
     void int13Handler(oz::x86_64::ExceptionFrame* frame, std::uint64_t error_code) { dumpExceptionInfo("#GP General Protection", frame, error_code); }
 
-    __attribute__((interrupt))
-    void int14Handler(oz::x86_64::ExceptionFrame* frame, std::uint64_t error_code) { 
+    extern "C" void pageFaultHandler(std::uint64_t* regs) {
+        using namespace oz;
         std::uint64_t cr2;
         __asm__ volatile("mov %%cr2, %0" : "=r"(cr2));
+
+        std::uint64_t error_code = regs[15];
+        std::uint64_t rip = regs[16];
+        std::uint64_t cs  = regs[17];
+        std::uint64_t rsp = regs[19];
+
+        // If page fault from user space and thread has a Fault Endpoint
+        if ((cs & 3) != 0 && oz::g_get_current_thread_func) {
+            Thread* current = oz::g_get_current_thread_func();
+            if (current && current->fault_ep) {
+                ChannelEndpoint* ep = current->fault_ep;
+                ChannelEndpoint* peer = ep->get_peer();
+                if (peer) {
+                    InternalIPCMessage msg{};
+                    msg.user_msg.data[0] = cr2;
+                    msg.user_msg.data[1] = error_code;
+                    msg.user_msg.data[2] = rip;
+                    msg.user_msg.data[3] = rsp;
+                    msg.user_msg.has_cap = false;
+
+                    Thread* pager = peer->pop_recv_waiter();
+                    if (pager) {
+                        peer->set_rendezvous_msg(msg);
+                        pager->state = ThreadState::Ready;
+                        if (oz::g_unblock_thread_func) {
+                            oz::g_unblock_thread_func(pager);
+                        }
+                    } else {
+                        ep->set_rendezvous_msg(msg);
+                    }
+
+                    current->state = ThreadState::Blocked;
+                    if (oz::g_block_thread_func) {
+                        oz::g_block_thread_func();
+                    }
+                    return; // Resumed after page was mapped!
+                }
+            }
+        }
+
+        // Unhandled page fault: dump and halt
         char hexStr[17];
         dprint("\nCR2: 0x");
         oz::utils::to_hex(cr2, hexStr);
         dprint(hexStr);
-        dumpExceptionInfo("#PF Page Fault", frame, error_code); 
+        dprint("\nRIP: 0x");
+        oz::utils::to_hex(rip, hexStr);
+        dprint(hexStr);
+        dprint("\nError Code: 0x");
+        oz::utils::to_hex(error_code, hexStr);
+        dprint(hexStr);
+        dprint("\nUnhandled Page Fault! System halted.\n\r");
+        while (1) {
+            __asm__ volatile("cli; hlt");
+        }
+    }
+
+    extern "C" __attribute__((naked)) void page_fault_entry() {
+        __asm__ volatile(
+            // Hardware has pushed: SS, RSP, RFLAGS, CS, RIP, ERROR_CODE
+            "pushq %rax\n"
+            "pushq %rcx\n"
+            "pushq %rdx\n"
+            "pushq %rbx\n"
+            "pushq %rbp\n"
+            "pushq %rsi\n"
+            "pushq %rdi\n"
+            "pushq %r8\n"
+            "pushq %r9\n"
+            "pushq %r10\n"
+            "pushq %r11\n"
+            "pushq %r12\n"
+            "pushq %r13\n"
+            "pushq %r14\n"
+            "pushq %r15\n"
+
+            "movq %rsp, %rdi\n"
+            "subq $8, %rsp\n"
+            "call pageFaultHandler\n"
+            "addq $8, %rsp\n"
+
+            "popq %r15\n"
+            "popq %r14\n"
+            "popq %r13\n"
+            "popq %r12\n"
+            "popq %r11\n"
+            "popq %r10\n"
+            "popq %r9\n"
+            "popq %r8\n"
+            "popq %rdi\n"
+            "popq %rsi\n"
+            "popq %rbp\n"
+            "popq %rbx\n"
+            "popq %rdx\n"
+            "popq %rcx\n"
+            "popq %rax\n"
+
+            // Pop error code
+            "addq $8, %rsp\n"
+            "iretq\n"
+        );
     }
 
     InterruptDescriptor idt[oz::x86_64::MAX_INTERRUPTS_COUNT];
@@ -162,7 +260,7 @@ void oz::x86_64::initIDTR() {
     setInterruptDescriptor(6, reinterpret_cast<void*>(int06Handler));
     setInterruptDescriptor(8, reinterpret_cast<void*>(int08Handler));
     setInterruptDescriptor(13, reinterpret_cast<void*>(int13Handler));
-    setInterruptDescriptor(14, reinterpret_cast<void*>(int14Handler));
+    setInterruptDescriptor(14, reinterpret_cast<void*>(page_fault_entry));
 
     volatile std::uint64_t idtr[2];
     idtr[0] = (reinterpret_cast<std::uint64_t>(&idt) << 16) | (sizeof(idt) - 1);
@@ -184,14 +282,53 @@ namespace {
         oz::x86_64::notifyEndOfInterrupt();
     }
 
-    __attribute__((interrupt))
-    void timerInterruptStub(oz::x86_64::ExceptionFrame* frame) {
-        (void)frame;
+    extern "C" void timerInterruptHandler() {
         oz::x86_64::notifyEndOfInterrupt();
         auto tick_fn = oz::irq::getTimerTickFn();
         if (tick_fn) {
             tick_fn();
         }
+    }
+
+    extern "C" __attribute__((naked)) void timer_interrupt_entry() {
+        __asm__ volatile(
+            // Hardware has pushed: SS, RSP, RFLAGS, CS, RIP
+            "pushq %rax\n"
+            "pushq %rcx\n"
+            "pushq %rdx\n"
+            "pushq %rbx\n"
+            "pushq %rbp\n"
+            "pushq %rsi\n"
+            "pushq %rdi\n"
+            "pushq %r8\n"
+            "pushq %r9\n"
+            "pushq %r10\n"
+            "pushq %r11\n"
+            "pushq %r12\n"
+            "pushq %r13\n"
+            "pushq %r14\n"
+            "pushq %r15\n"
+
+            "call timerInterruptHandler\n"
+
+            "popq %r15\n"
+            "popq %r14\n"
+            "popq %r13\n"
+            "popq %r12\n"
+            "popq %r11\n"
+            "popq %r10\n"
+            "popq %r9\n"
+            "popq %r8\n"
+            "popq %rdi\n"
+            "popq %rsi\n"
+            "popq %rbp\n"
+            "popq %rbx\n"
+            "popq %rdx\n"
+            "popq %rcx\n"
+            "popq %rax\n"
+
+            "iretq\n"
+        );
     }
 
 #define IRQ_STUB(N) \
@@ -211,7 +348,7 @@ namespace {
 }
 
 void oz::x86_64::initIRQStubs() {
-    setInterruptDescriptor(APIC_TIMER_VECTOR, reinterpret_cast<void*>(timerInterruptStub));
+    setInterruptDescriptor(APIC_TIMER_VECTOR, reinterpret_cast<void*>(timer_interrupt_entry));
 #define SET_STUB(N) setInterruptDescriptor(0x##N, reinterpret_cast<void*>(irqStub##N))
     SET_STUB(30); SET_STUB(31); SET_STUB(32); SET_STUB(33);
     SET_STUB(34); SET_STUB(35); SET_STUB(36); SET_STUB(37);

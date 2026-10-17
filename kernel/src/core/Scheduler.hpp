@@ -61,8 +61,9 @@ public:
 
     void initMainThread() {
         alignas(Thread) static std::uint8_t main_thread_storage[sizeof(Thread)];
+        alignas(16) static std::uint8_t main_stack[4096];
         Thread* thread = new (main_thread_storage) Thread(
-            next_thread_id++, nullptr, 0, PageBlock<>{nullptr}, 0
+            next_thread_id++, main_stack, sizeof(main_stack), PageBlock<>{nullptr}, 0
         );
         thread->is_untyped_backed = true;
         thread->state = ThreadState::Running;
@@ -188,7 +189,9 @@ public:
         }
         
         if (prev_thread) {
-            switch_context(&prev_thread->rsp, next_thread->rsp);
+            if (prev_thread != next_thread) {
+                switch_context(&prev_thread->rsp, next_thread->rsp);
+            }
         } else {
             void* dummy_rsp;
             switch_context(&dummy_rsp, next_thread->rsp);

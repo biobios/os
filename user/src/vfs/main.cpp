@@ -81,6 +81,14 @@ extern "C" void _start() {
     oz::VFS vfs;
     vfs.mountRoot(&fat32);
 
+    // Map shared client buffer (slot 243) if present
+    static constexpr std::uint64_t CLIENT_BUF_VIRT = 0x300000000000ULL;
+    char* client_buf = nullptr;
+    if (oz::sys_vspace_map_with_pagetables(oz::CAP_SELF_VSPACE, oz::CAP_UNTYPED, 243, CLIENT_BUF_VIRT, 0x01, 16 * 4096) == 0) {
+        client_buf = reinterpret_cast<char*>(CLIENT_BUF_VIRT);
+        oz::sys_write("VFS: Client shared buffer mapped (64KB).\n\r");
+    }
+
     // Main request loop
     oz::sys_write("VFS: Ready to serve file requests.\n\r");
     while (true) {
@@ -119,17 +127,21 @@ extern "C" void _start() {
                     break;
                 }
                 
-                // Limit read size to what fits in IPC response (24 bytes in data[1..3])
-                if (size > 24) size = 24;
-                
                 f->seek(offset);
-                char buf[24] = {};
-                std::size_t bytes_read = f->read(buf, size);
-                
-                resp.data[0] = 0; // success
-                resp.data[1] = bytes_read;
-                // Pack read data into data[2..3]
-                oz::utils::memcpy(&resp.data[2], buf, bytes_read > 16 ? 16 : bytes_read);
+                if (client_buf) {
+                    if (size > 64 * 1024) size = 64 * 1024;
+                    std::size_t bytes_read = f->read(client_buf, size);
+                    resp.data[0] = 0; // success
+                    resp.data[1] = bytes_read;
+                } else {
+                    if (size > 24) size = 24;
+                    char buf[24] = {};
+                    std::size_t bytes_read = f->read(buf, size);
+                    resp.data[0] = 0; // success
+                    resp.data[1] = bytes_read;
+                    // Pack read data into data[2..3]
+                    oz::utils::memcpy(&resp.data[2], buf, bytes_read > 16 ? 16 : bytes_read);
+                }
                 break;
             }
             case oz::ipc::VfsCmd::CLOSE: {
@@ -153,6 +165,41 @@ extern "C" void _start() {
                     resp.data[1] = f->getSize();
                 } else {
                     resp.data[0] = 1;
+                }
+                break;
+            }
+            case oz::ipc::VfsCmd::LIST_DIR: {
+                char path[25];
+                extract_path(req, path, sizeof(path));
+                auto dir = vfs.openDir(path);
+                if (!dir) {
+                    resp.data[0] = 1; // not found
+                    break;
+                }
+                
+                std::size_t entry_count = 0;
+                if (client_buf) {
+                    char* out = client_buf;
+                    std::size_t max_out = 64 * 1024 - 1;
+                    std::size_t curr = 0;
+                    char name[64];
+                    bool isDir = false;
+                    while (dir->readEntry(name, sizeof(name), isDir) && curr + 70 < max_out) {
+                        for (int k = 0; name[k] != '\0'; k++) {
+                            out[curr++] = name[k];
+                        }
+                        if (isDir) {
+                            out[curr++] = '/';
+                        }
+                        out[curr++] = '\n';
+                        entry_count++;
+                    }
+                    out[curr] = '\0';
+                    resp.data[0] = 0;
+                    resp.data[1] = entry_count;
+                    resp.data[2] = curr;
+                } else {
+                    resp.data[0] = 2; // buffer not available
                 }
                 break;
             }

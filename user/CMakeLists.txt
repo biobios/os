@@ -54,8 +54,13 @@ add_executable(display src/display/main.cpp src/display/linker.ld)
 target_link_libraries(display oz_syscall)
 target_link_options(display PRIVATE "-T${CMAKE_CURRENT_SOURCE_DIR}/src/display/linker.ld" "-nostdlib" "-static")
 
+# shell process (Interactive shell)
+add_executable(shell src/shell/main.cpp src/shell/linker.ld)
+target_link_libraries(shell oz_syscall)
+target_link_options(shell PRIVATE "-T${CMAKE_CURRENT_SOURCE_DIR}/src/shell/linker.ld" "-nostdlib" "-static")
+
 add_custom_target(initrd ALL
-    COMMAND tar -cvf ${CMAKE_SOURCE_DIR}/assets/initrd.tar -C ${CMAKE_CURRENT_BINARY_DIR} init console vfs ahci xhci display
-    DEPENDS init console vfs ahci xhci display
+    COMMAND tar -cvf ${CMAKE_SOURCE_DIR}/assets/initrd.tar -C ${CMAKE_CURRENT_BINARY_DIR} init console vfs ahci xhci display shell
+    DEPENDS init console vfs ahci xhci display shell
 )
 target_sources(oz_syscall PRIVATE lib/malloc.cpp)

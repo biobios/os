@@ -72,6 +72,149 @@ static CSpace* get_cspace() {
 }
 
 // ===========================================================================
+// ===========================================================================
+// Channel IPC helpers
+// ===========================================================================
+
+static int do_channel_send(CSpace* cspace, CapID ep_id, const IPCMessage* msg) {
+    if (!cspace || !msg) return -1;
+    
+    ChannelEndpoint* ep = get_cap_typed<ChannelEndpoint>(
+        cspace, ep_id, ObjectType::ChannelEndpoint, CapRights::WRITE);
+    if (!ep || ep->is_peer_closed()) return -1;
+    ChannelEndpoint* peer = ep->get_peer();
+    if (!peer) return -1;
+
+    // Build internal message with optional cap attachment
+    InternalIPCMessage internal;
+    internal.user_msg = *msg;
+    
+    if (msg->has_cap) {
+        // Transfer requires GRANT right on the endpoint
+        Capability ep_cap_check = cspace->get(ep_id);
+        if ((ep_cap_check.rights & CapRights::GRANT) == CapRights::NONE) return -1;
+        
+        // Extract the capability from sender's CSpace
+        Capability src_cap = cspace->get(msg->transferred_cap);
+        if (!src_cap.is_valid()) return -1;
+        
+        // Attach cap to internal message (copy semantics for refcount)
+        internal.attached_cap = src_cap;
+        
+        // Remove from sender's CSpace (move semantics)
+        cspace->remove(msg->transferred_cap);
+    }
+
+    // Synchronous rendezvous: check if a receiver is already waiting on peer
+    Thread* receiver = peer->pop_recv_waiter();
+    if (receiver) {
+        if (internal.attached_cap.is_valid() && receiver->cspace) {
+            CapID new_id = receiver->cspace->add(internal.attached_cap);
+            if (new_id == INVALID_CAP_ID) {
+                internal.user_msg.has_cap = false;
+            } else {
+                internal.user_msg.transferred_cap = new_id;
+                internal.user_msg.has_cap = true;
+            }
+            internal.attached_cap = Capability();
+        }
+        peer->set_rendezvous_msg(internal);
+        receiver->state = ThreadState::Ready;
+        if (g_unblock_thread_func) {
+            g_unblock_thread_func(receiver);
+        }
+        return 0;
+    }
+
+    // No receiver is waiting: sender must block until rendezvous
+    if (!g_get_current_thread_func || !g_block_thread_func) return -1;
+    Thread* current = g_get_current_thread_func();
+    if (!current) return -1;
+
+    current->send_msg = internal;
+    current->state = ThreadState::BlockedOnSend;
+    ep->add_send_waiter(current);
+
+    g_block_thread_func();
+
+    // Woken up after receiver accepted the message
+    current->send_msg = InternalIPCMessage{};
+    if (ep->is_peer_closed()) return -1;
+    return 0;
+}
+
+static int do_channel_recv(CSpace* cspace, CapID ep_id, IPCMessage* msg) {
+    if (!cspace || !msg) return -1;
+
+    ChannelEndpoint* ep = get_cap_typed<ChannelEndpoint>(
+        cspace, ep_id, ObjectType::ChannelEndpoint, CapRights::READ);
+    if (!ep) return -1;
+
+    // 1. Check for pending asynchronous notifications (e.g. IRQ)
+    std::uint64_t notif_data = 0;
+    if (ep->check_and_clear_notification(notif_data)) {
+        msg->data[0] = notif_data;
+        msg->data[1] = 0;
+        msg->data[2] = 0;
+        msg->data[3] = 0;
+        msg->has_cap = false;
+        return 0;
+    }
+
+    ChannelEndpoint* peer = ep->get_peer();
+
+    // 2. Synchronous rendezvous: check if a sender is already waiting on peer
+    Thread* sender = peer ? peer->pop_send_waiter() : nullptr;
+    if (sender) {
+        *msg = sender->send_msg.user_msg;
+        if (sender->send_msg.attached_cap.is_valid()) {
+            CapID new_id = cspace->add(sender->send_msg.attached_cap);
+            sender->send_msg.attached_cap = Capability();
+            if (new_id == INVALID_CAP_ID) {
+                msg->has_cap = false;
+            } else {
+                msg->transferred_cap = new_id;
+                msg->has_cap = true;
+            }
+        }
+        sender->state = ThreadState::Ready;
+        if (g_unblock_thread_func) {
+            g_unblock_thread_func(sender);
+        }
+        return 0;
+    }
+
+    // 3. No sender is waiting: receiver must block
+    if (!g_get_current_thread_func || !g_block_thread_func) return -1;
+    Thread* current = g_get_current_thread_func();
+    if (!current) return -1;
+
+    current->state = ThreadState::BlockedOnRecv;
+    ep->add_recv_waiter(current);
+
+    g_block_thread_func();
+
+    // Woken up by sender or notification
+    if (ep->check_and_clear_notification(notif_data)) {
+        msg->data[0] = notif_data;
+        msg->data[1] = 0;
+        msg->data[2] = 0;
+        msg->data[3] = 0;
+        msg->has_cap = false;
+        return 0;
+    }
+
+    InternalIPCMessage internal;
+    if (ep->pop_rendezvous_msg(internal)) {
+        *msg = internal.user_msg;
+        return 0;
+    }
+
+    if (ep->is_peer_closed()) return -1;
+    return -1;
+}
+
+// ===========================================================================
 // Syscall handlers
 // ===========================================================================
 
@@ -84,142 +227,14 @@ extern "C" std::uint64_t handleSyscall(std::uint64_t rdi, std::uint64_t rsi, std
         if (!cspace) return -1;
         if (!is_user_buffer(rsi, sizeof(IPCMessage))) return -1;
         const IPCMessage* msg = reinterpret_cast<const IPCMessage*>(rsi);
-        
-        ChannelEndpoint* ep = get_cap_typed<ChannelEndpoint>(
-            cspace, static_cast<CapID>(rdi), ObjectType::ChannelEndpoint, CapRights::WRITE);
-        if (!ep || ep->is_peer_closed()) return -1;
-        ChannelEndpoint* peer = ep->get_peer();
-        if (!peer) return -1;
-
-        // Build internal message with optional cap attachment
-        InternalIPCMessage internal;
-        internal.user_msg = *msg;
-        
-        if (msg->has_cap) {
-            // Transfer requires GRANT right on the endpoint
-            Capability ep_cap_check = cspace->get(static_cast<CapID>(rdi));
-            if ((ep_cap_check.rights & CapRights::GRANT) == CapRights::NONE) return -1;
-            
-            // Extract the capability from sender's CSpace
-            Capability src_cap = cspace->get(msg->transferred_cap);
-            if (!src_cap.is_valid()) return -1;
-            
-            // Attach cap to internal message (copy semantics for refcount)
-            internal.attached_cap = src_cap;
-            
-            // Remove from sender's CSpace (move semantics)
-            cspace->remove(msg->transferred_cap);
-        }
-
-        // Synchronous rendezvous: check if a receiver is already waiting on peer
-        Thread* receiver = peer->pop_recv_waiter();
-        if (receiver) {
-            if (internal.attached_cap.is_valid() && receiver->cspace) {
-                CapID new_id = receiver->cspace->add(internal.attached_cap);
-                if (new_id == INVALID_CAP_ID) {
-                    internal.user_msg.has_cap = false;
-                } else {
-                    internal.user_msg.transferred_cap = new_id;
-                    internal.user_msg.has_cap = true;
-                }
-                internal.attached_cap = Capability();
-            }
-            peer->set_rendezvous_msg(internal);
-            receiver->state = ThreadState::Ready;
-            if (g_unblock_thread_func) {
-                g_unblock_thread_func(receiver);
-            }
-            return 0;
-        }
-
-        // No receiver is waiting: sender must block until rendezvous
-        if (!g_get_current_thread_func || !g_block_thread_func) return -1;
-        Thread* current = g_get_current_thread_func();
-        if (!current) return -1;
-
-        current->send_msg = internal;
-        current->state = ThreadState::BlockedOnSend;
-        ep->add_send_waiter(current);
-
-        g_block_thread_func();
-
-        // Woken up after receiver accepted the message
-        current->send_msg = InternalIPCMessage{};
-        if (ep->is_peer_closed()) return -1;
-        return 0;
+        return do_channel_send(cspace, static_cast<CapID>(rdi), msg);
     } else if (syscall_number == 2) {
         // channel_recv
         CSpace* cspace = get_cspace();
         if (!cspace) return -1;
         if (!is_user_buffer(rsi, sizeof(IPCMessage))) return -1;
         IPCMessage* msg = reinterpret_cast<IPCMessage*>(rsi);
-        
-        ChannelEndpoint* ep = get_cap_typed<ChannelEndpoint>(
-            cspace, static_cast<CapID>(rdi), ObjectType::ChannelEndpoint, CapRights::READ);
-        if (!ep) return -1;
-
-        // 1. Check for pending asynchronous notifications (e.g. IRQ)
-        std::uint64_t notif_data = 0;
-        if (ep->check_and_clear_notification(notif_data)) {
-            msg->data[0] = notif_data;
-            msg->data[1] = 0;
-            msg->data[2] = 0;
-            msg->data[3] = 0;
-            msg->has_cap = false;
-            return 0;
-        }
-
-        ChannelEndpoint* peer = ep->get_peer();
-
-        // 2. Synchronous rendezvous: check if a sender is already waiting on peer
-        Thread* sender = peer ? peer->pop_send_waiter() : nullptr;
-        if (sender) {
-            *msg = sender->send_msg.user_msg;
-            if (sender->send_msg.attached_cap.is_valid()) {
-                CapID new_id = cspace->add(sender->send_msg.attached_cap);
-                sender->send_msg.attached_cap = Capability();
-                if (new_id == INVALID_CAP_ID) {
-                    msg->has_cap = false;
-                } else {
-                    msg->transferred_cap = new_id;
-                    msg->has_cap = true;
-                }
-            }
-            sender->state = ThreadState::Ready;
-            if (g_unblock_thread_func) {
-                g_unblock_thread_func(sender);
-            }
-            return 0;
-        }
-
-        // 3. No sender is waiting: receiver must block
-        if (!g_get_current_thread_func || !g_block_thread_func) return -1;
-        Thread* current = g_get_current_thread_func();
-        if (!current) return -1;
-
-        current->state = ThreadState::BlockedOnRecv;
-        ep->add_recv_waiter(current);
-
-        g_block_thread_func();
-
-        // Woken up by sender or notification
-        if (ep->check_and_clear_notification(notif_data)) {
-            msg->data[0] = notif_data;
-            msg->data[1] = 0;
-            msg->data[2] = 0;
-            msg->data[3] = 0;
-            msg->has_cap = false;
-            return 0;
-        }
-
-        InternalIPCMessage internal;
-        if (ep->pop_rendezvous_msg(internal)) {
-            *msg = internal.user_msg;
-            return 0;
-        }
-
-        if (ep->is_peer_closed()) return -1;
-        return -1;
+        return do_channel_recv(cspace, static_cast<CapID>(rdi), msg);
     } else if (syscall_number == 3) {
         // channel_create(untyped_cap, out0, out1)
         CSpace* cspace = get_cspace();
@@ -635,6 +650,41 @@ extern "C" std::uint64_t handleSyscall(std::uint64_t rdi, std::uint64_t rsi, std
         if (!frame) return 0;
 
         return static_cast<std::uint64_t>(frame->size());
+    } else if (syscall_number == 27) {
+        // sys_call(ep_cap, send_msg, recv_msg)
+        CSpace* cspace = get_cspace();
+        if (!cspace) return -1;
+        if (!is_user_buffer(rsi, sizeof(IPCMessage))) return -1;
+        if (!is_user_buffer(rdx, sizeof(IPCMessage))) return -1;
+
+        int res = do_channel_send(cspace, static_cast<CapID>(rdi), reinterpret_cast<const IPCMessage*>(rsi));
+        if (res != 0) return -1;
+        return do_channel_recv(cspace, static_cast<CapID>(rdi), reinterpret_cast<IPCMessage*>(rdx));
+    } else if (syscall_number == 28) {
+        // sys_reply_recv(ep_cap, reply_msg, recv_msg)
+        CSpace* cspace = get_cspace();
+        if (!cspace) return -1;
+        if (rsi != 0) {
+            if (!is_user_buffer(rsi, sizeof(IPCMessage))) return -1;
+            do_channel_send(cspace, static_cast<CapID>(rdi), reinterpret_cast<const IPCMessage*>(rsi));
+        }
+        if (!is_user_buffer(rdx, sizeof(IPCMessage))) return -1;
+        return do_channel_recv(cspace, static_cast<CapID>(rdi), reinterpret_cast<IPCMessage*>(rdx));
+    } else if (syscall_number == 29) {
+        // sys_tcb_set_fault_endpoint(tcb_cap, ep_cap)
+        CSpace* cspace = get_cspace();
+        if (!cspace) return -1;
+
+        TCB* tcb = get_cap_typed<TCB>(
+            cspace, static_cast<CapID>(rdi), ObjectType::TCB, CapRights::WRITE);
+        if (!tcb) return -1;
+
+        ChannelEndpoint* ep = get_cap_typed<ChannelEndpoint>(
+            cspace, static_cast<CapID>(rsi), ObjectType::ChannelEndpoint, CapRights::WRITE | CapRights::READ);
+        if (!ep) return -1;
+
+        tcb->setFaultEndpoint(ep);
+        return 0;
     }
     
     return static_cast<std::uint64_t>(-1);

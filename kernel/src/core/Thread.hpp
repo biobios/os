@@ -71,6 +71,7 @@ public:
     CSpace* cspace{nullptr};
     std::uint64_t user_rip{0};
     std::uint64_t user_rsp{0};
+    ChannelEndpoint* fault_ep{nullptr};
 
     Thread(std::uint64_t id, void* stack, std::uint64_t size, PageBlock<> block, std::uint8_t level, PhysicalAddress<PageTable> pml4_phys = PhysicalAddressProvider::nullPhysicalAddress<PageTable>())
         : id(id), rsp(reinterpret_cast<std::uint8_t*>(stack) + size), 

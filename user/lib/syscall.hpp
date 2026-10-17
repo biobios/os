@@ -49,6 +49,8 @@ std::size_t sys_write(const char* str);
 bool sys_channel_send(std::uint32_t cap_id, const IPCMessage* msg);
 bool sys_channel_recv(std::uint32_t cap_id, IPCMessage* msg);
 bool sys_channel_create(std::uint32_t untyped_cap, std::uint32_t* out_cap0, std::uint32_t* out_cap1);
+bool sys_call(std::uint32_t cap_id, const IPCMessage* send_msg, IPCMessage* recv_msg);
+bool sys_reply_recv(std::uint32_t cap_id, const IPCMessage* reply_msg, IPCMessage* recv_msg);
 
 // Capability-based memory management
 int sys_vspace_map(std::uint32_t vspace_cap, std::uint32_t frame_cap,
@@ -80,6 +82,7 @@ int sys_tcb_configure(std::uint32_t tcb_cap, std::uint32_t cspace_cap,
                       std::uint64_t user_rsp);
 int sys_tcb_resume(std::uint32_t tcb_cap);
 int sys_tcb_suspend(std::uint32_t tcb_cap);
+int sys_tcb_set_fault_endpoint(std::uint32_t tcb_cap, std::uint32_t ep_cap);
 std::uint32_t sys_cspace_create(std::uint32_t untyped_cap);
 int sys_cspace_cap_insert(std::uint32_t cspace_cap, std::uint32_t target_slot,
                           std::uint32_t src_cap, std::uint32_t rights);
