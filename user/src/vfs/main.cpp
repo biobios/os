@@ -158,6 +158,33 @@ extern "C" void _start() {
                 }
                 break;
             }
+            case oz::ipc::VfsCmd::WRITE: {
+                int handle = static_cast<int>(req.data[1]);
+                std::size_t offset = static_cast<std::size_t>(req.data[2]);
+                std::size_t size = static_cast<std::size_t>(req.data[3]);
+
+                oz::File* f = get_file(handle);
+                if (!f) {
+                    resp.data[0] = 1;
+                    break;
+                }
+
+                if (!client_buf) {
+                    resp.data[0] = 2; // buffer not available
+                    break;
+                }
+
+                if (size > 64 * 1024) size = 64 * 1024;
+                if (!f->seek(offset)) {
+                    resp.data[0] = 3; // seek failed
+                    break;
+                }
+
+                std::size_t bytes_written = f->write(client_buf, size);
+                resp.data[0] = 0; // success
+                resp.data[1] = bytes_written;
+                break;
+            }
             case oz::ipc::VfsCmd::CLOSE: {
                 int handle = static_cast<int>(req.data[1]);
                 oz::File* f = get_file(handle);

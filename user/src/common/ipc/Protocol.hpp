@@ -37,7 +37,7 @@ enum class BlockCmd : std::uint64_t {
 enum class VfsCmd : std::uint64_t {
     OPEN         = 1,   // Open file:  data[1..3] = path (packed chars)
     READ         = 2,   // Read file:  data[1] = handle, data[2] = offset, data[3] = size
-    WRITE        = 3,   // Write file: data[1] = handle, data[2] = offset, data[3] = phys_buf
+    WRITE        = 3,   // Write file: data[1] = handle, data[2] = offset, data[3] = size
     CLOSE        = 4,   // Close file: data[1] = handle
     GET_SIZE     = 5,   // Get size:   data[1] = handle
     LIST_DIR     = 6,   // List dir:   data[1..3] = path (packed chars)

@@ -64,14 +64,34 @@ inline SpawnedProcess spawn_process(
     std::size_t elf_size,
     std::uint64_t staging_vaddr = 0x550000000000ULL
 ) {
-    (void)elf_size;
     SpawnedProcess result{};
 
-    if (!elf_data) return result;
+    if (!elf_data || elf_size < sizeof(elf::Elf64_Ehdr)) return result;
 
     const auto* ehdr = reinterpret_cast<const elf::Elf64_Ehdr*>(elf_data);
     if (!elf::isValidElf(ehdr)) {
         return result;
+    }
+
+    // Validate program header table boundaries
+    if (ehdr->e_phentsize < sizeof(elf::Elf64_Phdr) || ehdr->e_phnum == 0) {
+        return result;
+    }
+    std::uint64_t ph_table_size = static_cast<std::uint64_t>(ehdr->e_phnum) * ehdr->e_phentsize;
+    if (ehdr->e_phoff > elf_size || ph_table_size > elf_size - ehdr->e_phoff) {
+        return result;
+    }
+
+    // Pre-validate all PT_LOAD segments before allocating any kernel resources
+    for (int i = 0; i < ehdr->e_phnum; ++i) {
+        const auto* p = reinterpret_cast<const elf::Elf64_Phdr*>(
+            elf_data + ehdr->e_phoff + static_cast<std::uint64_t>(i) * ehdr->e_phentsize
+        );
+        if (p->p_type != elf::PT_LOAD) continue;
+
+        if (p->p_filesz > p->p_memsz) return result;
+        if (p->p_offset > elf_size || p->p_filesz > elf_size - p->p_offset) return result;
+        if (p->p_vaddr + p->p_memsz < p->p_vaddr) return result;
     }
 
     // 1. Create CSpace and VSpace for child
@@ -86,14 +106,16 @@ inline SpawnedProcess spawn_process(
     if (result.tcb_cap == static_cast<std::uint32_t>(-1)) return result;
 
     // 3. Load PT_LOAD segments via staging buffer
-    const auto* phdr = reinterpret_cast<const elf::Elf64_Phdr*>(elf_data + ehdr->e_phoff);
     for (int i = 0; i < ehdr->e_phnum; ++i) {
-        if (phdr[i].p_type != elf::PT_LOAD) continue;
+        const auto* phdr_entry = reinterpret_cast<const elf::Elf64_Phdr*>(
+            elf_data + ehdr->e_phoff + static_cast<std::uint64_t>(i) * ehdr->e_phentsize
+        );
+        if (phdr_entry->p_type != elf::PT_LOAD) continue;
 
-        std::uint64_t vaddr = phdr[i].p_vaddr;
-        std::uint64_t memsz = phdr[i].p_memsz;
-        std::uint64_t filesz = phdr[i].p_filesz;
-        std::uint64_t offset = phdr[i].p_offset;
+        std::uint64_t vaddr = phdr_entry->p_vaddr;
+        std::uint64_t memsz = phdr_entry->p_memsz;
+        std::uint64_t filesz = phdr_entry->p_filesz;
+        std::uint64_t offset = phdr_entry->p_offset;
 
         std::uint64_t vaddr_aligned = vaddr & ~0xFFFULL;
         std::uint64_t vaddr_offset = vaddr - vaddr_aligned;
@@ -124,8 +146,8 @@ inline SpawnedProcess spawn_process(
 
         // Map into child's VSpace
         std::uint64_t flags = 0;
-        if (phdr[i].p_flags & elf::PF_W) flags |= 0x01; // Writable
-        if (phdr[i].p_flags & elf::PF_X) flags |= 0x02; // Executable
+        if (phdr_entry->p_flags & elf::PF_W) flags |= 0x01; // Writable
+        if (phdr_entry->p_flags & elf::PF_X) flags |= 0x02; // Executable
         if (sys_vspace_map_with_pagetables(result.vspace_cap, untyped_cap, seg_frame, vaddr_aligned, flags, map_size) != 0) {
             return result;
         }

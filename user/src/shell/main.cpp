@@ -59,6 +59,37 @@ static std::size_t vfs_read(int handle, std::size_t offset, char* buf, std::size
     return total_read;
 }
 
+static std::size_t vfs_write(int handle, std::size_t offset, const char* buf, std::size_t size) {
+    if (!g_shared_buf || size == 0) return 0;
+    std::size_t total_written = 0;
+    while (total_written < size) {
+        std::size_t chunk = size - total_written;
+        if (chunk > 64 * 1024) chunk = 64 * 1024;
+
+        for (std::size_t i = 0; i < chunk; i++) {
+            g_shared_buf[i] = buf[total_written + i];
+        }
+
+        oz::IPCMessage req{};
+        req.data[0] = oz::ipc::vfs_make_command(oz::ipc::VfsCmd::WRITE, 1);
+        req.data[1] = static_cast<std::uint64_t>(handle);
+        req.data[2] = static_cast<std::uint64_t>(offset + total_written);
+        req.data[3] = static_cast<std::uint64_t>(chunk);
+
+        oz::IPCMessage resp{};
+        if (!oz::sys_channel_send(CAP_VFS_SEND, &req) || !oz::sys_channel_recv(CAP_VFS_RECV, &resp)) {
+            break;
+        }
+        if (resp.data[0] != 0) break;
+        std::size_t bytes_written = static_cast<std::size_t>(resp.data[1]);
+        if (bytes_written == 0) break;
+
+        total_written += bytes_written;
+        if (bytes_written < chunk) break;
+    }
+    return total_written;
+}
+
 static std::size_t vfs_get_size(int handle) {
     oz::IPCMessage req{};
     req.data[0] = oz::ipc::vfs_make_command(oz::ipc::VfsCmd::GET_SIZE, 1);
