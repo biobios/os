@@ -31,7 +31,7 @@ static char* g_vfs_shared_buf = nullptr;
 // Helper: send a VFS file open request
 static int vfs_open(const char* path) {
     oz::IPCMessage req{};
-    req.data[0] = static_cast<std::uint64_t>(oz::ipc::VfsCmd::OPEN);
+    req.data[0] = oz::ipc::vfs_make_command(oz::ipc::VfsCmd::OPEN, 0);
     
     // Pack path into data[1..3] (up to 24 chars)
     char* dst = reinterpret_cast<char*>(&req.data[1]);
@@ -56,7 +56,7 @@ static int vfs_open(const char* path) {
 static std::size_t vfs_read(int handle, std::size_t offset, char* buf, std::size_t size) {
     if (!g_vfs_shared_buf) {
         oz::IPCMessage req{};
-        req.data[0] = static_cast<std::uint64_t>(oz::ipc::VfsCmd::READ);
+        req.data[0] = oz::ipc::vfs_make_command(oz::ipc::VfsCmd::READ, 0);
         req.data[1] = static_cast<std::uint64_t>(handle);
         req.data[2] = static_cast<std::uint64_t>(offset);
         req.data[3] = static_cast<std::uint64_t>(size);
@@ -84,7 +84,7 @@ static std::size_t vfs_read(int handle, std::size_t offset, char* buf, std::size
         if (chunk > 64 * 1024) chunk = 64 * 1024;
 
         oz::IPCMessage req{};
-        req.data[0] = static_cast<std::uint64_t>(oz::ipc::VfsCmd::READ);
+        req.data[0] = oz::ipc::vfs_make_command(oz::ipc::VfsCmd::READ, 0);
         req.data[1] = static_cast<std::uint64_t>(handle);
         req.data[2] = static_cast<std::uint64_t>(offset + total_read);
         req.data[3] = static_cast<std::uint64_t>(chunk);
@@ -109,7 +109,7 @@ static std::size_t vfs_read(int handle, std::size_t offset, char* buf, std::size
 // Helper: get file size
 static std::size_t vfs_get_size(int handle) {
     oz::IPCMessage req{};
-    req.data[0] = static_cast<std::uint64_t>(oz::ipc::VfsCmd::GET_SIZE);
+    req.data[0] = oz::ipc::vfs_make_command(oz::ipc::VfsCmd::GET_SIZE, 0);
     req.data[1] = static_cast<std::uint64_t>(handle);
     
     oz::sys_channel_send(CAP_VFS_SEND, &req);
@@ -124,7 +124,7 @@ static std::size_t vfs_get_size(int handle) {
 // Helper: close a VFS file
 static void vfs_close(int handle) {
     oz::IPCMessage req{};
-    req.data[0] = static_cast<std::uint64_t>(oz::ipc::VfsCmd::CLOSE);
+    req.data[0] = oz::ipc::vfs_make_command(oz::ipc::VfsCmd::CLOSE, 0);
     req.data[1] = static_cast<std::uint64_t>(handle);
     
     oz::sys_channel_send(CAP_VFS_SEND, &req);
@@ -276,29 +276,43 @@ extern "C" void _start() {
         oz::sys_exit(1);
     }
 
-    std::uint32_t init_vfs_send = 0;
-    std::uint32_t vfs_init_recv = 0;
-    oz::sys_channel_create(oz::CAP_UNTYPED, &init_vfs_send, &vfs_init_recv);
+    // Shared VFS request channel (all clients send requests to vfs_req_send)
+    std::uint32_t vfs_req_send = 0;
+    std::uint32_t vfs_req_recv = 0;
+    oz::sys_channel_create(oz::CAP_UNTYPED, &vfs_req_send, &vfs_req_recv);
 
-    std::uint32_t vfs_init_send = 0;
-    std::uint32_t init_vfs_recv = 0;
-    oz::sys_channel_create(oz::CAP_UNTYPED, &vfs_init_send, &init_vfs_recv);
+    // Dedicated reply channel for Client 0 (init)
+    std::uint32_t vfs_init_reply_send = 0;
+    std::uint32_t init_reply_recv = 0;
+    oz::sys_channel_create(oz::CAP_UNTYPED, &vfs_init_reply_send, &init_reply_recv);
 
-    oz::sys_cspace_cap_insert(oz::CAP_SELF_CSPACE, CAP_VFS_SEND, init_vfs_send, static_cast<std::uint32_t>(oz::CapRights::WRITE | oz::CapRights::GRANT));
-    oz::sys_cspace_cap_insert(oz::CAP_SELF_CSPACE, CAP_VFS_RECV, init_vfs_recv, static_cast<std::uint32_t>(oz::CapRights::READ));
+    // Dedicated reply channel for Client 1 (shell)
+    std::uint32_t vfs_shell_reply_send = 0;
+    std::uint32_t shell_reply_recv = 0;
+    oz::sys_channel_create(oz::CAP_UNTYPED, &vfs_shell_reply_send, &shell_reply_recv);
 
+    // Wire up Init's CSpace for VFS
+    oz::sys_cspace_cap_insert(oz::CAP_SELF_CSPACE, CAP_VFS_SEND, vfs_req_send, static_cast<std::uint32_t>(oz::CapRights::WRITE | oz::CapRights::GRANT));
+    oz::sys_cspace_cap_insert(oz::CAP_SELF_CSPACE, CAP_VFS_RECV, init_reply_recv, static_cast<std::uint32_t>(oz::CapRights::READ));
+
+    // Wire up VFS server CSpace
     oz::sys_cspace_cap_insert(vfs_proc.cspace_cap, 1, cons_send, static_cast<std::uint32_t>(oz::CapRights::WRITE | oz::CapRights::GRANT));
     oz::sys_cspace_cap_insert(vfs_proc.cspace_cap, 2, vfs_ahci_send, static_cast<std::uint32_t>(oz::CapRights::WRITE | oz::CapRights::GRANT));
     oz::sys_cspace_cap_insert(vfs_proc.cspace_cap, 3, vfs_ahci_recv, static_cast<std::uint32_t>(oz::CapRights::READ));
-    oz::sys_cspace_cap_insert(vfs_proc.cspace_cap, 4, vfs_init_recv, static_cast<std::uint32_t>(oz::CapRights::READ));
-    oz::sys_cspace_cap_insert(vfs_proc.cspace_cap, 5, vfs_init_send, static_cast<std::uint32_t>(oz::CapRights::WRITE | oz::CapRights::GRANT));
+    oz::sys_cspace_cap_insert(vfs_proc.cspace_cap, 4, vfs_req_recv, static_cast<std::uint32_t>(oz::CapRights::READ));
+    oz::sys_cspace_cap_insert(vfs_proc.cspace_cap, 5, vfs_init_reply_send, static_cast<std::uint32_t>(oz::CapRights::WRITE | oz::CapRights::GRANT));
+    oz::sys_cspace_cap_insert(vfs_proc.cspace_cap, 6, vfs_shell_reply_send, static_cast<std::uint32_t>(oz::CapRights::WRITE | oz::CapRights::GRANT));
     oz::sys_cspace_cap_insert(vfs_proc.cspace_cap, oz::CAP_UNTYPED, oz::CAP_UNTYPED, static_cast<std::uint32_t>(oz::CapRights::ALL));
     oz::sys_cspace_cap_insert(vfs_proc.cspace_cap, 242, shared_buf_frame, static_cast<std::uint32_t>(oz::CapRights::ALL));
 
-    // Shared buffer for VFS client data transfer (16 pages = 64KB)
-    std::uint32_t vfs_client_frame = oz::sys_frame_alloc(oz::CAP_UNTYPED, 16);
-    oz::sys_cspace_cap_insert(vfs_proc.cspace_cap, 243, vfs_client_frame, static_cast<std::uint32_t>(oz::CapRights::ALL));
-    oz::sys_cspace_cap_insert(oz::CAP_SELF_CSPACE, CAP_VFS_SHARED_BUF, vfs_client_frame, static_cast<std::uint32_t>(oz::CapRights::ALL));
+    // Dedicated shared buffer for Client 0 (init) (16 pages = 64KB)
+    std::uint32_t init_client_frame = oz::sys_frame_alloc(oz::CAP_UNTYPED, 16);
+    oz::sys_cspace_cap_insert(vfs_proc.cspace_cap, 243, init_client_frame, static_cast<std::uint32_t>(oz::CapRights::ALL));
+    oz::sys_cspace_cap_insert(oz::CAP_SELF_CSPACE, CAP_VFS_SHARED_BUF, init_client_frame, static_cast<std::uint32_t>(oz::CapRights::ALL));
+
+    // Dedicated shared buffer for Client 1 (shell) (16 pages = 64KB)
+    std::uint32_t shell_client_frame = oz::sys_frame_alloc(oz::CAP_UNTYPED, 16);
+    oz::sys_cspace_cap_insert(vfs_proc.cspace_cap, 244, shell_client_frame, static_cast<std::uint32_t>(oz::CapRights::ALL));
 
     if (oz::sys_vspace_map_with_pagetables(oz::CAP_SELF_VSPACE, oz::CAP_UNTYPED, CAP_VFS_SHARED_BUF, VFS_SHARED_BUF_VIRT, 0x01, 16 * 4096) == 0) {
         g_vfs_shared_buf = reinterpret_cast<char*>(VFS_SHARED_BUF_VIRT);
@@ -325,12 +339,12 @@ extern "C" void _start() {
             oz::sys_cspace_cap_insert(shell_proc.cspace_cap, 1, cons_send, static_cast<std::uint32_t>(oz::CapRights::WRITE | oz::CapRights::GRANT));
             // Slot 2: Shell Input Recv (from xHCI)
             oz::sys_cspace_cap_insert(shell_proc.cspace_cap, 2, shell_input_recv, static_cast<std::uint32_t>(oz::CapRights::READ));
-            // Slot 3: VFS Send
-            oz::sys_cspace_cap_insert(shell_proc.cspace_cap, 3, init_vfs_send, static_cast<std::uint32_t>(oz::CapRights::WRITE | oz::CapRights::GRANT));
-            // Slot 4: VFS Recv
-            oz::sys_cspace_cap_insert(shell_proc.cspace_cap, 4, init_vfs_recv, static_cast<std::uint32_t>(oz::CapRights::READ));
-            // Slot 5: VFS Shared Buffer
-            oz::sys_cspace_cap_insert(shell_proc.cspace_cap, 5, vfs_client_frame, static_cast<std::uint32_t>(oz::CapRights::ALL));
+            // Slot 3: VFS Request Send (shared request channel)
+            oz::sys_cspace_cap_insert(shell_proc.cspace_cap, 3, vfs_req_send, static_cast<std::uint32_t>(oz::CapRights::WRITE | oz::CapRights::GRANT));
+            // Slot 4: VFS Reply Recv (shell dedicated reply channel)
+            oz::sys_cspace_cap_insert(shell_proc.cspace_cap, 4, shell_reply_recv, static_cast<std::uint32_t>(oz::CapRights::READ));
+            // Slot 5: VFS Shared Buffer (shell dedicated buffer frame)
+            oz::sys_cspace_cap_insert(shell_proc.cspace_cap, 5, shell_client_frame, static_cast<std::uint32_t>(oz::CapRights::ALL));
             // Slot 240: Untyped
             oz::sys_cspace_cap_insert(shell_proc.cspace_cap, oz::CAP_UNTYPED, oz::CAP_UNTYPED, static_cast<std::uint32_t>(oz::CapRights::ALL));
 

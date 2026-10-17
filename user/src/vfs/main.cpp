@@ -9,13 +9,21 @@
 //   1: write to console (sys_write uses this)
 //   2: send block I/O requests to AHCI
 //   3: recv block I/O responses from AHCI
-//   4: recv file operation requests from clients
-//   5: send file operation responses to clients
+//   4: recv file operation requests from all clients (shared request channel)
+//   5: send file operation responses to client 0 (init)
+//   6: send file operation responses to client 1 (shell)
+//   243: shared buffer frame for client 0 (init) (64KB)
+//   244: shared buffer frame for client 1 (shell) (64KB)
 
 static constexpr std::uint32_t CAP_AHCI_SEND = 2;
 static constexpr std::uint32_t CAP_AHCI_RECV = 3;
 static constexpr std::uint32_t CAP_CLIENT_RECV = 4;
-static constexpr std::uint32_t CAP_CLIENT_SEND = 5;
+static constexpr std::uint32_t CAP_CLIENT_REPLY_BASE = 5;
+static constexpr std::uint32_t MAX_CLIENTS = 2;
+
+static constexpr std::uint32_t CAP_CLIENT_BUF_BASE = 243;
+static constexpr std::uint64_t CLIENT_BUF_BASE_VIRT = 0x300000000000ULL;
+static constexpr std::uint64_t CLIENT_BUF_SIZE = 64 * 1024;
 
 // Simple handle table for open files
 static constexpr int MAX_OPEN_FILES = 16;
@@ -81,12 +89,14 @@ extern "C" void _start() {
     oz::VFS vfs;
     vfs.mountRoot(&fat32);
 
-    // Map shared client buffer (slot 243) if present
-    static constexpr std::uint64_t CLIENT_BUF_VIRT = 0x300000000000ULL;
-    char* client_buf = nullptr;
-    if (oz::sys_vspace_map_with_pagetables(oz::CAP_SELF_VSPACE, oz::CAP_UNTYPED, 243, CLIENT_BUF_VIRT, 0x01, 16 * 4096) == 0) {
-        client_buf = reinterpret_cast<char*>(CLIENT_BUF_VIRT);
-        oz::sys_write("VFS: Client shared buffer mapped (64KB).\n\r");
+    // Map shared client buffers (slots 243, 244) if present
+    char* client_bufs[MAX_CLIENTS] = {};
+    for (std::uint32_t i = 0; i < MAX_CLIENTS; i++) {
+        std::uint64_t virt = CLIENT_BUF_BASE_VIRT + static_cast<std::uint64_t>(i) * CLIENT_BUF_SIZE;
+        if (oz::sys_vspace_map_with_pagetables(oz::CAP_SELF_VSPACE, oz::CAP_UNTYPED, CAP_CLIENT_BUF_BASE + i, virt, 0x01, 16 * 4096) == 0) {
+            client_bufs[i] = reinterpret_cast<char*>(virt);
+            oz::sys_write("VFS: Client shared buffer mapped.\n\r");
+        }
     }
 
     // Main request loop
@@ -95,8 +105,12 @@ extern "C" void _start() {
         oz::IPCMessage req{};
         if (!oz::sys_channel_recv(CAP_CLIENT_RECV, &req)) continue;
 
-        auto cmd = static_cast<oz::ipc::VfsCmd>(req.data[0]);
+        std::uint32_t client_id = oz::ipc::vfs_get_client_id(req.data[0]);
+        auto cmd = static_cast<oz::ipc::VfsCmd>(oz::ipc::vfs_get_cmd(req.data[0]));
         oz::IPCMessage resp{};
+
+        char* client_buf = (client_id < MAX_CLIENTS) ? client_bufs[client_id] : nullptr;
+        std::uint32_t reply_cap = (client_id < MAX_CLIENTS) ? (CAP_CLIENT_REPLY_BASE + client_id) : 0;
 
         switch (cmd) {
             case oz::ipc::VfsCmd::OPEN: {
@@ -208,6 +222,8 @@ extern "C" void _start() {
                 break;
         }
 
-        oz::sys_channel_send(CAP_CLIENT_SEND, &resp);
+        if (reply_cap != 0) {
+            oz::sys_channel_send(reply_cap, &resp);
+        }
     }
 }

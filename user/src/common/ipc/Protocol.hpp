@@ -43,5 +43,19 @@ enum class VfsCmd : std::uint64_t {
     LIST_DIR     = 6,   // List dir:   data[1..3] = path (packed chars)
 };
 
+// VFS Protocol Helpers: data[0] carries client_id (high 32 bits) and VfsCmd (low 32 bits)
+inline std::uint32_t vfs_get_cmd(std::uint64_t data0) {
+    return static_cast<std::uint32_t>(data0 & 0xFFFFFFFFULL);
+}
+
+inline std::uint32_t vfs_get_client_id(std::uint64_t data0) {
+    return static_cast<std::uint32_t>(data0 >> 32);
+}
+
+inline std::uint64_t vfs_make_command(VfsCmd cmd, std::uint32_t client_id = 0) {
+    return (static_cast<std::uint64_t>(client_id) << 32) | static_cast<std::uint64_t>(cmd);
+}
+
 } // namespace ipc
 } // namespace oz
+

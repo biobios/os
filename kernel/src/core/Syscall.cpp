@@ -102,22 +102,24 @@ static int do_channel_send(CSpace* cspace, CapID ep_id, const IPCMessage* msg) {
         
         // Attach cap to internal message (copy semantics for refcount)
         internal.attached_cap = src_cap;
-        
-        // Remove from sender's CSpace (move semantics)
-        cspace->remove(msg->transferred_cap);
     }
 
     // Synchronous rendezvous: check if a receiver is already waiting on peer
     Thread* receiver = peer->pop_recv_waiter();
     if (receiver) {
-        if (internal.attached_cap.is_valid() && receiver->cspace) {
+        if (internal.attached_cap.is_valid()) {
+            if (!receiver->cspace) {
+                return -1;
+            }
             CapID new_id = receiver->cspace->add(internal.attached_cap);
             if (new_id == INVALID_CAP_ID) {
-                internal.user_msg.has_cap = false;
-            } else {
-                internal.user_msg.transferred_cap = new_id;
-                internal.user_msg.has_cap = true;
+                // Receiver's CSpace is full: fail without removing from sender's CSpace
+                return -1;
             }
+            // Successfully added to receiver: remove from sender's CSpace (move semantics)
+            cspace->remove(msg->transferred_cap);
+            internal.user_msg.transferred_cap = new_id;
+            internal.user_msg.has_cap = true;
             internal.attached_cap = Capability();
         }
         peer->set_rendezvous_msg(internal);
@@ -133,15 +135,27 @@ static int do_channel_send(CSpace* cspace, CapID ep_id, const IPCMessage* msg) {
     Thread* current = g_get_current_thread_func();
     if (!current) return -1;
 
+    if (internal.attached_cap.is_valid()) {
+        // Remove from sender's CSpace while blocked, kept in internal.attached_cap
+        cspace->remove(msg->transferred_cap);
+    }
+
     current->send_msg = internal;
     current->state = ThreadState::BlockedOnSend;
     ep->add_send_waiter(current);
 
     g_block_thread_func();
 
-    // Woken up after receiver accepted the message
+    // Woken up
+    if (ep->is_peer_closed()) {
+        // Rollback attached capability if peer closed before reception
+        if (current->send_msg.attached_cap.is_valid()) {
+            cspace->insert(msg->transferred_cap, current->send_msg.attached_cap);
+            current->send_msg = InternalIPCMessage{};
+        }
+        return -1;
+    }
     current->send_msg = InternalIPCMessage{};
-    if (ep->is_peer_closed()) return -1;
     return 0;
 }
 
@@ -171,13 +185,17 @@ static int do_channel_recv(CSpace* cspace, CapID ep_id, IPCMessage* msg) {
         *msg = sender->send_msg.user_msg;
         if (sender->send_msg.attached_cap.is_valid()) {
             CapID new_id = cspace->add(sender->send_msg.attached_cap);
-            sender->send_msg.attached_cap = Capability();
             if (new_id == INVALID_CAP_ID) {
+                // Failed to add to receiver CSpace: rollback to sender's CSpace!
+                if (sender->cspace) {
+                    sender->cspace->insert(sender->send_msg.user_msg.transferred_cap, sender->send_msg.attached_cap);
+                }
                 msg->has_cap = false;
             } else {
                 msg->transferred_cap = new_id;
                 msg->has_cap = true;
             }
+            sender->send_msg.attached_cap = Capability();
         }
         sender->state = ThreadState::Ready;
         if (g_unblock_thread_func) {
