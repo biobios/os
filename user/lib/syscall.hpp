@@ -5,12 +5,14 @@
 namespace oz {
 
 enum class CapRights : std::uint32_t {
-    NONE    = 0,
-    READ    = 1 << 0,
-    WRITE   = 1 << 1,
-    EXEC    = 1 << 2,
-    GRANT   = 1 << 3,
-    ALL     = 0xFFFFFFFF
+    NONE      = 0,
+    READ      = 1 << 0,
+    WRITE     = 1 << 1,
+    EXEC      = 1 << 2,
+    GRANT     = 1 << 3,
+    DUPLICATE = 1 << 4,
+    ONCE      = 1 << 5,
+    ALL       = (1 << 0) | (1 << 1) | (1 << 2) | (1 << 3) | (1 << 4)
 };
 
 inline constexpr CapRights operator|(CapRights a, CapRights b) {
@@ -19,6 +21,10 @@ inline constexpr CapRights operator|(CapRights a, CapRights b) {
 
 inline constexpr CapRights operator&(CapRights a, CapRights b) {
     return static_cast<CapRights>(static_cast<std::uint32_t>(a) & static_cast<std::uint32_t>(b));
+}
+
+inline constexpr CapRights operator~(CapRights a) {
+    return static_cast<CapRights>(~static_cast<std::uint32_t>(a));
 }
 
 enum class ObjectType : std::uint32_t {
@@ -49,6 +55,7 @@ std::size_t sys_write(const char* str);
 bool sys_channel_send(std::uint32_t cap_id, const IPCMessage* msg);
 bool sys_channel_recv(std::uint32_t cap_id, IPCMessage* msg);
 bool sys_channel_create(std::uint32_t untyped_cap, std::uint32_t* out_cap0, std::uint32_t* out_cap1);
+bool sys_channel_create_ext(std::uint32_t untyped_cap, std::uint32_t rights0, std::uint32_t rights1, std::uint32_t* out_cap0, std::uint32_t* out_cap1);
 bool sys_call(std::uint32_t cap_id, const IPCMessage* send_msg, IPCMessage* recv_msg);
 bool sys_reply_recv(std::uint32_t cap_id, const IPCMessage* reply_msg, IPCMessage* recv_msg);
 
@@ -75,6 +82,9 @@ void sys_debug_print(const char* str);
 // Capability management
 std::uint32_t sys_cap_mint(std::uint32_t src_cap, std::uint32_t new_rights);
 int sys_cap_delete(std::uint32_t cap_id);
+int sys_cap_move(std::uint32_t dest_slot, std::uint32_t src_slot);
+int sys_cspace_cap_move(std::uint32_t target_cspace_cap, std::uint32_t target_slot, std::uint32_t src_slot);
+int sys_cap_copy(std::uint32_t dest_slot, std::uint32_t src_slot, std::uint32_t rights);
 
 // Process/thread management
 int sys_tcb_configure(std::uint32_t tcb_cap, std::uint32_t cspace_cap,
@@ -107,5 +117,109 @@ static constexpr std::uint32_t CAP_INITRD = 244;
 static constexpr std::uint32_t CAP_SELF_CSPACE = 245;
 static constexpr std::uint32_t CAP_FRAMEBUFFER = 246;
 static constexpr std::uint32_t CAP_ROOT_IOPORT = 247;
+static constexpr std::uint32_t INVALID_CAP_ID = 0xFFFFFFFF;
+
+// ============================================================================
+// C++ RAII helpers for Linear & Once Capabilities
+// ============================================================================
+
+template <typename Tag = void>
+class LinearCap {
+private:
+    std::uint32_t slot_{INVALID_CAP_ID};
+
+public:
+    LinearCap() = default;
+    explicit LinearCap(std::uint32_t slot) : slot_(slot) {}
+
+    ~LinearCap() {
+        reset();
+    }
+
+    LinearCap(const LinearCap&) = delete;
+    LinearCap& operator=(const LinearCap&) = delete;
+
+    LinearCap(LinearCap&& other) noexcept : slot_(other.slot_) {
+        other.slot_ = INVALID_CAP_ID;
+    }
+
+    LinearCap& operator=(LinearCap&& other) noexcept {
+        if (this != &other) {
+            reset();
+            slot_ = other.slot_;
+            other.slot_ = INVALID_CAP_ID;
+        }
+        return *this;
+    }
+
+    bool isValid() const { return slot_ != INVALID_CAP_ID; }
+    std::uint32_t get() const { return slot_; }
+
+    std::uint32_t release() {
+        std::uint32_t s = slot_;
+        slot_ = INVALID_CAP_ID;
+        return s;
+    }
+
+    void reset(std::uint32_t new_slot = INVALID_CAP_ID) {
+        if (slot_ != INVALID_CAP_ID) {
+            sys_cap_delete(slot_);
+        }
+        slot_ = new_slot;
+    }
+
+    // Move capability to another slot
+    bool moveTo(std::uint32_t dest_slot) {
+        if (!isValid()) return false;
+        if (sys_cap_move(dest_slot, slot_) == 0) {
+            slot_ = dest_slot;
+            return true;
+        }
+        return false;
+    }
+};
+
+// One-time sender wrapper (automatically invalidates after sending)
+class OnceSender {
+private:
+    std::uint32_t slot_{INVALID_CAP_ID};
+
+public:
+    OnceSender() = default;
+    explicit OnceSender(std::uint32_t slot) : slot_(slot) {}
+
+    ~OnceSender() {
+        if (slot_ != INVALID_CAP_ID) {
+            sys_cap_delete(slot_);
+        }
+    }
+
+    OnceSender(const OnceSender&) = delete;
+    OnceSender& operator=(const OnceSender&) = delete;
+
+    OnceSender(OnceSender&& other) noexcept : slot_(other.slot_) {
+        other.slot_ = INVALID_CAP_ID;
+    }
+
+    OnceSender& operator=(OnceSender&& other) noexcept {
+        if (this != &other) {
+            if (slot_ != INVALID_CAP_ID) sys_cap_delete(slot_);
+            slot_ = other.slot_;
+            other.slot_ = INVALID_CAP_ID;
+        }
+        return *this;
+    }
+
+    bool isValid() const { return slot_ != INVALID_CAP_ID; }
+    std::uint32_t get() const { return slot_; }
+
+    bool send(const IPCMessage& msg) {
+        if (slot_ == INVALID_CAP_ID) return false;
+        bool res = sys_channel_send(slot_, &msg);
+        // Consumed by kernel on send; invalidate user-space handle as well
+        slot_ = INVALID_CAP_ID;
+        return res;
+    }
+};
 
 } // namespace oz

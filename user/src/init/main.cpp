@@ -215,11 +215,90 @@ extern "C" void _start() {
     oz::sys_cspace_cap_insert(cons_proc.cspace_cap, oz::CAP_UNTYPED, oz::CAP_UNTYPED, static_cast<std::uint32_t>(oz::CapRights::ALL));
     int resume_res = oz::sys_tcb_resume(cons_proc.tcb_cap);
 
-    int self_res = oz::sys_cspace_cap_insert(oz::CAP_SELF_CSPACE, 1, cons_send, static_cast<std::uint32_t>(oz::CapRights::WRITE | oz::CapRights::GRANT));
+    int self_res = oz::sys_cspace_cap_insert(oz::CAP_SELF_CSPACE, 1, cons_send, static_cast<std::uint32_t>(oz::CapRights::ALL));
     (void)cs_res; (void)resume_res; (void)self_res;
 
     oz::sys_write("Hello from init process (Ring 3)!\n\r");
     oz::sys_write("[Init] Console server spawned successfully.\n\r");
+
+    // ========================================================================
+    // Self-tests for new Capability semantics (Move, Linear, Once)
+    // ========================================================================
+    oz::sys_debug_print("[Init] Running Capability semantics tests...\n\r");
+
+    // 1. Test Move semantics
+    std::uint32_t t_ep0 = 0, t_ep1 = 0;
+    if (oz::sys_channel_create(oz::CAP_UNTYPED, &t_ep0, &t_ep1)) {
+        if (oz::sys_cap_move(50, t_ep0) == 0) {
+            // Source slot t_ep0 must now be invalid
+            if (oz::sys_cap_delete(t_ep0) != 0 && oz::sys_cap_delete(50) == 0) {
+                oz::sys_debug_print("[Test] Capability Move semantics: PASSED\n\r");
+            } else {
+                oz::sys_debug_print("[Test] Capability Move semantics: FAILED (source not invalidated)\n\r");
+            }
+        } else {
+            oz::sys_debug_print("[Test] Capability Move semantics: FAILED (sys_cap_move failed)\n\r");
+        }
+        oz::sys_cap_delete(t_ep1);
+    }
+
+    // 2. Test Linear rejection on copy/mint
+    // CAP_ROOT_IOPORT is a Linear object; minting/copying must be rejected!
+    std::uint32_t minted_linear = oz::sys_cap_mint(oz::CAP_ROOT_IOPORT, static_cast<std::uint32_t>(oz::CapRights::ALL));
+    if (minted_linear == oz::INVALID_CAP_ID) {
+        oz::sys_debug_print("[Test] Linear duplication prevention: PASSED\n\r");
+    } else {
+        oz::sys_debug_print("[Test] Linear duplication prevention: FAILED (Linear object was duplicated!)\n\r");
+        oz::sys_cap_delete(minted_linear);
+    }
+
+    // 3. Test Once capability auto-consumption
+    std::uint32_t once_sender = oz::sys_cap_mint(1, static_cast<std::uint32_t>(oz::CapRights::WRITE | oz::CapRights::ONCE));
+    if (once_sender != oz::INVALID_CAP_ID) {
+        oz::IPCMessage once_msg{};
+        const char* msg_txt = "[Test] Once Capability msg\n\r";
+        for (int k = 0; k < 4; ++k) {
+            once_msg.data[k] = *reinterpret_cast<const std::uint64_t*>(&msg_txt[k * 8]);
+        }
+        if (oz::sys_channel_send(once_sender, &once_msg)) {
+            // After sending, the once_sender slot must have been removed by kernel!
+            if (oz::sys_cap_delete(once_sender) != 0) {
+                oz::sys_debug_print("[Test] Once Capability auto-consumption: PASSED\n\r");
+            } else {
+                oz::sys_debug_print("[Test] Once Capability auto-consumption: FAILED (slot still valid after send)\n\r");
+            }
+        } else {
+            oz::sys_debug_print("[Test] Once Capability auto-consumption: FAILED (send failed)\n\r");
+        }
+    } else {
+        oz::sys_debug_print("[Test] Once Capability auto-consumption: FAILED (mint failed)\n\r");
+    }
+
+    // 4. Test C++ RAII LinearCap
+    {
+        std::uint32_t r_ep0 = 0, r_ep1 = 0;
+        if (oz::sys_channel_create(oz::CAP_UNTYPED, &r_ep0, &r_ep1)) {
+            oz::LinearCap<> linear1(r_ep0);
+            oz::LinearCap<> linear2 = static_cast<oz::LinearCap<>&&>(linear1); // move construct
+            if (!linear1.isValid() && linear2.isValid()) {
+                if (linear2.moveTo(51)) {
+                    oz::sys_debug_print("[Test] C++ LinearCap RAII move: PASSED\n\r");
+                } else {
+                    oz::sys_debug_print("[Test] C++ LinearCap RAII move: FAILED (moveTo failed)\n\r");
+                }
+            } else {
+                oz::sys_debug_print("[Test] C++ LinearCap RAII move: FAILED\n\r");
+            }
+            oz::sys_cap_delete(r_ep1);
+        }
+    }
+    // linear2 went out of scope, slot 51 should be deleted automatically
+    if (oz::sys_cap_delete(51) != 0) {
+        oz::sys_debug_print("[Test] C++ LinearCap RAII destructor cleanup: PASSED\n\r");
+    } else {
+        oz::sys_debug_print("[Test] C++ LinearCap RAII destructor cleanup: FAILED (slot 51 still valid)\n\r");
+    }
+
 
     // 3.5 Spawn Display Server (GUI mode)
     oz::loader::TarFile disp_file = oz::loader::tar_find_file(initrd_ptr, initrd_size, "display");

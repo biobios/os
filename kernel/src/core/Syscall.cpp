@@ -81,6 +81,10 @@ static CSpace* get_cspace() {
 static int do_channel_send(CSpace* cspace, CapID ep_id, const IPCMessage* msg) {
     if (!cspace || !msg) return -1;
     
+    Capability ep_cap_check = cspace->get(ep_id);
+    if (!ep_cap_check.is_valid()) return -1;
+    bool is_once = ep_cap_check.is_once();
+
     ChannelEndpoint* ep = get_cap_typed<ChannelEndpoint>(
         cspace, ep_id, ObjectType::ChannelEndpoint, CapRights::WRITE);
     if (!ep || ep->is_peer_closed()) return -1;
@@ -93,7 +97,6 @@ static int do_channel_send(CSpace* cspace, CapID ep_id, const IPCMessage* msg) {
     
     if (msg->has_cap) {
         // Transfer requires GRANT right on the endpoint
-        Capability ep_cap_check = cspace->get(ep_id);
         if ((ep_cap_check.rights & CapRights::GRANT) == CapRights::NONE) return -1;
         
         // Extract the capability from sender's CSpace
@@ -127,6 +130,9 @@ static int do_channel_send(CSpace* cspace, CapID ep_id, const IPCMessage* msg) {
         if (g_unblock_thread_func) {
             g_unblock_thread_func(receiver);
         }
+        if (is_once) {
+            cspace->remove(ep_id);
+        }
         return 0;
     }
 
@@ -156,6 +162,9 @@ static int do_channel_send(CSpace* cspace, CapID ep_id, const IPCMessage* msg) {
         return -1;
     }
     current->send_msg = InternalIPCMessage{};
+    if (is_once) {
+        cspace->remove(ep_id);
+    }
     return 0;
 }
 
@@ -352,9 +361,14 @@ extern "C" std::uint64_t handleSyscall(std::uint64_t rdi, std::uint64_t rsi, std
         
         Capability src_cap = cspace->get(static_cast<CapID>(rdi));
         if (!src_cap.is_valid()) return -1;
+        if (!src_cap.can_duplicate()) return -1;
         
         CapRights new_rights = static_cast<CapRights>(rsi);
-        if ((src_cap.rights & new_rights) != new_rights) return -1;
+        CapRights base_requested = new_rights & ~CapRights::ONCE;
+        if ((src_cap.rights & base_requested) != base_requested) return -1;
+        if ((new_rights & CapRights::ONCE) != CapRights::NONE) {
+            if ((src_cap.rights & CapRights::WRITE) != CapRights::WRITE) return -1;
+        }
         
         Capability minted(src_cap.object, new_rights);
         CapID new_id = cspace->add(minted);
@@ -443,9 +457,14 @@ extern "C" std::uint64_t handleSyscall(std::uint64_t rdi, std::uint64_t rsi, std
         
         Capability src_cap = cspace->get(static_cast<CapID>(rdx));
         if (!src_cap.is_valid()) return -1;
+        if (!src_cap.can_duplicate()) return -1;
         
         CapRights new_rights = static_cast<CapRights>(r10);
-        if ((src_cap.rights & new_rights) != new_rights) return -1;
+        CapRights base_requested = new_rights & ~CapRights::ONCE;
+        if ((src_cap.rights & base_requested) != base_requested) return -1;
+        if ((new_rights & CapRights::ONCE) != CapRights::NONE) {
+            if ((src_cap.rights & CapRights::WRITE) != CapRights::WRITE) return -1;
+        }
         
         Capability minted(src_cap.object, new_rights);
         if (!target_cs->insertCap(static_cast<CapID>(rsi), minted)) return -1;
@@ -737,6 +756,47 @@ extern "C" std::uint64_t handleSyscall(std::uint64_t rdi, std::uint64_t rsi, std
 
         tcb->setFaultEndpoint(ep);
         return 0;
+    } else if (syscall_number == 30) {
+        // cap_move(dest_slot, src_slot)
+        CSpace* cspace = get_cspace();
+        if (!cspace) return -1;
+        CapID dest = static_cast<CapID>(rdi);
+        CapID src = static_cast<CapID>(rsi);
+        if (!cap_move(cspace, dest, src)) return -1;
+        return 0;
+    } else if (syscall_number == 31) {
+        // cspace_cap_move(target_cspace_cap, target_slot, src_slot)
+        CSpace* cspace = get_cspace();
+        if (!cspace) return -1;
+        CSpaceCap* target_cs = get_cap_typed<CSpaceCap>(
+            cspace, static_cast<CapID>(rdi), ObjectType::CSpaceCap, CapRights::WRITE);
+        if (!target_cs || !target_cs->getCSpace()) return -1;
+
+        CapID target_slot = static_cast<CapID>(rsi);
+        CapID src_slot = static_cast<CapID>(rdx);
+        if (!cap_move(target_cs->getCSpace(), target_slot, cspace, src_slot)) return -1;
+        return 0;
+    } else if (syscall_number == 32) {
+        // cap_copy(dest_slot, src_slot, rights)
+        CSpace* cspace = get_cspace();
+        if (!cspace) return -1;
+        CapID dest = static_cast<CapID>(rdi);
+        CapID src = static_cast<CapID>(rsi);
+        CapRights rights = static_cast<CapRights>(rdx);
+        if (!cap_copy(cspace, dest, src, rights)) return -1;
+        return 0;
+    } else if (syscall_number == 33) {
+        // channel_create_ext(untyped_cap, rights0, rights1, out0, out1)
+        CSpace* cspace = get_cspace();
+        if (!cspace) return -1;
+        if (!is_user_buffer(r10, sizeof(CapID))) return -1;
+        if (!is_user_buffer(r8, sizeof(CapID))) return -1;
+        CapRights r0 = static_cast<CapRights>(rsi);
+        CapRights r1 = static_cast<CapRights>(rdx);
+        CapID* out0 = reinterpret_cast<CapID*>(r10);
+        CapID* out1 = reinterpret_cast<CapID*>(r8);
+        if (sys_channel_create_ext(cspace, static_cast<CapID>(rdi), r0, r1, out0, out1)) return 0;
+        return -1;
     }
     
     return static_cast<std::uint64_t>(-1);

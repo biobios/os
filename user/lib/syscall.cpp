@@ -202,6 +202,22 @@ int sys_untyped_revoke(std::uint32_t untyped_cap) {
     return static_cast<int>(syscall(24, untyped_cap, 0, 0, 0, 0, 0));
 }
 
+bool sys_channel_create_ext(std::uint32_t untyped_cap, std::uint32_t rights0, std::uint32_t rights1, std::uint32_t* out_cap0, std::uint32_t* out_cap1) {
+    return syscall(33, untyped_cap, rights0, rights1, reinterpret_cast<std::uint64_t>(out_cap0), reinterpret_cast<std::uint64_t>(out_cap1), 0) == 0;
+}
+
+int sys_cap_move(std::uint32_t dest_slot, std::uint32_t src_slot) {
+    return static_cast<int>(syscall(30, dest_slot, src_slot, 0, 0, 0, 0));
+}
+
+int sys_cspace_cap_move(std::uint32_t target_cspace_cap, std::uint32_t target_slot, std::uint32_t src_slot) {
+    return static_cast<int>(syscall(31, target_cspace_cap, target_slot, src_slot, 0, 0, 0));
+}
+
+int sys_cap_copy(std::uint32_t dest_slot, std::uint32_t src_slot, std::uint32_t rights) {
+    return static_cast<int>(syscall(32, dest_slot, src_slot, rights, 0, 0, 0));
+}
+
 } // extern "C"
 
 } // namespace oz

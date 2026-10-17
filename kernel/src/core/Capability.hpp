@@ -7,12 +7,14 @@
 namespace oz {
 
 enum class CapRights : std::uint32_t {
-    NONE    = 0,
-    READ    = 1 << 0,
-    WRITE   = 1 << 1,
-    EXEC    = 1 << 2,
-    GRANT   = 1 << 3,
-    ALL     = 0xFFFFFFFF
+    NONE      = 0,
+    READ      = 1 << 0,
+    WRITE     = 1 << 1,
+    EXEC      = 1 << 2,
+    GRANT     = 1 << 3,
+    DUPLICATE = 1 << 4,
+    ONCE      = 1 << 5,
+    ALL       = (1 << 0) | (1 << 1) | (1 << 2) | (1 << 3) | (1 << 4)
 };
 
 inline CapRights operator|(CapRights a, CapRights b) {
@@ -22,6 +24,15 @@ inline CapRights operator|(CapRights a, CapRights b) {
 inline CapRights operator&(CapRights a, CapRights b) {
     return static_cast<CapRights>(static_cast<std::uint32_t>(a) & static_cast<std::uint32_t>(b));
 }
+
+inline CapRights operator~(CapRights a) {
+    return static_cast<CapRights>(~static_cast<std::uint32_t>(a));
+}
+
+enum class CapKind : std::uint8_t {
+    Duplicable = 0,
+    Linear     = 1,
+};
 
 enum class ObjectType : std::uint8_t {
     Unknown = 0,
@@ -46,6 +57,8 @@ protected:
     ObjectType obj_type_{ObjectType::Unknown};
     bool is_untyped_backed_{false};
     bool is_revoked_{false};
+    CapKind cap_kind_{CapKind::Duplicable};
+    std::uint32_t active_cap_count_{0};
 
     KernelObject* cdt_parent_{nullptr};
     KernelObject* cdt_first_child_{nullptr};
@@ -55,8 +68,12 @@ protected:
     Capability* cap_list_head_{nullptr};
 
 public:
-    explicit KernelObject(ObjectType t = ObjectType::Unknown, bool untyped = false)
-        : obj_type_(t), is_untyped_backed_(untyped) {}
+    explicit KernelObject(ObjectType t = ObjectType::Unknown, bool untyped = false, CapKind kind = CapKind::Duplicable)
+        : obj_type_(t), is_untyped_backed_(untyped), cap_kind_(kind) {
+        if (t == ObjectType::IRQHandler || t == ObjectType::TCB || t == ObjectType::IOPort) {
+            cap_kind_ = CapKind::Linear;
+        }
+    }
     virtual ~KernelObject();
 
     ObjectType objectType() const { return obj_type_; }
@@ -65,6 +82,11 @@ public:
 
     bool isRevoked() const { return is_revoked_; }
     void markRevoked() { is_revoked_ = true; }
+
+    CapKind capKind() const { return cap_kind_; }
+    void setCapKind(CapKind k) { cap_kind_ = k; }
+    bool isLinear() const { return cap_kind_ == CapKind::Linear; }
+    std::uint32_t activeCapCount() const { return active_cap_count_; }
 
     KernelObject* cdtParent() const { return cdt_parent_; }
     KernelObject* cdtFirstChild() const { return cdt_first_child_; }
@@ -216,6 +238,11 @@ struct Capability {
     }
 
     bool is_valid() const { return object != nullptr && !object->isRevoked(); }
+    bool is_linear() const { return object != nullptr && object->isLinear(); }
+    bool is_once() const { return (rights & CapRights::ONCE) != CapRights::NONE; }
+    bool can_duplicate() const {
+        return is_valid() && !is_linear() && ((rights & CapRights::DUPLICATE) == CapRights::DUPLICATE);
+    }
 };
 
 inline KernelObject::~KernelObject() {
@@ -231,6 +258,7 @@ inline void KernelObject::attachCapability(Capability* cap) {
         cap_list_head_->prev_cap_ = cap;
     }
     cap_list_head_ = cap;
+    active_cap_count_++;
 }
 
 inline void KernelObject::detachCapability(Capability* cap) {
@@ -245,11 +273,15 @@ inline void KernelObject::detachCapability(Capability* cap) {
     }
     cap->next_cap_ = nullptr;
     cap->prev_cap_ = nullptr;
+    if (active_cap_count_ > 0) {
+        active_cap_count_--;
+    }
 }
 
 inline void KernelObject::invalidateAllCapabilities() {
     Capability* curr = cap_list_head_;
     cap_list_head_ = nullptr;
+    active_cap_count_ = 0;
     std::size_t revoked_refs = 0;
     while (curr) {
         Capability* next = curr->next_cap_;
