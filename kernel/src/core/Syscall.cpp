@@ -23,6 +23,7 @@ void (*g_block_thread_func)() = nullptr;
 void (*g_unblock_thread_func)(Thread*) = nullptr;
 void (*g_queue_thread_func)(Thread* t) = nullptr;
 void (*g_register_irq_handler_fn)(std::uint8_t, IRQHandler*) = nullptr;
+void (*g_unregister_irq_handler_fn)(std::uint8_t, IRQHandler*) = nullptr;
 void (*g_eoi_fn)() = nullptr;
 std::uint8_t (*g_read_io8_fn)(std::uint16_t) = nullptr;
 std::uint16_t (*g_read_io16_fn)(std::uint16_t) = nullptr;
@@ -482,7 +483,7 @@ extern "C" std::uint64_t handleSyscall(std::uint64_t rdi, std::uint64_t rsi, std
             cspace, static_cast<CapID>(rdx), ObjectType::ChannelEndpoint, CapRights::WRITE);
         if (!ep) return -1;
         
-        auto* handler = untyped->allocateObject<IRQHandler>(vector, g_register_irq_handler_fn, g_eoi_fn);
+        auto* handler = untyped->allocateObject<IRQHandler>(vector, g_register_irq_handler_fn, g_unregister_irq_handler_fn, g_eoi_fn);
         if (!handler) return -1;
         handler->setNotificationEndpoint(ep);
         handler->registerHandler();
@@ -492,7 +493,7 @@ extern "C" std::uint64_t handleSyscall(std::uint64_t rdi, std::uint64_t rsi, std
         handler->release();
         
         if (new_id == INVALID_CAP_ID) {
-            oz::irq::unregisterHandler(vector, handler);
+            handler->unregisterHandler();
             return static_cast<std::uint64_t>(-1);
         }
         return static_cast<std::uint64_t>(new_id);

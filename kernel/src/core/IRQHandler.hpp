@@ -1,6 +1,7 @@
 #pragma once
 #include "core/Capability.hpp"
 #include "core/Channel.hpp"
+#include "core/IRQDispatch.hpp"
 #include <cstdint>
 
 namespace oz {
@@ -14,21 +15,29 @@ private:
     std::uint8_t irq_vector_;
     ChannelEndpoint* notification_ep_;  // Endpoint to send notification to (not owned)
     bool acknowledged_;  // Whether the last interrupt was acknowledged
+    bool is_registered_{false};
 
     // Function pointers for interrupt management (set by Kernel.hpp)
     void (*register_fn_)(std::uint8_t vector, IRQHandler* handler);
+    void (*unregister_fn_)(std::uint8_t vector, IRQHandler* handler);
     void (*eoi_fn_)();
 
 public:
     IRQHandler(std::uint8_t vector,
                void (*register_fn)(std::uint8_t, IRQHandler*) = nullptr,
+               void (*unregister_fn)(std::uint8_t, IRQHandler*) = nullptr,
                void (*eoi_fn)() = nullptr)
         : KernelObject(ObjectType::IRQHandler),
           irq_vector_(vector), notification_ep_(nullptr),
-          acknowledged_(true),
-          register_fn_(register_fn), eoi_fn_(eoi_fn) {}
+          acknowledged_(true), is_registered_(false),
+          register_fn_(register_fn), unregister_fn_(unregister_fn), eoi_fn_(eoi_fn) {}
+
+    ~IRQHandler() override {
+        unregisterHandler();
+    }
 
     std::uint8_t vector() const { return irq_vector_; }
+    bool isRegistered() const { return is_registered_; }
 
     // Set the notification endpoint
     bool setNotificationEndpoint(ChannelEndpoint* ep) {
@@ -60,8 +69,25 @@ public:
 
     // Register this handler with the kernel interrupt system
     bool registerHandler() {
-        if (!register_fn_) return false;
-        register_fn_(irq_vector_, this);
+        if (is_registered_) return true;
+        if (register_fn_) {
+            register_fn_(irq_vector_, this);
+        } else {
+            oz::irq::registerHandler(irq_vector_, this);
+        }
+        is_registered_ = true;
+        return true;
+    }
+
+    // Unregister this handler from the kernel interrupt system
+    bool unregisterHandler() {
+        if (!is_registered_) return false;
+        if (unregister_fn_) {
+            unregister_fn_(irq_vector_, this);
+        } else {
+            oz::irq::unregisterHandler(irq_vector_, this);
+        }
+        is_registered_ = false;
         return true;
     }
 };

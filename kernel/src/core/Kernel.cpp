@@ -64,6 +64,9 @@ void Kernel::initSyscallAndStubs() {
     oz::g_register_irq_handler_fn = [](std::uint8_t vector, IRQHandler* handler) {
         oz::irq::registerHandler(vector, handler);
     };
+    oz::g_unregister_irq_handler_fn = [](std::uint8_t vector, IRQHandler* handler) {
+        oz::irq::unregisterHandler(vector, handler);
+    };
     oz::irq::setUnblockFn([](Thread* t) {
         Kernel::instance().scheduler.queueThread(t);
     });

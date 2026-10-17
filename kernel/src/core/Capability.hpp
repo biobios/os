@@ -36,6 +36,8 @@ enum class ObjectType : std::uint8_t {
     PageTable,
 };
 
+struct Capability;
+
 class KernelObject {
 protected:
     // Starts at 1: the creator owns the initial reference and must call
@@ -50,12 +52,12 @@ protected:
     KernelObject* cdt_next_sibling_{nullptr};
     KernelObject* cdt_prev_sibling_{nullptr};
 
+    Capability* cap_list_head_{nullptr};
+
 public:
     explicit KernelObject(ObjectType t = ObjectType::Unknown, bool untyped = false)
         : obj_type_(t), is_untyped_backed_(untyped) {}
-    virtual ~KernelObject() {
-        detachFromParent();
-    }
+    virtual ~KernelObject();
 
     ObjectType objectType() const { return obj_type_; }
     bool isUntypedBacked() const { return is_untyped_backed_; }
@@ -100,16 +102,25 @@ public:
         }
     }
 
+    void attachCapability(Capability* cap);
+    void detachCapability(Capability* cap);
+    void invalidateAllCapabilities();
+
     void add_ref() { ref_count++; }
+
+    virtual void destroy() {
+        if (!is_untyped_backed_) {
+            delete this;
+        } else {
+            this->~KernelObject();
+        }
+    }
+
     void release() {
         if (ref_count > 0) {
             ref_count--;
             if (ref_count == 0) {
-                if (!is_untyped_backed_) {
-                    delete this;
-                } else {
-                    this->~KernelObject();
-                }
+                destroy();
             }
         }
     }
@@ -117,39 +128,57 @@ public:
 };
 
 struct Capability {
-    KernelObject* object;
-    CapRights rights;
+    KernelObject* object{nullptr};
+    CapRights rights{CapRights::NONE};
+    Capability* next_cap_{nullptr};
+    Capability* prev_cap_{nullptr};
 
-    Capability() : object(nullptr), rights(CapRights::NONE) {}
-    Capability(KernelObject* obj, CapRights r) : object(obj), rights(r) {
+    Capability() : object(nullptr), rights(CapRights::NONE), next_cap_(nullptr), prev_cap_(nullptr) {}
+
+    Capability(KernelObject* obj, CapRights r)
+        : object(obj), rights(r), next_cap_(nullptr), prev_cap_(nullptr) {
         if (object) {
             object->add_ref();
+            object->attachCapability(this);
         }
     }
 
     // Copy constructor
-    Capability(const Capability& other) : object(other.object), rights(other.rights) {
+    Capability(const Capability& other)
+        : object(other.object), rights(other.rights), next_cap_(nullptr), prev_cap_(nullptr) {
         if (object) {
             object->add_ref();
+            object->attachCapability(this);
         }
     }
 
     // Move constructor
-    Capability(Capability&& other) noexcept : object(other.object), rights(other.rights) {
+    Capability(Capability&& other) noexcept
+        : object(other.object), rights(other.rights), next_cap_(nullptr), prev_cap_(nullptr) {
+        if (object) {
+            other.object->detachCapability(&other);
+            object->attachCapability(this);
+        }
         other.object = nullptr;
         other.rights = CapRights::NONE;
+        other.next_cap_ = nullptr;
+        other.prev_cap_ = nullptr;
     }
 
     // Copy assignment
     Capability& operator=(const Capability& other) {
         if (this != &other) {
             if (object) {
+                object->detachCapability(this);
                 object->release();
             }
             object = other.object;
             rights = other.rights;
+            next_cap_ = nullptr;
+            prev_cap_ = nullptr;
             if (object) {
                 object->add_ref();
+                object->attachCapability(this);
             }
         }
         return *this;
@@ -159,24 +188,82 @@ struct Capability {
     Capability& operator=(Capability&& other) noexcept {
         if (this != &other) {
             if (object) {
+                object->detachCapability(this);
                 object->release();
             }
             object = other.object;
             rights = other.rights;
+            next_cap_ = nullptr;
+            prev_cap_ = nullptr;
+            if (object) {
+                other.object->detachCapability(&other);
+                object->attachCapability(this);
+            }
             other.object = nullptr;
             other.rights = CapRights::NONE;
+            other.next_cap_ = nullptr;
+            other.prev_cap_ = nullptr;
         }
         return *this;
     }
 
     ~Capability() {
         if (object) {
+            object->detachCapability(this);
             object->release();
+            object = nullptr;
         }
     }
 
     bool is_valid() const { return object != nullptr && !object->isRevoked(); }
 };
+
+inline KernelObject::~KernelObject() {
+    invalidateAllCapabilities();
+    detachFromParent();
+}
+
+inline void KernelObject::attachCapability(Capability* cap) {
+    if (!cap) return;
+    cap->next_cap_ = cap_list_head_;
+    cap->prev_cap_ = nullptr;
+    if (cap_list_head_) {
+        cap_list_head_->prev_cap_ = cap;
+    }
+    cap_list_head_ = cap;
+}
+
+inline void KernelObject::detachCapability(Capability* cap) {
+    if (!cap) return;
+    if (cap->prev_cap_) {
+        cap->prev_cap_->next_cap_ = cap->next_cap_;
+    } else if (cap_list_head_ == cap) {
+        cap_list_head_ = cap->next_cap_;
+    }
+    if (cap->next_cap_) {
+        cap->next_cap_->prev_cap_ = cap->prev_cap_;
+    }
+    cap->next_cap_ = nullptr;
+    cap->prev_cap_ = nullptr;
+}
+
+inline void KernelObject::invalidateAllCapabilities() {
+    Capability* curr = cap_list_head_;
+    cap_list_head_ = nullptr;
+    std::size_t revoked_refs = 0;
+    while (curr) {
+        Capability* next = curr->next_cap_;
+        curr->object = nullptr;
+        curr->rights = CapRights::NONE;
+        curr->next_cap_ = nullptr;
+        curr->prev_cap_ = nullptr;
+        revoked_refs++;
+        curr = next;
+    }
+    for (std::size_t i = 0; i < revoked_refs; ++i) {
+        this->release();
+    }
+}
 
 using CapID = std::uint32_t;
 constexpr CapID INVALID_CAP_ID = 0xFFFFFFFF;

@@ -44,6 +44,9 @@ public:
           queue_thread_fn_(queue_thread_fn) {}
 
     ~TCB() override {
+        if (thread_) {
+            thread_->state = ThreadState::Dead;
+        }
         if (owned_ && thread_ && !is_untyped_backed_) {
             delete thread_;
         }

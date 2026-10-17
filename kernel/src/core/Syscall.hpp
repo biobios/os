@@ -18,9 +18,9 @@ extern void (*g_unblock_thread_func)(Thread*);   // Wake up a blocked thread
 // Queues a thread into the scheduler
 extern void (*g_queue_thread_func)(Thread* t);
 
-// For hardware resource management (Phase 4)
 class IRQHandler;
 extern void (*g_register_irq_handler_fn)(std::uint8_t vector, IRQHandler* handler);
+extern void (*g_unregister_irq_handler_fn)(std::uint8_t vector, IRQHandler* handler);
 extern void (*g_eoi_fn)();
 // I/O port function pointers
 extern std::uint8_t (*g_read_io8_fn)(std::uint16_t);

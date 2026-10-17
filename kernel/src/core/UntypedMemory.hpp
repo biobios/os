@@ -6,6 +6,7 @@
 #include "core/CSpaceCap.hpp"
 #include "core/Channel.hpp"
 #include "core/PageTableObject.hpp"
+#include "core/IRQHandler.hpp"
 #include "memory/Address.hpp"
 #include <cstdint>
 #include <cstddef>
@@ -71,7 +72,14 @@ public:
             if (tcb->getThread()) {
                 tcb->getThread()->state = ThreadState::Dead;
             }
+        } else if (node->objectType() == ObjectType::IRQHandler) {
+            auto* irq = static_cast<IRQHandler*>(node);
+            irq->unregisterHandler();
         }
+
+        // Force invalidate all Capabilities referencing this object
+        node->invalidateAllCapabilities();
+
         this->removeChild(node);
         node->release();
     }
@@ -80,7 +88,9 @@ public:
         while (cdt_first_child_) {
             revokeRecursive(cdt_first_child_);
         }
-        watermark_ = 0;
+        if (cdt_first_child_ == nullptr) {
+            watermark_ = 0;
+        }
     }
 
     template <typename T, typename... Args>
