@@ -10,6 +10,7 @@
 #include "core/CSpaceCap.hpp"
 #include "core/PageTableObject.hpp"
 #include "core/IRQHandler.hpp"
+#include "core/IRQDispatch.hpp"
 #include "core/IOPort.hpp"
 
 #include "core/Kernel.hpp"
@@ -463,11 +464,19 @@ extern "C" std::uint64_t handleSyscall(std::uint64_t rdi, std::uint64_t rsi, std
         CSpace* cspace = get_cspace();
         if (!cspace || !g_register_irq_handler_fn || !g_eoi_fn) return -1;
         
+        std::uint8_t vector = static_cast<std::uint8_t>(rsi);
+        // Whitelist check: only allow external IRQs defined in IDT (0x30 - 0x4F)
+        if (vector < 0x30 || vector > 0x4F) {
+            return static_cast<std::uint64_t>(-1);
+        }
+        // Conflict check: vector must not be already in use
+        if (oz::irq::getHandler(vector) != nullptr) {
+            return static_cast<std::uint64_t>(-1);
+        }
+
         UntypedMemory* untyped = get_cap_typed<UntypedMemory>(
             cspace, static_cast<CapID>(rdi), ObjectType::UntypedMemory, CapRights::WRITE);
         if (!untyped) return -1;
-        
-        std::uint8_t vector = static_cast<std::uint8_t>(rsi);
         
         ChannelEndpoint* ep = get_cap_typed<ChannelEndpoint>(
             cspace, static_cast<CapID>(rdx), ObjectType::ChannelEndpoint, CapRights::WRITE);
@@ -482,7 +491,10 @@ extern "C" std::uint64_t handleSyscall(std::uint64_t rdi, std::uint64_t rsi, std
         CapID new_id = cspace->add(irq_cap);
         handler->release();
         
-        if (new_id == INVALID_CAP_ID) return static_cast<std::uint64_t>(-1);
+        if (new_id == INVALID_CAP_ID) {
+            oz::irq::unregisterHandler(vector, handler);
+            return static_cast<std::uint64_t>(-1);
+        }
         return static_cast<std::uint64_t>(new_id);
     } else if (syscall_number == 19) {
         // irq_ack
@@ -496,23 +508,44 @@ extern "C" std::uint64_t handleSyscall(std::uint64_t rdi, std::uint64_t rsi, std
         if (!handler->acknowledge()) return -1;
         return 0;
     } else if (syscall_number == 20) {
-        // ioport_create(untyped_cap, base_port, port_count)
+        // ioport_create(parent_ioport_cap, untyped_cap, base_port, port_count)
         CSpace* cspace = get_cspace();
         if (!cspace) return -1;
         
+        // 1. Verify parent IOPort capability and rights
+        Capability parent_cap = cspace->get(static_cast<CapID>(rdi));
+        if (!parent_cap.is_valid() || !parent_cap.object || parent_cap.object->objectType() != ObjectType::IOPort) {
+            return static_cast<std::uint64_t>(-1);
+        }
+        if ((parent_cap.rights & CapRights::WRITE) != CapRights::WRITE) {
+            return static_cast<std::uint64_t>(-1);
+        }
+        auto* parent_ioport = static_cast<IOPort*>(parent_cap.object);
+
+        // 2. Verify untyped memory capability
         UntypedMemory* untyped = get_cap_typed<UntypedMemory>(
-            cspace, static_cast<CapID>(rdi), ObjectType::UntypedMemory, CapRights::WRITE);
+            cspace, static_cast<CapID>(rsi), ObjectType::UntypedMemory, CapRights::WRITE);
         if (!untyped) return -1;
+
+        std::uint16_t base_port = static_cast<std::uint16_t>(rdx);
+        std::uint32_t port_count = static_cast<std::uint32_t>(r10);
+
+        // 3. Check requested range is non-empty and contained within parent range
+        if (port_count == 0 || !parent_ioport->contains(base_port, port_count)) {
+            return static_cast<std::uint64_t>(-1);
+        }
         
         auto* ioport = untyped->allocateObject<IOPort>(
-            static_cast<std::uint16_t>(rsi),
-            static_cast<std::uint16_t>(rdx),
-            g_read_io8_fn, g_read_io16_fn, g_read_io32_fn,
-            g_write_io8_fn, g_write_io16_fn, g_write_io32_fn
+            base_port,
+            port_count,
+            parent_ioport->read8Fn(), parent_ioport->read16Fn(), parent_ioport->read32Fn(),
+            parent_ioport->write8Fn(), parent_ioport->write16Fn(), parent_ioport->write32Fn()
         );
         if (!ioport) return -1;
+
+        parent_ioport->addChild(ioport);
         
-        Capability io_cap(ioport, CapRights::ALL);
+        Capability io_cap(ioport, parent_cap.rights);
         CapID new_id = cspace->add(io_cap);
         ioport->release();
         

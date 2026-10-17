@@ -91,7 +91,7 @@ std::uint32_t sys_vspace_create(std::uint32_t untyped_cap);
 // Hardware resource management
 std::uint32_t sys_irq_handler_create(std::uint32_t untyped_cap, std::uint8_t vector, std::uint32_t notification_ep_cap);
 int sys_irq_ack(std::uint32_t irq_handler_cap);
-std::uint32_t sys_ioport_create(std::uint32_t untyped_cap, std::uint16_t base_port, std::uint16_t port_count);
+std::uint32_t sys_ioport_create(std::uint32_t parent_ioport_cap, std::uint32_t untyped_cap, std::uint16_t base_port, std::uint32_t port_count);
 std::uint64_t sys_ioport_read(std::uint32_t ioport_cap, std::uint16_t port, std::uint32_t width);
 int sys_ioport_write(std::uint32_t ioport_cap, std::uint16_t port, std::uint64_t value, std::uint32_t width);
 
@@ -106,5 +106,6 @@ static constexpr std::uint32_t CAP_BOOTINFO = 243;
 static constexpr std::uint32_t CAP_INITRD = 244;
 static constexpr std::uint32_t CAP_SELF_CSPACE = 245;
 static constexpr std::uint32_t CAP_FRAMEBUFFER = 246;
+static constexpr std::uint32_t CAP_ROOT_IOPORT = 247;
 
 } // namespace oz

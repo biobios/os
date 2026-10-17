@@ -315,6 +315,19 @@ void Kernel::setupRootServerCaps(Thread* init_thread, UntypedMemory& boot_untype
         fb_frame->release();
         dprint("[Kernel] FrameBuffer capability created.\n\r");
     }
+
+    // 9. Setup Root IOPort capability (Slot 247)
+    auto* root_ioport = boot_untyped.allocateObject<IOPort>(
+        0x0000, 0x10000,
+        g_read_io8_fn, g_read_io16_fn, g_read_io32_fn,
+        g_write_io8_fn, g_write_io16_fn, g_write_io32_fn
+    );
+    if (root_ioport) {
+        Capability ioport_cap(root_ioport, CapRights::ALL);
+        init_cspace->insert(247, ioport_cap);
+        root_ioport->release();
+        dprint("[Kernel] Root IOPort capability created (Slot 247).\n\r");
+    }
 }
 
 void Kernel::setupIdleThread() {

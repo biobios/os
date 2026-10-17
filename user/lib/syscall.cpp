@@ -182,8 +182,8 @@ int sys_irq_ack(std::uint32_t irq_handler_cap) {
     return static_cast<int>(syscall(19, irq_handler_cap, 0, 0, 0, 0, 0));
 }
 
-std::uint32_t sys_ioport_create(std::uint32_t untyped_cap, std::uint16_t base_port, std::uint16_t port_count) {
-    return static_cast<std::uint32_t>(syscall(20, untyped_cap, base_port, port_count, 0, 0, 0));
+std::uint32_t sys_ioport_create(std::uint32_t parent_ioport_cap, std::uint32_t untyped_cap, std::uint16_t base_port, std::uint32_t port_count) {
+    return static_cast<std::uint32_t>(syscall(20, parent_ioport_cap, untyped_cap, base_port, port_count, 0, 0));
 }
 
 std::uint64_t sys_ioport_read(std::uint32_t ioport_cap, std::uint16_t port, std::uint32_t width) {

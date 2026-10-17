@@ -9,7 +9,17 @@ static void (*unblock_fn)(Thread*) = nullptr;
 static void (*tick_fn)() = nullptr;
 
 void registerHandler(std::uint8_t vector, IRQHandler* handler) {
-    dispatch_table[vector] = handler;
+    if (dispatch_table[vector] == nullptr) {
+        dispatch_table[vector] = handler;
+    }
+}
+
+bool unregisterHandler(std::uint8_t vector, IRQHandler* handler) {
+    if (dispatch_table[vector] == handler) {
+        dispatch_table[vector] = nullptr;
+        return true;
+    }
+    return false;
 }
 
 IRQHandler* getHandler(std::uint8_t vector) {

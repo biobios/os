@@ -16,6 +16,7 @@
 //   244: CAP_INITRD
 //   245: CAP_SELF_CSPACE
 //   246: CAP_FRAMEBUFFER
+//   247: CAP_ROOT_IOPORT
 
 static constexpr std::uint32_t CAP_AHCI_SEND = 2;
 static constexpr std::uint32_t CAP_VFS_SEND = 3;
