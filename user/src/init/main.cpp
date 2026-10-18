@@ -779,6 +779,17 @@ extern "C" void _start() {
                 startup_info.add_cap(next_slot++, oz::CapRole::ROOT_DIR, "/");
             }
 
+            // Test arguments passing (including spaced argument) and delegated capability
+            startup_info.add_arg("manifest_test");
+            startup_info.add_arg("test.txt");
+            startup_info.add_arg("spaced argument.log");
+
+            std::uint32_t delegated_slot = next_slot++;
+            startup_info.add_cap(delegated_slot, oz::CapRole::CUSTOM, "test.txt");
+
+            std::uint32_t test_file_send = 0, test_file_recv = 0;
+            oz::sys_channel_create(oz::CAP_UNTYPED, &test_file_send, &test_file_recv);
+
             auto test_proc = oz::loader::spawn_process(oz::CAP_UNTYPED, oz::CAP_SELF_VSPACE, test_file.data, test_file.size, &startup_info);
             if (test_proc.success) {
                 // Insert granted capabilities into child's CSpace
@@ -787,6 +798,8 @@ extern "C" void _start() {
                         oz::sys_cspace_cap_insert(test_proc.cspace_cap, startup_info.caps[i].slot, cons_send, static_cast<std::uint32_t>(oz::CapRights::WRITE | oz::CapRights::GRANT));
                     }
                 }
+                // Insert delegated test.txt capability into slot
+                oz::sys_cspace_cap_insert(test_proc.cspace_cap, delegated_slot, test_file_send, static_cast<std::uint32_t>(oz::CapRights::READ | oz::CapRights::WRITE | oz::CapRights::GRANT));
 
                 oz::sys_tcb_resume(test_proc.tcb_cap);
                 oz::sys_debug_print("[Init] manifest_test process spawned and resumed.\n\r");

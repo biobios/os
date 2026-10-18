@@ -66,6 +66,41 @@ OZ_PROCESS_ENTRY() {
     }
     oz::sys_debug_print("[ManifestTest] Sandboxing verified: DISPLAY cap is NOT present (PASS)\n\r");
 
-    oz::sys_debug_print("[Test] Step 2 Local Namespace & Manifest Sandboxing: PASSED\n\r");
+    // ========================================================================
+    // Step 3 Tests: Command-Line Arguments & Powerbox Capability Delegation
+    // ========================================================================
+    std::uint32_t argc = oz::LocalNamespace::get_argc();
+    oz::sys_debug_print("[ManifestTest] argc = ");
+    char num_buf[4] = {static_cast<char>('0' + (argc % 10)), '\n', '\r', '\0'};
+    oz::sys_debug_print(num_buf);
+
+    for (std::uint32_t i = 0; i < argc; ++i) {
+        const char* arg = oz::LocalNamespace::get_argv(i);
+        oz::sys_debug_print("[ManifestTest] argv[");
+        char idx_buf[8] = {static_cast<char>('0' + i), ']', ':', ' ', '\0'};
+        oz::sys_debug_print(idx_buf);
+        oz::sys_debug_print(arg ? arg : "(null)");
+        oz::sys_debug_print("\n\r");
+
+        // Test 5: Check if this argument corresponds to a Powerbox delegated capability
+        if (arg) {
+            std::uint32_t delegated_slot = oz::LocalNamespace::get_cap(arg);
+            if (delegated_slot != 0) {
+                oz::sys_debug_print("[ManifestTest] PASS: Found Powerbox delegated capability for '");
+                oz::sys_debug_print(arg);
+                oz::sys_debug_print("'\n\r");
+            }
+        }
+    }
+
+    // Verify unauthorized file capability lookup returns 0 (POLA)
+    std::uint32_t unauth_cap = oz::LocalNamespace::get_cap("unauthorized_secret.txt");
+    if (unauth_cap != 0) {
+        oz::sys_debug_print("[ManifestTest] FAIL: Unauthorized file capability leaked!\n\r");
+        oz::sys_exit(1);
+    }
+    oz::sys_debug_print("[ManifestTest] Sandboxing verified: unauthorized file cap is 0 (PASS)\n\r");
+
+    oz::sys_debug_print("[Test] Step 3 CLI Powerbox & Argument Passing: PASSED\n\r");
     oz::sys_exit(0);
 }

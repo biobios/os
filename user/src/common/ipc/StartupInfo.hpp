@@ -46,16 +46,24 @@ enum class CapRole : std::uint32_t {
 struct StartupCapEntry {
     std::uint32_t slot{0};       // Slot ID in child's CSpace
     CapRole       role{CapRole::NONE};
-    char          name[24]{};    // Logical name (e.g. "stdin", "/", "display")
+    char          name[32]{};    // Logical name (e.g. "stdin", "/", "memo.txt")
 };
 
 struct ProcessStartupInfo {
     static constexpr std::uint32_t MAGIC = 0x49535A4FULL; // 'OZSI'
     static constexpr std::size_t MAX_CAPS = 16;
+    static constexpr std::size_t MAX_ARGS = 16;
+    static constexpr std::size_t ARG_BUF_SIZE = 512;
 
     std::uint32_t magic{MAGIC};
     std::uint32_t num_caps{0};
     StartupCapEntry caps[MAX_CAPS]{};
+
+    // Command-line arguments
+    std::uint32_t argc{0};
+    std::uint32_t arg_buf_len{0};
+    std::uint32_t arg_offsets[MAX_ARGS]{};
+    char          arg_buf[ARG_BUF_SIZE]{};
 
     // Helper: find slot by role
     std::uint32_t find_slot(CapRole role) const {
@@ -67,6 +75,7 @@ struct ProcessStartupInfo {
 
     // Helper: find slot by name
     std::uint32_t find_slot_by_name(const char* name_query) const {
+        if (!name_query) return 0;
         for (std::size_t i = 0; i < num_caps; ++i) {
             const char* a = caps[i].name;
             const char* b = name_query;
@@ -92,6 +101,29 @@ struct ProcessStartupInfo {
         }
         caps[num_caps].name[i] = '\0';
         num_caps++;
+        return true;
+    }
+
+    // Helper: get argument by index
+    const char* get_arg(std::size_t index) const {
+        if (index >= argc || index >= MAX_ARGS) return nullptr;
+        return &arg_buf[arg_offsets[index]];
+    }
+
+    // Helper: add argument
+    bool add_arg(const char* str) {
+        if (argc >= MAX_ARGS || !str) return false;
+        std::size_t len = 0;
+        while (str[len] != '\0') len++;
+
+        if (arg_buf_len + len + 1 > ARG_BUF_SIZE) return false;
+
+        arg_offsets[argc] = arg_buf_len;
+        for (std::size_t i = 0; i < len; ++i) {
+            arg_buf[arg_buf_len++] = str[i];
+        }
+        arg_buf[arg_buf_len++] = '\0';
+        argc++;
         return true;
     }
 };
@@ -124,6 +156,14 @@ public:
         if (!g_info) return fallback;
         std::uint32_t slot = g_info->find_slot_by_name(name);
         return (slot != 0) ? slot : fallback;
+    }
+
+    static std::uint32_t get_argc() {
+        return g_info ? g_info->argc : 0;
+    }
+
+    static const char* get_argv(std::size_t index) {
+        return g_info ? g_info->get_arg(index) : nullptr;
     }
 };
 
