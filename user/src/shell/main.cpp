@@ -343,7 +343,44 @@ static std::size_t str_len(const char* s) {
     return len;
 }
 
-static bool execute_spawn(const CommandArgs& cmd_args, std::uint32_t override_stdin_cap = 0, std::uint32_t override_stdout_cap = 0) {
+struct ProcessHandle {
+    std::uint32_t tcb_cap{oz::INVALID_CAP_ID};
+    std::uint32_t cspace_cap{oz::INVALID_CAP_ID};
+    std::uint32_t vspace_cap{oz::INVALID_CAP_ID};
+    std::uint32_t untyped_cap{oz::INVALID_CAP_ID};
+    std::uint32_t exit_notif{oz::INVALID_CAP_ID};
+
+    int wait_and_reclaim() {
+        int exit_code = 0;
+        if (exit_notif != oz::INVALID_CAP_ID) {
+            std::uint64_t badge = 0;
+            oz::sys_notification_wait(exit_notif, &badge);
+            exit_code = static_cast<int>(badge & 0xFFFFFFFFULL);
+            oz::sys_cap_delete(exit_notif);
+            exit_notif = oz::INVALID_CAP_ID;
+        }
+        if (untyped_cap != oz::INVALID_CAP_ID) {
+            oz::sys_untyped_revoke(untyped_cap);
+            oz::sys_cap_delete(untyped_cap);
+            untyped_cap = oz::INVALID_CAP_ID;
+        }
+        if (tcb_cap != oz::INVALID_CAP_ID) {
+            oz::sys_cap_delete(tcb_cap);
+            tcb_cap = oz::INVALID_CAP_ID;
+        }
+        if (cspace_cap != oz::INVALID_CAP_ID) {
+            oz::sys_cap_delete(cspace_cap);
+            cspace_cap = oz::INVALID_CAP_ID;
+        }
+        if (vspace_cap != oz::INVALID_CAP_ID) {
+            oz::sys_cap_delete(vspace_cap);
+            vspace_cap = oz::INVALID_CAP_ID;
+        }
+        return exit_code;
+    }
+};
+
+static bool execute_spawn(const CommandArgs& cmd_args, std::uint32_t override_stdin_cap = 0, std::uint32_t override_stdout_cap = 0, ProcessHandle* out_handle = nullptr) {
     if (cmd_args.argc == 0) return false;
 
     std::size_t prog_idx = 0;
@@ -474,8 +511,26 @@ static bool execute_spawn(const CommandArgs& cmd_args, std::uint32_t override_st
         startup_info.add_arg(cmd_args.args[i]);
     }
 
+    // Allocate dedicated child UntypedMemory (at least 2MB, aligned power of two)
+    std::size_t needed = sz + 64 * 1024 + 1024 * 1024;
+    std::size_t child_ut_size = 2 * 1024 * 1024;
+    while (child_ut_size < needed) {
+        child_ut_size <<= 1;
+    }
+
+    std::uint32_t child_untyped = oz::sys_untyped_retype(
+        oz::CAP_UNTYPED,
+        static_cast<std::uint32_t>(oz::ObjectType::UntypedMemory),
+        child_ut_size
+    );
+    if (child_untyped == oz::INVALID_CAP_ID) {
+        oz::sys_write("Failed to allocate Untyped memory for child process\n\r");
+        oz::sys_vspace_unmap(oz::CAP_SELF_VSPACE, STAGING_ADDR);
+        return false;
+    }
+
     auto proc = oz::loader::spawn_process(
-        oz::CAP_UNTYPED, oz::CAP_SELF_VSPACE,
+        child_untyped, oz::CAP_SELF_VSPACE,
         reinterpret_cast<const std::uint8_t*>(staging), sz,
         has_manifest ? &startup_info : nullptr
     );
@@ -501,12 +556,34 @@ static bool execute_spawn(const CommandArgs& cmd_args, std::uint32_t override_st
                 static_cast<std::uint32_t>(oz::CapRights::READ | oz::CapRights::WRITE | oz::CapRights::GRANT)
             );
         }
+        // Create exit notification for child process
+        std::uint32_t exit_notif = oz::sys_notification_create(oz::CAP_UNTYPED);
+        if (exit_notif != oz::INVALID_CAP_ID) {
+            oz::sys_tcb_set_exit_notification(proc.tcb_cap, exit_notif, 0);
+        }
+
+        ProcessHandle handle{
+            .tcb_cap = proc.tcb_cap,
+            .cspace_cap = proc.cspace_cap,
+            .vspace_cap = proc.vspace_cap,
+            .untyped_cap = child_untyped,
+            .exit_notif = exit_notif,
+        };
+
         oz::sys_tcb_resume(proc.tcb_cap);
         oz::sys_write("Spawned process: ");
         oz::sys_write(prog_name);
         oz::sys_write("\n\r");
+
+        if (out_handle) {
+            *out_handle = handle;
+        } else {
+            handle.wait_and_reclaim();
+        }
         return true;
     } else {
+        oz::sys_untyped_revoke(child_untyped);
+        oz::sys_cap_delete(child_untyped);
         oz::sys_write("Failed to spawn process\n\r");
         return false;
     }
@@ -551,8 +628,12 @@ static bool execute_pipeline(const char* line) {
 
     oz::sys_write("[Pipeline] Created Channel pipe: write / read\n\r");
 
-    // Spawn right-side command first with pipe_r connected to STDIN
-    execute_spawn(cmd_right, pipe_r, 0);
+    ProcessHandle handle_right{};
+    ProcessHandle handle_left{};
+
+    // Spawn right-side command first with pipe_r connected to STDIN (non-blocking)
+    execute_spawn(cmd_right, pipe_r, 0, &handle_right);
+    oz::sys_cap_delete(pipe_r); // Shell drops its own copy of pipe_r so only right-side owns it
 
     // If left-side is "echo", write directly to pipe_w and close
     if (str_equals(cmd_left.args[0], "echo")) {
@@ -566,9 +647,14 @@ static bool execute_pipeline(const char* line) {
         oz::io::write_cap(pipe_w, "\n\r", 2);
         oz::sys_cap_delete(pipe_w); // Close write end to signal EOF to right-side
     } else {
-        // Spawn left-side command with pipe_w connected to STDOUT
-        execute_spawn(cmd_left, 0, pipe_w);
+        // Spawn left-side command with pipe_w connected to STDOUT (non-blocking)
+        execute_spawn(cmd_left, 0, pipe_w, &handle_left);
+        oz::sys_cap_delete(pipe_w); // Shell drops its own copy of pipe_w so only left-side owns it
     }
+
+    // Wait for pipeline children to exit and reclaim their resources
+    handle_left.wait_and_reclaim();
+    handle_right.wait_and_reclaim();
 
     return true;
 }
@@ -655,6 +741,9 @@ static void execute_command(const char* line) {
 extern "C" void _start() {
     oz::sys_write("\n\r=== OZ OS Interactive Shell ===\n\r");
     oz::sys_write("Type 'help' for a list of commands.\n\r\n\r");
+
+    // Ensure staging area intermediate page tables exist in shell's VSpace using CAP_UNTYPED
+    oz::sys_vspace_ensure_pagetables_range(oz::CAP_SELF_VSPACE, oz::CAP_UNTYPED, 0x550000000000ULL, 16 * 1024 * 1024);
 
     // Map VFS shared buffer if available
     if (oz::sys_vspace_map_with_pagetables(oz::CAP_SELF_VSPACE, oz::CAP_UNTYPED, CAP_VFS_SHARED_BUF, VFS_SHARED_BUF_VIRT, 0x01, 16 * 4096) == 0) {

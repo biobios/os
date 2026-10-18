@@ -113,6 +113,33 @@ public:
         return obj;
     }
 
+    // Retype into a child UntypedMemory
+    UntypedMemory* retypeUntyped(std::size_t size_bytes) {
+        if (size_bytes == 0 || (size_bytes & 0xFFF) != 0) return nullptr;
+
+        // 1. Allocate metadata (UntypedMemory struct)
+        std::uintptr_t meta_phys = 0;
+        void* meta_mem = allocateBytes(sizeof(UntypedMemory), alignof(UntypedMemory), meta_phys);
+        if (!meta_mem) return nullptr;
+
+        // 2. Allocate aligned physical pages for child untyped
+        std::size_t align = 4096;
+        while ((align << 1) <= size_bytes && (align << 1) != 0) {
+            align <<= 1;
+        }
+
+        std::uintptr_t child_phys = 0;
+        void* child_mem = allocateBytes(size_bytes, align, child_phys);
+        if (!child_mem) {
+            watermark_ = meta_phys - phys_base_;
+            return nullptr;
+        }
+
+        auto* child = new (meta_mem) UntypedMemory(child_phys, size_bytes, nullptr, nullptr, is_device_, true);
+        this->addChild(child);
+        return child;
+    }
+
     // Retype into a Frame (user-mapped physical memory)
     Frame* retypeFrame(std::size_t num_pages) {
         if (num_pages == 0) return nullptr;

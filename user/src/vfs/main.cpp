@@ -110,7 +110,18 @@ static FileSession file_sessions[MAX_FILE_SESSIONS] = {};
 
 static void handle_file_session_request(FileSession& sess) {
     oz::IPCMessage req{};
-    if (!oz::sys_channel_recv(sess.vfs_ep, &req)) return;
+    if (!oz::sys_channel_recv(sess.vfs_ep, &req)) {
+        if (sess.file) {
+            sess.file->close();
+            delete sess.file;
+            sess.file = nullptr;
+        }
+        oz::sys_channel_bind_notification(sess.vfs_ep, oz::INVALID_CAP_ID, 0);
+        oz::sys_cap_delete(sess.vfs_ep);
+        sess.vfs_ep = 0;
+        sess.in_use = false;
+        return;
+    }
 
     auto cmd = oz::ipc::file_get_cmd(req.data[0]);
     std::uint32_t req_len = oz::ipc::file_get_len(req.data[0]);
@@ -171,7 +182,17 @@ static void handle_file_session_request(FileSession& sess) {
     }
 
     if (sess.vfs_ep != 0) {
-        oz::sys_channel_send(sess.vfs_ep, &resp);
+        if (!oz::sys_channel_send(sess.vfs_ep, &resp)) {
+            if (sess.file) {
+                sess.file->close();
+                delete sess.file;
+                sess.file = nullptr;
+            }
+            oz::sys_channel_bind_notification(sess.vfs_ep, oz::INVALID_CAP_ID, 0);
+            oz::sys_cap_delete(sess.vfs_ep);
+            sess.vfs_ep = 0;
+            sess.in_use = false;
+        }
     }
 }
 

@@ -322,6 +322,13 @@ extern "C" std::uint64_t handleSyscall(std::uint64_t rdi, std::uint64_t rsi, std
     } else if (syscall_number == 60) {
         // exit
         dprint("User process exited.\n\r");
+        if (g_get_current_thread_func) {
+            Thread* cur = g_get_current_thread_func();
+            if (cur && cur->exit_notif && !cur->exit_notif->isRevoked()) {
+                std::uint64_t status = rdi & 0xFFFFFFFFULL;
+                cur->exit_notif->signal(cur->exit_badge | status);
+            }
+        }
         if (g_exit_thread_func) g_exit_thread_func();
         return 0;
     } else if (syscall_number == 6) {
@@ -658,6 +665,10 @@ extern "C" std::uint64_t handleSyscall(std::uint64_t rdi, std::uint64_t rsi, std
             obj = untyped->retypeTCB(g_queue_thread_func);
         } else if (target_type == ObjectType::CSpaceCap) {
             obj = untyped->retypeCSpace();
+        } else if (target_type == ObjectType::UntypedMemory) {
+            obj = untyped->retypeUntyped(rdx); // rdx = size in bytes
+        } else if (target_type == ObjectType::Notification) {
+            obj = untyped->retypeNotification();
         } else if (target_type == ObjectType::ChannelEndpoint) {
             ChannelEndpoint* end0 = nullptr;
             ChannelEndpoint* end1 = nullptr;
@@ -880,6 +891,26 @@ extern "C" std::uint64_t handleSyscall(std::uint64_t rdi, std::uint64_t rsi, std
         std::uint64_t val = notif->poll();
         *reinterpret_cast<std::uint64_t*>(rsi) = val;
         return (val != 0) ? 0 : 1;
+    } else if (syscall_number == 39) {
+        // sys_tcb_set_exit_notification(tcb_cap, notif_cap, badge)
+        CSpace* cspace = get_cspace();
+        if (!cspace) return -1;
+
+        TCB* tcb = get_cap_typed<TCB>(
+            cspace, static_cast<CapID>(rdi), ObjectType::TCB, CapRights::WRITE);
+        if (!tcb) return -1;
+
+        if (rsi == INVALID_CAP_ID) {
+            tcb->setExitNotification(nullptr, 0);
+            return 0;
+        }
+
+        Notification* notif = get_cap_typed<Notification>(
+            cspace, static_cast<CapID>(rsi), ObjectType::Notification, CapRights::WRITE);
+        if (!notif) return -1;
+
+        tcb->setExitNotification(notif, rdx);
+        return 0;
     }
     
     return static_cast<std::uint64_t>(-1);

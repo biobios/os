@@ -4,6 +4,7 @@
 #include <cstdint>
 
 #include "core/VSpace.hpp"
+#include "core/Notification.hpp"
 #include "utils/utils.hpp"
 
 namespace oz {
@@ -62,6 +63,21 @@ public:
 
     ChannelEndpoint* getFaultEndpoint() const {
         return thread_ ? thread_->fault_ep : nullptr;
+    }
+
+    void setExitNotification(Notification* notif, std::uint64_t badge) {
+        if (thread_) {
+            thread_->exit_notif = notif;
+            thread_->exit_badge = badge;
+        }
+    }
+
+    Notification* getExitNotification() const {
+        return thread_ ? thread_->exit_notif : nullptr;
+    }
+
+    std::uint64_t getExitBadge() const {
+        return thread_ ? thread_->exit_badge : 0;
     }
 
     // Resume: queue thread into scheduler

@@ -161,6 +161,10 @@ int sys_tcb_set_fault_endpoint(std::uint32_t tcb_cap, std::uint32_t ep_cap) {
     return static_cast<int>(syscall(29, tcb_cap, ep_cap, 0, 0, 0, 0));
 }
 
+int sys_tcb_set_exit_notification(std::uint32_t tcb_cap, std::uint32_t notif_cap, std::uint64_t badge) {
+    return static_cast<int>(syscall(39, tcb_cap, notif_cap, badge, 0, 0, 0));
+}
+
 std::uint32_t sys_cspace_create(std::uint32_t untyped_cap) {
     return static_cast<std::uint32_t>(syscall(15, untyped_cap, 0, 0, 0, 0, 0));
 }

@@ -94,6 +94,7 @@ int sys_tcb_configure(std::uint32_t tcb_cap, std::uint32_t cspace_cap,
 int sys_tcb_resume(std::uint32_t tcb_cap);
 int sys_tcb_suspend(std::uint32_t tcb_cap);
 int sys_tcb_set_fault_endpoint(std::uint32_t tcb_cap, std::uint32_t ep_cap);
+int sys_tcb_set_exit_notification(std::uint32_t tcb_cap, std::uint32_t notif_cap, std::uint64_t badge);
 std::uint32_t sys_cspace_create(std::uint32_t untyped_cap);
 int sys_cspace_cap_insert(std::uint32_t cspace_cap, std::uint32_t target_slot,
                           std::uint32_t src_cap, std::uint32_t rights);
