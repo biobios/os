@@ -43,6 +43,13 @@ public:
     
     virtual std::unique_ptr<File> openFile(const char* path) = 0;
     virtual std::unique_ptr<Directory> openDir(const char* path) = 0;
+
+    virtual std::unique_ptr<File> openFileAt(std::uint32_t base_id, const char* rel_path) {
+        (void)base_id; (void)rel_path; return nullptr;
+    }
+    virtual std::unique_ptr<Directory> openDirAt(std::uint32_t base_id, const char* rel_path) {
+        (void)base_id; (void)rel_path; return nullptr;
+    }
 };
 
 class VFS {
@@ -61,6 +68,11 @@ public:
     
     // Open a directory by path
     std::unique_ptr<Directory> openDir(const char* path);
+
+    // Capability-based relative open operations
+    std::unique_ptr<File> openAt(std::uint32_t base_id, const char* rel_path);
+    std::unique_ptr<Directory> openDirAt(std::uint32_t base_id, const char* rel_path);
 };
+
 
 } // namespace oz

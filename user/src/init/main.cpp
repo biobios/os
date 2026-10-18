@@ -28,6 +28,44 @@ static constexpr std::uint64_t INITRD_VADDR   = 0x500000000000ULL;
 static constexpr std::uint64_t VFS_SHARED_BUF_VIRT = 0x300000000000ULL;
 static char* g_vfs_shared_buf = nullptr;
 
+// Capability-based VFS openat result
+struct VfsOpenAtResult {
+    oz::ipc::VfsStatus status{oz::ipc::VfsStatus::NOT_FOUND};
+    int handle{-1};
+    std::uint32_t transferred_cap{oz::INVALID_CAP_ID};
+    std::size_t size{0};
+};
+
+static VfsOpenAtResult vfs_openat(std::uint32_t dir_send_cap, std::uint32_t dir_recv_cap,
+                                  const char* rel_path, oz::ipc::VfsOpenFlags flags,
+                                  std::uint32_t base_dir_handle = 0) {
+    VfsOpenAtResult res{};
+    oz::IPCMessage req{};
+    req.data[0] = oz::ipc::vfs_make_openat_command(0, flags, base_dir_handle);
+
+    char* dst = reinterpret_cast<char*>(&req.data[1]);
+    int i = 0;
+    for (; i < 23 && rel_path[i] != '\0'; i++) {
+        dst[i] = rel_path[i];
+    }
+    dst[i] = '\0';
+
+    if (!oz::sys_channel_send(dir_send_cap, &req)) return res;
+
+    oz::IPCMessage resp{};
+    if (!oz::sys_channel_recv(dir_recv_cap, &resp)) return res;
+
+    res.status = static_cast<oz::ipc::VfsStatus>(resp.data[0]);
+    if (res.status == oz::ipc::VfsStatus::OK) {
+        res.handle = static_cast<int>(resp.data[1]);
+        res.size = static_cast<std::size_t>(resp.data[2]);
+        if (resp.has_cap) {
+            res.transferred_cap = resp.transferred_cap;
+        }
+    }
+    return res;
+}
+
 // Helper: send a VFS file open request
 static int vfs_open(const char* path) {
     oz::IPCMessage req{};
@@ -51,6 +89,7 @@ static int vfs_open(const char* path) {
     }
     return -1;
 }
+
 
 // Helper: read from a VFS file using shared buffer (up to 64KB per chunk)
 static std::size_t vfs_read(int handle, std::size_t offset, char* buf, std::size_t size) {
@@ -481,6 +520,8 @@ extern "C" void _start() {
     oz::sys_write("[Init] VFS server spawned successfully.\n\r");
 
     // 6. Spawn Interactive Shell Server
+
+
     std::uint32_t xhci_key_send = cons_send;
     oz::loader::TarFile shell_file = oz::loader::tar_find_file(initrd_ptr, initrd_size, "shell");
     if (shell_file.data) {
@@ -590,7 +631,61 @@ extern "C" void _start() {
         oz::sys_write("test.txt not found (this is OK if disk has no test.txt).\n\r");
     }
 
+    // ========================================================================
+    // Capability-based VFS Self-Tests (Ambient Authority Elimination)
+    // ========================================================================
+    oz::sys_debug_print("[Init] Running Capability-based VFS self-tests...\n\r");
+
+    // Test 1: Valid relative open of file
+    auto res_file = vfs_openat(CAP_VFS_SEND, CAP_VFS_RECV, "test.txt", oz::ipc::VfsOpenFlags::FILE);
+    if (res_file.status == oz::ipc::VfsStatus::OK && res_file.transferred_cap != oz::INVALID_CAP_ID) {
+        oz::sys_debug_print("[Test] VFS openat relative file (Cap Transfer): PASSED\n\r");
+    } else {
+        oz::sys_debug_print("[Test] VFS openat relative file: FAILED\n\r");
+    }
+
+    // Test 2: Reject ".." in relative path (Sandbox violation)
+    auto res_jailbreak = vfs_openat(CAP_VFS_SEND, CAP_VFS_RECV, "../test.txt", oz::ipc::VfsOpenFlags::FILE);
+    if (res_jailbreak.status == oz::ipc::VfsStatus::INVALID_PATH) {
+        oz::sys_debug_print("[Test] VFS sandbox '..' traversal rejection: PASSED\n\r");
+    } else {
+        oz::sys_debug_print("[Test] VFS sandbox '..' traversal rejection: FAILED\n\r");
+    }
+
+    // Test 3: Reject leading '/' (Absolute path ambient authority violation)
+    auto res_abs = vfs_openat(CAP_VFS_SEND, CAP_VFS_RECV, "/test.txt", oz::ipc::VfsOpenFlags::FILE);
+    if (res_abs.status == oz::ipc::VfsStatus::INVALID_PATH) {
+        oz::sys_debug_print("[Test] VFS sandbox absolute path rejection: PASSED\n\r");
+    } else {
+        oz::sys_debug_print("[Test] VFS sandbox absolute path rejection: FAILED\n\r");
+    }
+
+    // Test 4: Open subdirectory as Directory Capability
+    auto res_dir = vfs_openat(CAP_VFS_SEND, CAP_VFS_RECV, "os", oz::ipc::VfsOpenFlags::DIRECTORY);
+    if (res_dir.status == oz::ipc::VfsStatus::OK && res_dir.transferred_cap != oz::INVALID_CAP_ID) {
+        oz::sys_debug_print("[Test] VFS openat Directory Capability: PASSED\n\r");
+
+        // Test 5: Open child file relative to the new Directory Capability
+        auto res_subfile = vfs_openat(CAP_VFS_SEND, CAP_VFS_RECV, "kernel.bin", oz::ipc::VfsOpenFlags::FILE, res_dir.handle);
+        if (res_subfile.status == oz::ipc::VfsStatus::OK && res_subfile.transferred_cap != oz::INVALID_CAP_ID) {
+            oz::sys_debug_print("[Test] VFS openat child relative to DirectoryCap: PASSED\n\r");
+        } else {
+            oz::sys_debug_print("[Test] VFS openat child relative to DirectoryCap: FAILED\n\r");
+        }
+
+        // Test 6: Attempt '..' escape from Directory Capability
+        auto res_sub_escape = vfs_openat(CAP_VFS_SEND, CAP_VFS_RECV, "../test.txt", oz::ipc::VfsOpenFlags::FILE, res_dir.handle);
+        if (res_sub_escape.status == oz::ipc::VfsStatus::INVALID_PATH) {
+            oz::sys_debug_print("[Test] VFS child '..' escape rejection: PASSED\n\r");
+        } else {
+            oz::sys_debug_print("[Test] VFS child '..' escape rejection: FAILED\n\r");
+        }
+    } else {
+        oz::sys_debug_print("[Test] VFS openat Directory Capability: FAILED\n\r");
+    }
+
     oz::sys_write("Init process completed. Idling...\n\r");
+
     while (true) {
         __asm__ volatile("pause");
     }

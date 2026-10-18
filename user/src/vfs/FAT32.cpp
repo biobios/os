@@ -1,9 +1,10 @@
 #include "FAT32.hpp"
 #include "BufferCache.hpp"
 #include "../common/utils/utils.hpp"
-
+#include "../common/ipc/Protocol.hpp"
 
 namespace oz {
+
 
 // --- FAT32File ---
 
@@ -326,11 +327,12 @@ std::uint32_t FAT32FileSystem::findEntryInDir(std::uint32_t dir_cluster, const c
     return 0; // Not found
 }
 
-std::unique_ptr<File> FAT32FileSystem::openFile(const char* path) {
-    const char* p = path;
-    if (*p == '/') p++;
-    
-    std::uint32_t current_dir_cluster = bpb.root_cluster;
+std::unique_ptr<File> FAT32FileSystem::openFileAt(std::uint32_t base_cluster, const char* rel_path) {
+    if (!rel_path || *rel_path == '\0') return nullptr;
+    if (!ipc::vfs_is_valid_relative_path(rel_path)) return nullptr; // Sandbox violation (e.g. contains '..' or starts with '/')
+
+    const char* p = rel_path;
+    std::uint32_t current_dir_cluster = base_cluster;
     FAT_DirEntry entry;
     std::uint32_t out_dir_cluster = 0;
     std::uint32_t out_entry_offset = 0;
@@ -361,15 +363,16 @@ std::unique_ptr<File> FAT32FileSystem::openFile(const char* path) {
     return nullptr;
 }
 
-std::unique_ptr<Directory> FAT32FileSystem::openDir(const char* path) {
-    const char* p = path;
-    if (*p == '/') p++;
-    
-    if (*p == '\0') {
-        return std::impl::make_unique<FAT32Directory>(this, bpb.root_cluster);
+std::unique_ptr<Directory> FAT32FileSystem::openDirAt(std::uint32_t base_cluster, const char* rel_path) {
+    if (!rel_path) return nullptr;
+    if (*rel_path == '\0' || (rel_path[0] == '.' && rel_path[1] == '\0')) {
+        // Current directory itself
+        return std::impl::make_unique<FAT32Directory>(this, base_cluster);
     }
-    
-    std::uint32_t current_dir_cluster = bpb.root_cluster;
+    if (!ipc::vfs_is_valid_relative_path(rel_path)) return nullptr;
+
+    const char* p = rel_path;
+    std::uint32_t current_dir_cluster = base_cluster;
     FAT_DirEntry entry;
     std::uint32_t out_dir_cluster = 0;
     std::uint32_t out_entry_offset = 0;
@@ -397,6 +400,19 @@ std::unique_ptr<Directory> FAT32FileSystem::openDir(const char* path) {
     }
     return nullptr;
 }
+
+std::unique_ptr<File> FAT32FileSystem::openFile(const char* path) {
+    const char* p = path;
+    while (*p == '/') p++;
+    return openFileAt(bpb.root_cluster, p);
+}
+
+std::unique_ptr<Directory> FAT32FileSystem::openDir(const char* path) {
+    const char* p = path;
+    while (*p == '/') p++;
+    return openDirAt(bpb.root_cluster, p);
+}
+
 
 bool FAT32FileSystem::writeCluster(std::uint32_t cluster, const void* buffer) {
     if (cluster < 2) return false;

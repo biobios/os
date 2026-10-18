@@ -95,6 +95,7 @@ public:
 
     bool readEntry(char* nameOut, std::size_t maxLen, bool& isDirOut) override;
     void close() override;
+    std::uint32_t getFirstCluster() const { return first_cluster; }
 };
 
 class FAT32FileSystem : public FileSystem {
@@ -114,6 +115,13 @@ public:
 
     std::unique_ptr<File> openFile(const char* path) override;
     std::unique_ptr<Directory> openDir(const char* path) override;
+
+    // Capability-based relative open operations
+    std::uint32_t getRootCluster() const { return bpb.root_cluster; }
+    std::unique_ptr<File> openFileAt(std::uint32_t base_cluster, const char* rel_path) override;
+    std::unique_ptr<Directory> openDirAt(std::uint32_t base_cluster, const char* rel_path) override;
+
+
 
     // Helper functions for reading clusters
     std::uint32_t getNextCluster(std::uint32_t current_cluster);

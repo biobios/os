@@ -50,6 +50,42 @@ static void free_handle(int handle) {
     }
 }
 
+// Handle table for open directories (handle 0 is reserved for root directory)
+struct OpenDirectory {
+    std::uint32_t cluster{0};
+    oz::Directory* dir{nullptr};
+};
+static constexpr int MAX_OPEN_DIRS = 16;
+static OpenDirectory open_dirs[MAX_OPEN_DIRS] = {};
+
+static int alloc_dir_handle(std::uint32_t cluster, oz::Directory* d) {
+    for (int i = 1; i < MAX_OPEN_DIRS; i++) {
+        if (!open_dirs[i].dir && open_dirs[i].cluster == 0) {
+            open_dirs[i].cluster = cluster;
+            open_dirs[i].dir = d;
+            return i;
+        }
+    }
+    return -1;
+}
+
+static OpenDirectory* get_dir(int handle) {
+    if (handle < 0 || handle >= MAX_OPEN_DIRS) return nullptr;
+    return &open_dirs[handle];
+}
+
+static void free_dir_handle(int handle) {
+    if (handle > 0 && handle < MAX_OPEN_DIRS) {
+        if (open_dirs[handle].dir) {
+            open_dirs[handle].dir->close();
+            delete open_dirs[handle].dir;
+        }
+        open_dirs[handle].dir = nullptr;
+        open_dirs[handle].cluster = 0;
+    }
+}
+
+
 // Extract a path string packed in IPCMessage data[1..3] (up to 24 bytes)
 static void extract_path(const oz::IPCMessage& msg, char* path, std::size_t max_len) {
     const char* src = reinterpret_cast<const char*>(&msg.data[1]);
@@ -113,6 +149,80 @@ extern "C" void _start() {
         std::uint32_t reply_cap = (client_id < MAX_CLIENTS) ? (CAP_CLIENT_REPLY_BASE + client_id) : 0;
 
         switch (cmd) {
+            case oz::ipc::VfsCmd::OPENAT: {
+                std::uint32_t flags = static_cast<std::uint32_t>((req.data[0] >> 48) & 0xFF);
+                std::uint32_t base_dir_handle = static_cast<std::uint32_t>((req.data[0] >> 56) & 0xFF);
+
+                char path[25];
+                extract_path(req, path, sizeof(path));
+
+                // 1. Strict sandbox check: relative path without '..'
+                if (!oz::ipc::vfs_is_valid_relative_path(path)) {
+                    oz::sys_write("VFS: [Security] OPENAT rejected invalid relative path (ambient authority violation)!\n\r");
+                    resp.data[0] = static_cast<std::uint64_t>(oz::ipc::VfsStatus::INVALID_PATH);
+                    break;
+                }
+
+                // 2. Resolve base directory cluster
+                std::uint32_t base_cluster = fat32.getRootCluster();
+                if (base_dir_handle > 0) {
+                    OpenDirectory* d = get_dir(base_dir_handle);
+                    if (d && d->cluster != 0) {
+                        base_cluster = d->cluster;
+                    } else {
+                        resp.data[0] = static_cast<std::uint64_t>(oz::ipc::VfsStatus::NOT_FOUND);
+                        break;
+                    }
+                }
+
+                if (flags == static_cast<std::uint32_t>(oz::ipc::VfsOpenFlags::DIRECTORY)) {
+                    auto dir = fat32.openDirAt(base_cluster, path);
+                    if (dir) {
+                        std::uint32_t dir_first_cluster = static_cast<oz::FAT32Directory*>(dir.get())->getFirstCluster();
+                        int handle = alloc_dir_handle(dir_first_cluster, dir.release());
+                        if (handle >= 0) {
+                            std::uint32_t vfs_ep = 0, client_ep = 0;
+                            if (oz::sys_channel_create(oz::CAP_UNTYPED, &vfs_ep, &client_ep)) {
+                                resp.data[0] = static_cast<std::uint64_t>(oz::ipc::VfsStatus::OK);
+                                resp.data[1] = static_cast<std::uint64_t>(handle);
+                                resp.transferred_cap = client_ep;
+                                resp.has_cap = true;
+                                oz::sys_write("VFS: OPENAT Directory succeeded, transferred new Channel Cap.\n\r");
+                            } else {
+                                resp.data[0] = static_cast<std::uint64_t>(oz::ipc::VfsStatus::IO_ERROR);
+                            }
+                        } else {
+                            resp.data[0] = static_cast<std::uint64_t>(oz::ipc::VfsStatus::TOO_MANY_OPEN);
+                        }
+                    } else {
+                        resp.data[0] = static_cast<std::uint64_t>(oz::ipc::VfsStatus::NOT_FOUND);
+                    }
+                } else {
+                    auto file = fat32.openFileAt(base_cluster, path);
+                    if (file) {
+                        std::size_t sz = file->getSize();
+                        int handle = alloc_handle(file.release());
+                        if (handle >= 0) {
+                            std::uint32_t vfs_ep = 0, client_ep = 0;
+                            if (oz::sys_channel_create(oz::CAP_UNTYPED, &vfs_ep, &client_ep)) {
+                                resp.data[0] = static_cast<std::uint64_t>(oz::ipc::VfsStatus::OK);
+                                resp.data[1] = static_cast<std::uint64_t>(handle);
+                                resp.data[2] = static_cast<std::uint64_t>(sz);
+                                resp.transferred_cap = client_ep;
+                                resp.has_cap = true;
+                                oz::sys_write("VFS: OPENAT File succeeded, transferred new Channel Cap.\n\r");
+                            } else {
+                                resp.data[0] = static_cast<std::uint64_t>(oz::ipc::VfsStatus::IO_ERROR);
+                            }
+                        } else {
+                            resp.data[0] = static_cast<std::uint64_t>(oz::ipc::VfsStatus::TOO_MANY_OPEN);
+                        }
+                    } else {
+                        resp.data[0] = static_cast<std::uint64_t>(oz::ipc::VfsStatus::NOT_FOUND);
+                    }
+                }
+                break;
+            }
             case oz::ipc::VfsCmd::OPEN: {
                 char path[25];
                 extract_path(req, path, sizeof(path));
@@ -130,6 +240,7 @@ extern "C" void _start() {
                 }
                 break;
             }
+
             case oz::ipc::VfsCmd::READ: {
                 int handle = static_cast<int>(req.data[1]);
                 std::size_t offset = static_cast<std::size_t>(req.data[2]);
