@@ -1,5 +1,7 @@
 #include "syscall.hpp"
 #include "Font.hpp"
+#include "../common/ipc/Protocol.hpp"
+#include "../common/utils/utils.hpp"
 
 namespace {
 
@@ -60,6 +62,32 @@ public:
         fillRect(0, 0, width_, height_, color);
     }
 
+    void blit(std::int32_t dst_x, std::int32_t dst_y, const Pixel* src, std::uint32_t src_w, std::uint32_t src_h) {
+        if (!fb_ || !src) return;
+
+        std::int32_t start_x = (dst_x < 0) ? -dst_x : 0;
+        std::int32_t start_y = (dst_y < 0) ? -dst_y : 0;
+
+        std::int32_t end_x = static_cast<std::int32_t>(src_w);
+        if (dst_x + end_x > static_cast<std::int32_t>(width_)) {
+            end_x = static_cast<std::int32_t>(width_) - dst_x;
+        }
+        std::int32_t end_y = static_cast<std::int32_t>(src_h);
+        if (dst_y + end_y > static_cast<std::int32_t>(height_)) {
+            end_y = static_cast<std::int32_t>(height_) - dst_y;
+        }
+
+        for (std::int32_t sy = start_y; sy < end_y; ++sy) {
+            std::int32_t dy = dst_y + sy;
+            if (dy < 0 || dy >= static_cast<std::int32_t>(height_)) continue;
+            for (std::int32_t sx = start_x; sx < end_x; ++sx) {
+                std::int32_t dx = dst_x + sx;
+                if (dx < 0 || dx >= static_cast<std::int32_t>(width_)) continue;
+                fb_[dy * width_ + dx] = src[sy * src_w + sx];
+            }
+        }
+    }
+
     void drawChar(std::uint32_t x, std::uint32_t y, char c, Pixel fg) {
         if (c < 32 || c > 126) return;
         if (x + FONT_WIDTH > width_ || y + FONT_HEIGHT > height_) return;
@@ -97,6 +125,7 @@ public:
     std::uint32_t width() const { return width_; }
     std::uint32_t height() const { return height_; }
 };
+
 
 static DisplayDriver g_display;
 
@@ -243,10 +272,86 @@ void renderDesktop(DisplayDriver& disp) {
     disp.drawString(12, 6, "OZ Operating System (Capability-Based Microkernel)", Pixel{0xd0, 0xd0, 0xd0, 0});
 }
 
+void drawCursor(DisplayDriver& disp, std::int32_t x, std::int32_t y) {
+
+    static const char* cursor_pattern[16] = {
+        "X          ",
+        "XX         ",
+        "X.X        ",
+        "X..X       ",
+        "X...X      ",
+        "X....X     ",
+        "X.....X    ",
+        "X......X   ",
+        "X.......X  ",
+        "X.....XXXX ",
+        "X..X..X    ",
+        "X.X X..X   ",
+        "XX   X..X  ",
+        "X     X..X ",
+        "       XX  ",
+        "           ",
+    };
+    Pixel black{0, 0, 0, 0};
+    Pixel white{255, 255, 255, 0};
+
+    for (int r = 0; r < 16; ++r) {
+        for (int c = 0; c < 11; ++c) {
+            char p = cursor_pattern[r][c];
+            if (p == 'X') {
+                disp.putPixel(x + c, y + r, black);
+            } else if (p == '.') {
+                disp.putPixel(x + c, y + r, white);
+            }
+        }
+    }
+}
+
+static constexpr std::uint64_t SURFACE_BUF_BASE_VIRT = 0x400000000000ULL;
+static constexpr std::size_t MAX_SURFACES = 8;
+
+struct Surface {
+    std::uint32_t id{0};
+    std::uint32_t width{0};
+    std::uint32_t height{0};
+    std::int32_t x{0};
+    std::int32_t y{0};
+    bool visible{false};
+    std::int32_t z_order{0};
+    std::uint32_t frame_cap{oz::INVALID_CAP_ID};
+    Pixel* buffer{nullptr};
+    std::size_t size{0};
+};
+
+static Surface g_surfaces[MAX_SURFACES] = {};
+static std::int32_t g_cursor_x = 200;
+static std::int32_t g_cursor_y = 150;
+static bool g_cursor_visible = true;
+
+void compose(DisplayDriver& disp) {
+    // 1. Render desktop background
+    renderDesktop(disp);
+
+    // 2. Render surfaces
+    for (std::size_t i = 0; i < MAX_SURFACES; ++i) {
+        if (g_surfaces[i].id != 0 && g_surfaces[i].visible && g_surfaces[i].buffer) {
+            disp.blit(g_surfaces[i].x, g_surfaces[i].y, g_surfaces[i].buffer, g_surfaces[i].width, g_surfaces[i].height);
+        }
+    }
+
+    // 3. Render legacy terminal
+    g_terminal.renderWindowFrame();
+
+    // 4. Render cursor on top
+    if (g_cursor_visible) {
+        drawCursor(disp, g_cursor_x, g_cursor_y);
+    }
+}
+
 } // namespace
 
 extern "C" void _start() {
-    oz::sys_debug_print("[Display] Display Server started (Ring 3)!\n\r");
+    oz::sys_debug_print("[Display] Minimal Display Server started (Ring 3)!\n\r");
 
     // Wait for configuration IPC message from init process on Channel 2
     oz::IPCMessage config_msg{};
@@ -265,24 +370,18 @@ extern "C" void _start() {
         oz::sys_exit(1);
     }
 
-    // ========================================================================
-    // Notification-driven event loop (seL4 Bound Notification pattern)
-    // ========================================================================
+    // Notification-driven event loop
     std::uint32_t notif_cap = oz::sys_notification_create(oz::CAP_UNTYPED);
     if (notif_cap == oz::INVALID_CAP_ID) {
         oz::sys_debug_print("[Display] ERROR: Failed to create Notification!\n\r");
         oz::sys_exit(1);
     }
 
-    // Bind CAP_DISPLAY_RECV to notif_cap with badge 1 (Client 0 / Console)
     static constexpr std::uint64_t BADGE_CONSOLE = 1ULL << 0;
     if (oz::sys_channel_bind_notification(CAP_DISPLAY_RECV, notif_cap, BADGE_CONSOLE) != 0) {
         oz::sys_debug_print("[Display] ERROR: Failed to bind Channel to Notification!\n\r");
         oz::sys_exit(1);
     }
-
-    // Render desktop background
-    renderDesktop(g_display);
 
     // Setup interactive terminal window in center of screen
     std::uint32_t win_w = 640;
@@ -294,8 +393,8 @@ extern "C" void _start() {
     std::uint32_t win_y = (g_display.height() > win_h) ? (g_display.height() - win_h) / 2 : 40;
 
     g_terminal.init(&g_display, win_x, win_y, win_w, win_h);
-    oz::sys_debug_print("[Display] Initial GUI and Terminal window rendered!\n\r");
-    oz::sys_debug_print("[Display] Notification event loop ready.\n\r");
+    compose(g_display);
+    oz::sys_debug_print("[Display] Notification event loop ready (Surface & Blit engine).\n\r");
 
     while (true) {
         std::uint64_t badge = 0;
@@ -303,19 +402,157 @@ extern "C" void _start() {
             continue;
         }
 
-        // Handle Console / Shell input text
         if (badge & BADGE_CONSOLE) {
-            oz::IPCMessage msg{};
-            if (oz::sys_channel_recv(CAP_DISPLAY_RECV, &msg)) {
+            oz::IPCMessage req{};
+            if (!oz::sys_channel_recv(CAP_DISPLAY_RECV, &req)) {
+                oz::sys_debug_print("[Display] Client on Channel 2 disconnected.\n\r");
+                continue;
+            }
+
+            // Check if this is a Display IPC command
+            auto cmd = static_cast<oz::ipc::DisplayCmd>(req.data[0] & 0xFFFFFFFFULL);
+            bool is_cmd = false;
+
+            if (cmd == oz::ipc::DisplayCmd::CREATE_SURFACE ||
+                cmd == oz::ipc::DisplayCmd::COMMIT ||
+                cmd == oz::ipc::DisplayCmd::DESTROY_SURFACE ||
+                cmd == oz::ipc::DisplayCmd::SET_SURFACE_RECT ||
+                cmd == oz::ipc::DisplayCmd::SET_SURFACE_VISIBILITY ||
+                cmd == oz::ipc::DisplayCmd::UPDATE_CURSOR ||
+                cmd == oz::ipc::DisplayCmd::GET_DISPLAY_INFO) {
+                is_cmd = true;
+            }
+
+            if (is_cmd) {
+                oz::IPCMessage resp{};
+                std::uint32_t reply_endpoint = req.has_cap ? req.transferred_cap : 0;
+
+                switch (cmd) {
+                    case oz::ipc::DisplayCmd::CREATE_SURFACE: {
+                        std::uint32_t w = static_cast<std::uint32_t>(req.data[1]);
+                        std::uint32_t h = static_cast<std::uint32_t>(req.data[2]);
+                        int slot = -1;
+                        for (std::size_t i = 0; i < MAX_SURFACES; ++i) {
+                            if (g_surfaces[i].id == 0) {
+                                slot = static_cast<int>(i);
+                                break;
+                            }
+                        }
+
+                        if (slot >= 0 && w > 0 && h > 0) {
+                            std::size_t surf_size = ((w * h * sizeof(Pixel)) + 4095) & ~4095ULL;
+                            std::uint64_t num_pages = surf_size / 4096;
+                            std::uint32_t frame_cap = oz::sys_frame_alloc(oz::CAP_UNTYPED, num_pages);
+
+                            if (frame_cap != oz::INVALID_CAP_ID) {
+                                std::uint64_t virt = SURFACE_BUF_BASE_VIRT + slot * 0x1000000ULL;
+                                if (oz::sys_vspace_map_with_pagetables(oz::CAP_SELF_VSPACE, oz::CAP_UNTYPED, frame_cap, virt, 0x01, surf_size) == 0) {
+                                    g_surfaces[slot].id = slot + 1;
+                                    g_surfaces[slot].width = w;
+                                    g_surfaces[slot].height = h;
+                                    g_surfaces[slot].buffer = reinterpret_cast<Pixel*>(virt);
+                                    g_surfaces[slot].frame_cap = frame_cap;
+                                    g_surfaces[slot].visible = true;
+                                    g_surfaces[slot].size = surf_size;
+
+                                    // Fill buffer with default color
+                                    for (std::size_t p = 0; p < w * h; ++p) {
+                                        g_surfaces[slot].buffer[p] = Pixel{0x20, 0x20, 0x20, 0};
+                                    }
+
+                                    resp.data[0] = 0; // success
+                                    resp.data[1] = slot + 1; // surface_id
+                                    resp.data[2] = surf_size;
+                                    resp.transferred_cap = frame_cap;
+                                    resp.has_cap = true;
+                                    oz::sys_debug_print("[Display] Created Surface successfully!\n\r");
+                                } else {
+                                    resp.data[0] = 2; // map failed
+                                }
+                            } else {
+                                resp.data[0] = 3; // frame alloc failed
+                            }
+                        } else {
+                            resp.data[0] = 1; // no free surface slot
+                        }
+                        break;
+                    }
+                    case oz::ipc::DisplayCmd::COMMIT: {
+                        compose(g_display);
+                        resp.data[0] = 0;
+                        break;
+                    }
+                    case oz::ipc::DisplayCmd::DESTROY_SURFACE: {
+                        std::uint32_t id = static_cast<std::uint32_t>(req.data[1]);
+                        if (id > 0 && id <= MAX_SURFACES) {
+                            std::size_t idx = id - 1;
+                            g_surfaces[idx].id = 0;
+                            g_surfaces[idx].visible = false;
+                            g_surfaces[idx].buffer = nullptr;
+                            compose(g_display);
+                            resp.data[0] = 0;
+                        } else {
+                            resp.data[0] = 1;
+                        }
+                        break;
+                    }
+                    case oz::ipc::DisplayCmd::SET_SURFACE_RECT: {
+                        std::uint32_t id = static_cast<std::uint32_t>(req.data[1]);
+                        if (id > 0 && id <= MAX_SURFACES) {
+                            std::size_t idx = id - 1;
+                            g_surfaces[idx].x = static_cast<std::int32_t>(req.data[2] >> 32);
+                            g_surfaces[idx].y = static_cast<std::int32_t>(req.data[2] & 0xFFFFFFFFULL);
+                            compose(g_display);
+                            resp.data[0] = 0;
+                        } else {
+                            resp.data[0] = 1;
+                        }
+                        break;
+                    }
+                    case oz::ipc::DisplayCmd::SET_SURFACE_VISIBILITY: {
+                        std::uint32_t id = static_cast<std::uint32_t>(req.data[1]);
+                        if (id > 0 && id <= MAX_SURFACES) {
+                            std::size_t idx = id - 1;
+                            g_surfaces[idx].visible = (req.data[2] != 0);
+                            compose(g_display);
+                            resp.data[0] = 0;
+                        } else {
+                            resp.data[0] = 1;
+                        }
+                        break;
+                    }
+                    case oz::ipc::DisplayCmd::UPDATE_CURSOR: {
+                        g_cursor_x = static_cast<std::int32_t>(req.data[1] >> 32);
+                        g_cursor_y = static_cast<std::int32_t>(req.data[1] & 0xFFFFFFFFULL);
+                        g_cursor_visible = (req.data[2] != 0);
+                        compose(g_display);
+                        resp.data[0] = 0;
+                        break;
+                    }
+                    case oz::ipc::DisplayCmd::GET_DISPLAY_INFO: {
+                        resp.data[0] = 0;
+                        resp.data[1] = g_display.width();
+                        resp.data[2] = g_display.height();
+                        break;
+                    }
+                    default:
+                        resp.data[0] = static_cast<std::uint64_t>(-1);
+                        break;
+                }
+
+                if (reply_endpoint != 0) {
+                    oz::sys_channel_send(reply_endpoint, &resp);
+                }
+            } else {
+                // Legacy text from console
                 alignas(8) char buf[33];
                 for (int i = 0; i < 4; ++i) {
-                    *reinterpret_cast<std::uint64_t*>(&buf[i * 8]) = msg.data[i];
+                    *reinterpret_cast<std::uint64_t*>(&buf[i * 8]) = req.data[i];
                 }
                 buf[32] = '\0';
                 g_terminal.write(buf);
-            } else {
-                oz::sys_debug_print("[Display] Client on Channel 2 disconnected.\n\r");
             }
         }
     }
 }
+

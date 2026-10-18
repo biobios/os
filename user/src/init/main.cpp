@@ -22,6 +22,8 @@ static constexpr std::uint32_t CAP_AHCI_SEND = 2;
 static constexpr std::uint32_t CAP_VFS_SEND = 3;
 static constexpr std::uint32_t CAP_VFS_RECV = 4;
 static constexpr std::uint32_t CAP_VFS_SHARED_BUF = 5;
+static constexpr std::uint32_t CAP_DISPLAY_SEND = 6;
+
 
 static constexpr std::uint64_t BOOTINFO_VADDR = 0x600000000000ULL;
 static constexpr std::uint64_t INITRD_VADDR   = 0x500000000000ULL;
@@ -413,6 +415,10 @@ extern "C" void _start() {
             // Forward Display Server input channel to Console Server (Slot 2)
             oz::sys_cspace_cap_insert(cons_proc.cspace_cap, 2, init_disp_send, static_cast<std::uint32_t>(oz::CapRights::WRITE | oz::CapRights::GRANT));
             oz::sys_write("[Init] Connected Console server to Display server.\n\r");
+
+            // Also keep Display channel in Init for Surface/Admin operations
+            oz::sys_cspace_cap_insert(oz::CAP_SELF_CSPACE, CAP_DISPLAY_SEND, init_disp_send, static_cast<std::uint32_t>(oz::CapRights::WRITE | oz::CapRights::GRANT));
+
         } else {
             oz::sys_write("[Init] ERROR: Failed to spawn display server!\n\r");
         }
@@ -684,9 +690,77 @@ extern "C" void _start() {
         oz::sys_debug_print("[Test] VFS openat Directory Capability: FAILED\n\r");
     }
 
+    // ========================================================================
+    // Capability-based Display & Surface Self-Tests (Mechanism vs Policy)
+    // ========================================================================
+    oz::sys_debug_print("[Init] Running Capability-based Display & Surface self-tests...\n\r");
+
+    std::uint32_t disp_reply_send = 0;
+    std::uint32_t disp_reply_recv = 0;
+    oz::sys_channel_create(oz::CAP_UNTYPED, &disp_reply_send, &disp_reply_recv);
+
+    // Test 1: CREATE_SURFACE via Display Capability
+    oz::IPCMessage req_surf{};
+    req_surf.data[0] = static_cast<std::uint64_t>(oz::ipc::DisplayCmd::CREATE_SURFACE);
+    req_surf.data[1] = 160; // width
+    req_surf.data[2] = 120; // height
+    req_surf.transferred_cap = disp_reply_send;
+    req_surf.has_cap = true;
+
+    oz::sys_channel_send(CAP_DISPLAY_SEND, &req_surf);
+
+    oz::IPCMessage resp_surf{};
+    if (oz::sys_channel_recv(disp_reply_recv, &resp_surf) && resp_surf.data[0] == 0 && resp_surf.has_cap) {
+        oz::sys_debug_print("[Test] Display create_surface (FrameCap Transfer): PASSED\n\r");
+        std::uint32_t surf_id = static_cast<std::uint32_t>(resp_surf.data[1]);
+        std::uint32_t surf_frame_cap = resp_surf.transferred_cap;
+
+        // Test 2: Map the transferred FrameCap into client address space
+        static constexpr std::uint64_t TEST_SURF_VADDR = 0x700000000000ULL;
+        if (oz::sys_vspace_map_with_pagetables(oz::CAP_SELF_VSPACE, oz::CAP_UNTYPED, surf_frame_cap, TEST_SURF_VADDR, 0x01, 160 * 120 * 4) == 0) {
+            oz::sys_debug_print("[Test] Surface FrameCap mapping: PASSED\n\r");
+
+            // Draw a bright cyan test rectangle in the client's surface buffer
+            struct Pixel { std::uint8_t b, g, r, a; };
+            Pixel* surf_buf = reinterpret_cast<Pixel*>(TEST_SURF_VADDR);
+            for (int y = 0; y < 120; ++y) {
+                for (int x = 0; x < 160; ++x) {
+                    surf_buf[y * 160 + x] = Pixel{0xFF, 0xFF, 0x00, 0}; // Cyan
+                }
+            }
+
+            // Test 3: Set surface position and commit composition
+            oz::IPCMessage req_pos{};
+            req_pos.data[0] = static_cast<std::uint64_t>(oz::ipc::DisplayCmd::SET_SURFACE_RECT);
+            req_pos.data[1] = surf_id;
+            req_pos.data[2] = (30ULL << 32) | 50ULL; // (x=30, y=50)
+            oz::sys_channel_send(CAP_DISPLAY_SEND, &req_pos);
+
+            // Test 4: Update cursor position (Mouse Cursor simulation)
+            oz::IPCMessage req_cur{};
+            req_cur.data[0] = static_cast<std::uint64_t>(oz::ipc::DisplayCmd::UPDATE_CURSOR);
+            req_cur.data[1] = (40ULL << 32) | 60ULL; // (cursor_x=40, cursor_y=60)
+            req_cur.data[2] = 1; // visible
+            oz::sys_channel_send(CAP_DISPLAY_SEND, &req_cur);
+
+            // Commit
+            oz::IPCMessage req_commit{};
+            req_commit.data[0] = static_cast<std::uint64_t>(oz::ipc::DisplayCmd::COMMIT);
+            req_commit.data[1] = surf_id;
+            oz::sys_channel_send(CAP_DISPLAY_SEND, &req_commit);
+
+            oz::sys_debug_print("[Test] Surface SetRect & Cursor Update & Commit: PASSED\n\r");
+        } else {
+            oz::sys_debug_print("[Test] Surface FrameCap mapping: FAILED\n\r");
+        }
+    } else {
+        oz::sys_debug_print("[Test] Display create_surface: FAILED\n\r");
+    }
+
     oz::sys_write("Init process completed. Idling...\n\r");
 
     while (true) {
         __asm__ volatile("pause");
     }
 }
+

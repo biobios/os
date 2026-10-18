@@ -102,8 +102,40 @@ inline std::uint64_t vfs_make_openat_command(std::uint32_t client_id, VfsOpenFla
            static_cast<std::uint64_t>(VfsCmd::OPENAT);
 }
 
+// ===== Display Server IPC Protocol =====
+// Pure mechanism: Surface composition and pixel blitting
+enum class DisplayCmd : std::uint64_t {
+    CREATE_SURFACE         = 1, // data[1] = width, data[2] = height -> returns surface_id & FrameCap
+    COMMIT                 = 2, // data[1] = surface_id (surface updated)
+    DESTROY_SURFACE        = 3, // data[1] = surface_id
+    // Admin / Window Manager commands
+    SET_SURFACE_RECT       = 10, // data[1] = surface_id, data[2] = (x << 32) | y, data[3] = (w << 32) | h
+    SET_SURFACE_VISIBILITY = 11, // data[1] = surface_id, data[2] = visible (0/1), data[3] = z_order
+    UPDATE_CURSOR          = 12, // data[1] = (x << 32) | y, data[2] = visible
+    GET_DISPLAY_INFO       = 13, // returns width, height, bpp
+};
+
+// ===== Window Manager IPC Protocol =====
+// Policy: Windows, layouts, focus, input filtering
+enum class WMCmd : std::uint64_t {
+    CREATE_WINDOW          = 1, // Client -> WM: data[1] = width, data[2] = height
+                                // Returns: data[1] = win_id, data[2] = surface_id, transferred_cap = InputChannelCap
+    DESTROY_WINDOW         = 2, // Client -> WM: data[1] = win_id
+    SET_TITLE              = 3, // Client -> WM: data[1] = win_id, data[2..3] = title chars
+    FOCUS_WINDOW           = 4, // data[1] = win_id
+};
+
+enum class WMEventType : std::uint64_t {
+    KEY_DOWN               = 1, // data[1] = ascii, data[2] = scancode, data[3] = modifiers
+    KEY_UP                 = 2,
+    MOUSE_MOVE             = 3, // data[1] = rel_x, data[2] = rel_y
+    MOUSE_BUTTON           = 4, // data[1] = buttons, data[2] = rel_x, data[3] = rel_y
+    FOCUS_CHANGED          = 5, // data[1] = 1 (gained) or 0 (lost)
+};
+
 } // namespace ipc
 
 } // namespace oz
+
 
 
