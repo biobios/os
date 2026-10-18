@@ -1,6 +1,7 @@
 #include "syscall.hpp"
 #include "xHCIDriver.hpp"
 #include "HIDKeyboard.hpp"
+#include "../common/ipc/Protocol.hpp"
 
 static constexpr std::uint32_t CAP_CONSOLE_WRITE = 1;
 static constexpr std::uint32_t CAP_IRQ_RECV = 2;
@@ -12,13 +13,19 @@ static void onHIDReport(const std::uint8_t* report) {
     g_keyboard.processReport(report);
     HID::KeyEvent event;
     while (g_keyboard.pop(event)) {
-        if (event.state == HID::KeyState::Pressed && event.ascii != 0) {
-            // Send to console
+        if (event.state == HID::KeyState::Pressed) {
             oz::IPCMessage msg{};
-            char buf[32] = {};
-            buf[0] = event.ascii;
-            for (int k = 0; k < 4; k++)
-                msg.data[k] = *reinterpret_cast<std::uint64_t*>(&buf[k*8]);
+            msg.data[0] = static_cast<std::uint64_t>(oz::ipc::WMEventType::KEY_DOWN);
+            msg.data[1] = static_cast<std::uint64_t>(event.ascii);
+            msg.data[2] = static_cast<std::uint64_t>(event.keycode);
+
+            std::uint32_t mod = 0;
+            if (event.modifiers.left_shift || event.modifiers.right_shift) mod |= static_cast<std::uint32_t>(oz::ipc::WMModifier::SHIFT);
+            if (event.modifiers.left_ctrl || event.modifiers.right_ctrl)   mod |= static_cast<std::uint32_t>(oz::ipc::WMModifier::CTRL);
+            if (event.modifiers.left_alt || event.modifiers.right_alt)     mod |= static_cast<std::uint32_t>(oz::ipc::WMModifier::ALT);
+            if (event.modifiers.left_gui || event.modifiers.right_gui)     mod |= static_cast<std::uint32_t>(oz::ipc::WMModifier::SUPER);
+            msg.data[3] = static_cast<std::uint64_t>(mod);
+
             oz::sys_channel_send(CAP_CONSOLE_WRITE, &msg);
         }
     }

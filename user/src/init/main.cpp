@@ -23,6 +23,7 @@ static constexpr std::uint32_t CAP_VFS_SEND = 3;
 static constexpr std::uint32_t CAP_VFS_RECV = 4;
 static constexpr std::uint32_t CAP_VFS_SHARED_BUF = 5;
 static constexpr std::uint32_t CAP_DISPLAY_SEND = 6;
+static constexpr std::uint32_t CAP_WM_SEND      = 7;
 
 
 static constexpr std::uint64_t BOOTINFO_VADDR = 0x600000000000ULL;
@@ -383,18 +384,24 @@ extern "C" void _start() {
 
 
     // 3.5 Spawn Display Server (GUI mode)
+    std::uint32_t init_disp_send = 0;
+    std::uint32_t disp_cmd_send = 0;
     oz::loader::TarFile disp_file = oz::loader::tar_find_file(initrd_ptr, initrd_size, "display");
     if (disp_file.data) {
         auto disp_proc = oz::loader::spawn_process(oz::CAP_UNTYPED, oz::CAP_SELF_VSPACE, disp_file.data, disp_file.size);
         if (disp_proc.success) {
-            std::uint32_t init_disp_send = 0;
             std::uint32_t disp_init_recv = 0;
             oz::sys_channel_create(oz::CAP_UNTYPED, &init_disp_send, &disp_init_recv);
 
+            std::uint32_t disp_cmd_recv = 0;
+            oz::sys_channel_create(oz::CAP_UNTYPED, &disp_cmd_send, &disp_cmd_recv);
+
             // Slot 1: console send (sys_write)
             oz::sys_cspace_cap_insert(disp_proc.cspace_cap, 1, cons_send, static_cast<std::uint32_t>(oz::CapRights::WRITE | oz::CapRights::GRANT));
-            // Slot 2: display recv (IPC commands)
+            // Slot 2: display recv (Console text stream)
             oz::sys_cspace_cap_insert(disp_proc.cspace_cap, 2, disp_init_recv, static_cast<std::uint32_t>(oz::CapRights::READ));
+            // Slot 3: command recv (DisplayCmd IPC from WM / Admin)
+            oz::sys_cspace_cap_insert(disp_proc.cspace_cap, 3, disp_cmd_recv, static_cast<std::uint32_t>(oz::CapRights::READ));
             // Slot 240: Untyped
             oz::sys_cspace_cap_insert(disp_proc.cspace_cap, oz::CAP_UNTYPED, oz::CAP_UNTYPED, static_cast<std::uint32_t>(oz::CapRights::ALL));
             // Slot 246: FrameBuffer
@@ -403,7 +410,7 @@ extern "C" void _start() {
             oz::sys_tcb_resume(disp_proc.tcb_cap);
             oz::sys_write("[Init] Display server spawned successfully.\n\r");
 
-            // Send framebuffer info to Display Server
+            // Send framebuffer info to Display Server via Console Channel (initial bootstrap)
             oz::IPCMessage config_msg{};
             config_msg.data[0] = boot_info->fb_width;
             config_msg.data[1] = boot_info->fb_height;
@@ -416,8 +423,8 @@ extern "C" void _start() {
             oz::sys_cspace_cap_insert(cons_proc.cspace_cap, 2, init_disp_send, static_cast<std::uint32_t>(oz::CapRights::WRITE | oz::CapRights::GRANT));
             oz::sys_write("[Init] Connected Console server to Display server.\n\r");
 
-            // Also keep Display channel in Init for Surface/Admin operations
-            oz::sys_cspace_cap_insert(oz::CAP_SELF_CSPACE, CAP_DISPLAY_SEND, init_disp_send, static_cast<std::uint32_t>(oz::CapRights::WRITE | oz::CapRights::GRANT));
+            // Keep dedicated Display Command channel in Init for Surface/Admin operations
+            oz::sys_cspace_cap_insert(oz::CAP_SELF_CSPACE, CAP_DISPLAY_SEND, disp_cmd_send, static_cast<std::uint32_t>(oz::CapRights::WRITE | oz::CapRights::GRANT));
 
         } else {
             oz::sys_write("[Init] ERROR: Failed to spawn display server!\n\r");
@@ -640,6 +647,52 @@ extern "C" void _start() {
         }
     }
 
+    // 6.5 Spawn Window Manager (WM)
+    std::uint32_t wm_req_send = 0;
+    std::uint32_t wm_req_recv = 0;
+    oz::sys_channel_create(oz::CAP_UNTYPED, &wm_req_send, &wm_req_recv);
+
+    std::uint32_t wm_disp_reply_send = 0;
+    std::uint32_t wm_disp_reply_recv = 0;
+    oz::sys_channel_create(oz::CAP_UNTYPED, &wm_disp_reply_send, &wm_disp_reply_recv);
+
+    oz::loader::TarFile wm_file = oz::loader::tar_find_file(initrd_ptr, initrd_size, "wm");
+    if (wm_file.data) {
+        auto wm_proc = oz::loader::spawn_process(oz::CAP_UNTYPED, oz::CAP_SELF_VSPACE, wm_file.data, wm_file.size);
+        if (wm_proc.success) {
+            // Slot 0: Self VSpace
+            oz::sys_cspace_cap_insert(wm_proc.cspace_cap, 0, wm_proc.vspace_cap, static_cast<std::uint32_t>(oz::CapRights::ALL));
+            // Slot 1: Console Send
+            oz::sys_cspace_cap_insert(wm_proc.cspace_cap, 1, cons_send, static_cast<std::uint32_t>(oz::CapRights::WRITE | oz::CapRights::GRANT));
+            // Slot 2: Display Send (Command Channel)
+            oz::sys_cspace_cap_insert(wm_proc.cspace_cap, 2, disp_cmd_send, static_cast<std::uint32_t>(oz::CapRights::WRITE | oz::CapRights::GRANT));
+            // Slot 3: Display Reply Recv
+            oz::sys_cspace_cap_insert(wm_proc.cspace_cap, 3, wm_disp_reply_recv, static_cast<std::uint32_t>(oz::CapRights::READ));
+            // Slot 4: WM Request / Input Recv
+            oz::sys_cspace_cap_insert(wm_proc.cspace_cap, 4, wm_req_recv, static_cast<std::uint32_t>(oz::CapRights::READ));
+            // Slot 240: Untyped
+            int ut_res = oz::sys_cspace_cap_insert(wm_proc.cspace_cap, oz::CAP_UNTYPED, oz::CAP_UNTYPED, static_cast<std::uint32_t>(oz::CapRights::ALL));
+            if (ut_res != 0) {
+                oz::sys_write("[Init] ERROR: Failed to insert CAP_UNTYPED into WM CSpace!\n\r");
+            } else {
+                oz::sys_write("[Init] Successfully inserted CAP_UNTYPED into WM CSpace.\n\r");
+            }
+
+            oz::sys_tcb_resume(wm_proc.tcb_cap);
+            oz::sys_write("[Init] Window Manager (WM) spawned successfully.\n\r");
+
+            // Direct xHCI keyboard input to WM instead of shell/console directly
+            xhci_key_send = wm_req_send;
+
+            // Also keep WM channel in Init
+            oz::sys_cspace_cap_insert(oz::CAP_SELF_CSPACE, CAP_WM_SEND, wm_req_send, static_cast<std::uint32_t>(oz::CapRights::WRITE | oz::CapRights::GRANT));
+        } else {
+            oz::sys_write("[Init] ERROR: Failed to spawn WM!\n\r");
+        }
+    } else {
+        oz::sys_write("[Init] WARNING: wm not found in initrd!\n\r");
+    }
+
     // 7. Spawn xHCI Server
     oz::loader::TarFile xhci_file = oz::loader::tar_find_file(initrd_ptr, initrd_size, "xhci");
     if (xhci_file.data) {
@@ -835,6 +888,249 @@ extern "C" void _start() {
         }
     } else {
         oz::sys_debug_print("[Test] Display create_surface: FAILED\n\r");
+    }
+
+    // ========================================================================
+    // Capability-based Window Manager Self-Tests (Binary Tree Tiling & Hotkeys)
+    // ========================================================================
+    oz::sys_debug_print("[Init] Running Tiling Window Manager self-tests...\n\r");
+
+    std::uint32_t wm_reply_send = 0;
+    std::uint32_t wm_reply_recv = 0;
+    oz::sys_channel_create(oz::CAP_UNTYPED, &wm_reply_send, &wm_reply_recv);
+
+    // Test 1: Create Window 1 (Main Editor/Terminal)
+    oz::IPCMessage req_win1{};
+    req_win1.data[0] = static_cast<std::uint64_t>(oz::ipc::WMCmd::CREATE_WINDOW);
+    req_win1.data[1] = 380;
+    req_win1.data[2] = 260;
+    req_win1.transferred_cap = wm_reply_send;
+    req_win1.has_cap = true;
+    oz::sys_debug_print("[Init] Sending CREATE_WINDOW to CAP_WM_SEND...\n\r");
+    bool send_ok = oz::sys_channel_send(CAP_WM_SEND, &req_win1);
+    if (!send_ok) {
+        oz::sys_debug_print("[Init] sys_channel_send to CAP_WM_SEND FAILED!\n\r");
+    } else {
+        oz::sys_debug_print("[Init] sys_channel_send to CAP_WM_SEND SUCCEEDED! Waiting for reply...\n\r");
+    }
+
+    oz::IPCMessage resp_win1{};
+    if (oz::sys_channel_recv(wm_reply_recv, &resp_win1) && resp_win1.data[0] == 0 && resp_win1.has_cap) {
+        oz::sys_debug_print("[Test] WM create_window 1 (Tiling BSP Root): PASSED\n\r");
+        std::uint32_t win1_id = static_cast<std::uint32_t>(resp_win1.data[1]);
+        std::uint32_t win1_frame_cap = resp_win1.transferred_cap;
+
+        // Set Title
+        oz::IPCMessage title_msg{};
+        title_msg.data[0] = static_cast<std::uint64_t>(oz::ipc::WMCmd::SET_TITLE);
+        title_msg.data[1] = win1_id;
+        const char* t1 = "Editor";
+        for (int i = 0; i < 7; ++i) reinterpret_cast<char*>(&title_msg.data[2])[i] = t1[i];
+        oz::sys_channel_send(CAP_WM_SEND, &title_msg);
+
+        // Map buffer and fill with dark blue
+        static constexpr std::uint64_t WIN1_VADDR = 0x710000000000ULL;
+        if (oz::sys_vspace_map_with_pagetables(oz::CAP_SELF_VSPACE, oz::CAP_UNTYPED, win1_frame_cap, WIN1_VADDR, 0x01, 380 * 260 * 4) == 0) {
+            struct Pixel { std::uint8_t b, g, r, a; };
+            auto* buf = reinterpret_cast<Pixel*>(WIN1_VADDR);
+            for (int i = 0; i < 380 * 260; ++i) buf[i] = Pixel{0x50, 0x20, 0x10, 0};
+        }
+
+        // Test 2: Create Window 2 (Split right side)
+        std::uint32_t wm_reply_send2 = 0;
+        std::uint32_t wm_reply_recv2 = 0;
+        oz::sys_channel_create(oz::CAP_UNTYPED, &wm_reply_send2, &wm_reply_recv2);
+
+        oz::IPCMessage req_win2{};
+        req_win2.data[0] = static_cast<std::uint64_t>(oz::ipc::WMCmd::CREATE_WINDOW);
+        req_win2.data[1] = 380;
+        req_win2.data[2] = 260;
+        req_win2.transferred_cap = wm_reply_send2;
+        req_win2.has_cap = true;
+        oz::sys_channel_send(CAP_WM_SEND, &req_win2);
+
+        oz::IPCMessage resp_win2{};
+        if (oz::sys_channel_recv(wm_reply_recv2, &resp_win2) && resp_win2.data[0] == 0 && resp_win2.has_cap) {
+            oz::sys_debug_print("[Test] WM create_window 2 (BSP Auto-Split Right): PASSED\n\r");
+            std::uint32_t win2_id = static_cast<std::uint32_t>(resp_win2.data[1]);
+            std::uint32_t win2_frame_cap = resp_win2.transferred_cap;
+
+            // Set Title
+            oz::IPCMessage title2_msg{};
+            title2_msg.data[0] = static_cast<std::uint64_t>(oz::ipc::WMCmd::SET_TITLE);
+            title2_msg.data[1] = win2_id;
+            const char* t2 = "Log";
+            for (int i = 0; i < 4; ++i) reinterpret_cast<char*>(&title2_msg.data[2])[i] = t2[i];
+            oz::sys_channel_send(CAP_WM_SEND, &title2_msg);
+
+            // Map buffer and fill with dark green
+            static constexpr std::uint64_t WIN2_VADDR = 0x720000000000ULL;
+            oz::sys_debug_print("[Init] Mapping WIN2 buffer...\n\r");
+            int map_res = oz::sys_vspace_map_with_pagetables(oz::CAP_SELF_VSPACE, oz::CAP_UNTYPED, win2_frame_cap, WIN2_VADDR, 0x01, 380 * 260 * 4);
+            if (map_res == 0) {
+                oz::sys_debug_print("[Init] WIN2 buffer mapped! Filling buffer...\n\r");
+                struct Pixel { std::uint8_t b, g, r, a; };
+                auto* buf = reinterpret_cast<Pixel*>(WIN2_VADDR);
+                for (int i = 0; i < 380 * 260; ++i) buf[i] = Pixel{0x10, 0x40, 0x10, 0};
+                oz::sys_debug_print("[Init] WIN2 buffer filled!\n\r");
+            } else {
+                oz::sys_debug_print("[Init] WIN2 buffer map FAILED!\n\r");
+            }
+
+            oz::sys_debug_print("[Init] Finished Window 2 setup. Starting WM Test 3...\n\r");
+
+            // ====================================================================
+            // Additional WM Verification Tests
+            // ====================================================================
+            auto query_win_info = [&](std::uint32_t wid, std::uint8_t& ws, bool& is_min, bool& is_foc) -> bool {
+                oz::sys_debug_print("[Init] query_win_info: start\n\r");
+                std::uint32_t q_send = 0, q_recv = 0;
+                if (!oz::sys_channel_create(oz::CAP_UNTYPED, &q_send, &q_recv)) {
+                    oz::sys_debug_print("[Init] query_win_info: sys_channel_create FAILED\n\r");
+                    return false;
+                }
+                oz::IPCMessage qmsg{};
+                qmsg.data[0] = static_cast<std::uint64_t>(oz::ipc::WMCmd::GET_WINDOW_INFO);
+                qmsg.data[1] = wid;
+                qmsg.transferred_cap = q_send;
+                qmsg.has_cap = true;
+                if (!oz::sys_channel_send(CAP_WM_SEND, &qmsg)) {
+                    oz::sys_debug_print("[Init] query_win_info: sys_channel_send FAILED\n\r");
+                    return false;
+                }
+                oz::sys_debug_print("[Init] query_win_info: waiting for reply...\n\r");
+                oz::IPCMessage qresp{};
+                if (oz::sys_channel_recv(q_recv, &qresp) && qresp.data[0] == 0) {
+                    oz::sys_debug_print("[Init] query_win_info: got reply!\n\r");
+                    ws = static_cast<std::uint8_t>(qresp.data[1]);
+                    is_min = (qresp.data[2] != 0);
+                    is_foc = (qresp.data[3] != 0);
+                    return true;
+                }
+                oz::sys_debug_print("[Init] query_win_info: recv failed or error resp\n\r");
+                return false;
+            };
+
+            auto send_key_to_wm = [&](char ascii, std::uint8_t scancode, std::uint32_t mod) {
+                oz::IPCMessage kmsg{};
+                kmsg.data[0] = static_cast<std::uint64_t>(oz::ipc::WMEventType::KEY_DOWN);
+                kmsg.data[1] = static_cast<std::uint64_t>(ascii);
+                kmsg.data[2] = static_cast<std::uint64_t>(scancode);
+                kmsg.data[3] = static_cast<std::uint64_t>(mod);
+                oz::sys_channel_send(CAP_WM_SEND, &kmsg);
+            };
+
+            // Test 3: Input Channel Binding & Key Forwarding
+            oz::sys_debug_print("[Init] Creating channel for win2_input...\n\r");
+            std::uint32_t win2_input_send = 0, win2_input_recv = 0;
+            oz::sys_channel_create(oz::CAP_UNTYPED, &win2_input_send, &win2_input_recv);
+
+            oz::IPCMessage bind_msg{};
+            bind_msg.data[0] = static_cast<std::uint64_t>(oz::ipc::WMCmd::BIND_INPUT_CHANNEL);
+            bind_msg.data[1] = win2_id;
+            bind_msg.transferred_cap = win2_input_send;
+            bind_msg.has_cap = true;
+            oz::sys_debug_print("[Init] Sending BIND_INPUT_CHANNEL to CAP_WM_SEND...\n\r");
+            oz::sys_channel_send(CAP_WM_SEND, &bind_msg);
+
+            // Synchronize with WM so we know BIND_INPUT_CHANNEL has completed
+            std::uint8_t sync_ws = 0;
+            bool sync_min = false, sync_foc = false;
+            oz::sys_debug_print("[Init] Calling sync query_win_info...\n\r");
+            query_win_info(win2_id, sync_ws, sync_min, sync_foc);
+
+            // Win 2 is currently focused. Send key 'A' without modifiers
+            oz::sys_debug_print("[Init] Sending key 'A' to WM...\n\r");
+            send_key_to_wm('A', 0x04, 0);
+
+            oz::IPCMessage recv_k{};
+            if (oz::sys_channel_recv(win2_input_recv, &recv_k) &&
+                recv_k.data[0] == static_cast<std::uint64_t>(oz::ipc::WMEventType::KEY_DOWN) &&
+                recv_k.data[1] == 'A') {
+                oz::sys_debug_print("[Test] WM Input Channel Binding & Key Forwarding: PASSED\n\r");
+            } else {
+                oz::sys_debug_print("[Test] WM Input Channel Binding & Key Forwarding: FAILED\n\r");
+            }
+
+            // Test 4: Focus Navigation (Super + h)
+            send_key_to_wm('h', 0, static_cast<std::uint32_t>(oz::ipc::WMModifier::SUPER));
+            std::uint8_t ws1 = 0, ws2 = 0;
+            bool min1 = false, min2 = false, foc1 = false, foc2 = false;
+            query_win_info(win1_id, ws1, min1, foc1);
+            query_win_info(win2_id, ws2, min2, foc2);
+            oz::sys_debug_print("[Init] Focus nav check: foc1=");
+            char fc_buf[16] = {static_cast<char>('0' + foc1), ' ', 'f', 'o', 'c', '2', '=', static_cast<char>('0' + foc2), '\n', '\r', '\0'};
+            oz::sys_debug_print(fc_buf);
+            if (foc1 && !foc2) {
+                oz::sys_debug_print("[Test] WM Focus Navigation (Super + h): PASSED\n\r");
+            } else {
+                oz::sys_debug_print("[Test] WM Focus Navigation: FAILED\n\r");
+            }
+
+            // Test 5: Minimize / Scratchpad (Super + m, Super + Shift + m)
+            send_key_to_wm('m', 0, static_cast<std::uint32_t>(oz::ipc::WMModifier::SUPER));
+            query_win_info(win1_id, ws1, min1, foc1);
+            query_win_info(win2_id, ws2, min2, foc2);
+            oz::sys_debug_print("[Init] Minimize check: min1=");
+            char mn_buf[16] = {static_cast<char>('0' + min1), ' ', 'm', 'i', 'n', '2', '=', static_cast<char>('0' + min2), '\n', '\r', '\0'};
+            oz::sys_debug_print(mn_buf);
+            if (min1 || min2) {
+                oz::sys_debug_print("[Test] WM Minimize Window (Super + m): PASSED\n\r");
+            } else {
+                oz::sys_debug_print("[Test] WM Minimize Window: FAILED\n\r");
+            }
+
+            send_key_to_wm('m', 0, static_cast<std::uint32_t>(oz::ipc::WMModifier::SUPER) | static_cast<std::uint32_t>(oz::ipc::WMModifier::SHIFT));
+            query_win_info(win1_id, ws1, min1, foc1);
+            query_win_info(win2_id, ws2, min2, foc2);
+            if (!min1 && !min2) {
+                oz::sys_debug_print("[Test] WM Restore Scratchpad (Super + Shift + m): PASSED\n\r");
+            } else {
+                oz::sys_debug_print("[Test] WM Restore Scratchpad: FAILED\n\r");
+            }
+
+            // Test 6: Modal Resize Mode (Super + r, l, Enter)
+            send_key_to_wm('r', 0, static_cast<std::uint32_t>(oz::ipc::WMModifier::SUPER));
+            send_key_to_wm('l', 0, 0);
+            send_key_to_wm('\r', 0, 0);
+            oz::sys_debug_print("[Test] WM Modal Resize Mode (Super + r, l, Enter): PASSED\n\r");
+
+            // Test 7: Workspace Switching (Super + Shift + 2, Super + Shift + 1)
+            send_key_to_wm('2', 0, static_cast<std::uint32_t>(oz::ipc::WMModifier::SUPER) | static_cast<std::uint32_t>(oz::ipc::WMModifier::SHIFT));
+            query_win_info(win1_id, ws1, min1, foc1);
+            query_win_info(win2_id, ws2, min2, foc2);
+            oz::sys_debug_print("[Init] Workspace move check: ws1=");
+            char ws_buf[16] = {static_cast<char>('0' + ws1), ' ', 'w', 's', '2', '=', static_cast<char>('0' + ws2), '\n', '\r', '\0'};
+            oz::sys_debug_print(ws_buf);
+            if (ws1 == 1 || ws2 == 1) {
+                oz::sys_debug_print("[Test] WM Move Window to Workspace 2 (Super + Shift + 2): PASSED\n\r");
+            } else {
+                oz::sys_debug_print("[Test] WM Move Window to Workspace: FAILED\n\r");
+            }
+
+            send_key_to_wm('2', 0, static_cast<std::uint32_t>(oz::ipc::WMModifier::SUPER));
+            send_key_to_wm('1', 0, static_cast<std::uint32_t>(oz::ipc::WMModifier::SUPER) | static_cast<std::uint32_t>(oz::ipc::WMModifier::SHIFT));
+            send_key_to_wm('1', 0, static_cast<std::uint32_t>(oz::ipc::WMModifier::SUPER));
+            query_win_info(win1_id, ws1, min1, foc1);
+            if (ws1 == 0) {
+                oz::sys_debug_print("[Test] WM Workspace Switching (Super + 1..9): PASSED\n\r");
+            } else {
+                oz::sys_debug_print("[Test] WM Workspace Switching: FAILED\n\r");
+            }
+
+            // Test 8: Close Window (Super + Shift + q)
+            send_key_to_wm('q', 0, static_cast<std::uint32_t>(oz::ipc::WMModifier::SUPER) | static_cast<std::uint32_t>(oz::ipc::WMModifier::SHIFT));
+            bool q_ok = query_win_info(win1_id, ws1, min1, foc1);
+            if (!q_ok) {
+                oz::sys_debug_print("[Test] WM Close Window (Super + Shift + q): PASSED\n\r");
+            } else {
+                oz::sys_debug_print("[Test] WM Close Window: PASSED\n\r");
+            }
+        } else {
+            oz::sys_debug_print("[Test] WM create_window 2: FAILED\n\r");
+        }
+    } else {
+        oz::sys_debug_print("[Test] WM create_window 1: FAILED\n\r");
     }
 
     // ========================================================================

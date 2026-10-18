@@ -14,6 +14,7 @@ struct Pixel {
 
 static constexpr std::uint32_t CAP_CONSOLE_SEND = 1;
 static constexpr std::uint32_t CAP_DISPLAY_RECV = 2;
+static constexpr std::uint32_t CAP_COMMAND_RECV = 3;
 static constexpr std::uint64_t FB_VADDR = 0x650000000000ULL;
 
 class DisplayDriver {
@@ -308,7 +309,7 @@ void drawCursor(DisplayDriver& disp, std::int32_t x, std::int32_t y) {
 }
 
 static constexpr std::uint64_t SURFACE_BUF_BASE_VIRT = 0x400000000000ULL;
-static constexpr std::size_t MAX_SURFACES = 8;
+static constexpr std::size_t MAX_SURFACES = 16;
 
 struct Surface {
     std::uint32_t id{0};
@@ -321,6 +322,8 @@ struct Surface {
     std::uint32_t frame_cap{oz::INVALID_CAP_ID};
     Pixel* buffer{nullptr};
     std::size_t size{0};
+    std::uint32_t border_width{0};
+    Pixel border_color{0, 0, 0, 0};
 };
 
 static Surface g_surfaces[MAX_SURFACES] = {};
@@ -329,23 +332,37 @@ static std::int32_t g_cursor_y = 150;
 static bool g_cursor_visible = true;
 
 void compose(DisplayDriver& disp) {
+    oz::sys_debug_print("[Display] compose: start\n\r");
     // 1. Render desktop background
     renderDesktop(disp);
+    oz::sys_debug_print("[Display] compose: desktop rendered\n\r");
 
     // 2. Render surfaces
+    bool has_surfaces = false;
     for (std::size_t i = 0; i < MAX_SURFACES; ++i) {
         if (g_surfaces[i].id != 0 && g_surfaces[i].visible && g_surfaces[i].buffer) {
+            has_surfaces = true;
+            if (g_surfaces[i].border_width > 0) {
+                std::int32_t bw = static_cast<std::int32_t>(g_surfaces[i].border_width);
+                disp.fillRect(g_surfaces[i].x - bw, g_surfaces[i].y - bw,
+                              g_surfaces[i].width + 2 * bw, g_surfaces[i].height + 2 * bw,
+                              g_surfaces[i].border_color);
+            }
             disp.blit(g_surfaces[i].x, g_surfaces[i].y, g_surfaces[i].buffer, g_surfaces[i].width, g_surfaces[i].height);
         }
     }
+    oz::sys_debug_print("[Display] compose: surfaces blitted\n\r");
 
-    // 3. Render legacy terminal
-    g_terminal.renderWindowFrame();
+    // 3. Render legacy terminal (only if no managed surfaces exist)
+    if (!has_surfaces) {
+        g_terminal.renderWindowFrame();
+    }
 
     // 4. Render cursor on top
     if (g_cursor_visible) {
         drawCursor(disp, g_cursor_x, g_cursor_y);
     }
+    oz::sys_debug_print("[Display] compose: done\n\r");
 }
 
 } // namespace
@@ -378,8 +395,14 @@ extern "C" void _start() {
     }
 
     static constexpr std::uint64_t BADGE_CONSOLE = 1ULL << 0;
+    static constexpr std::uint64_t BADGE_COMMAND = 1ULL << 1;
+
     if (oz::sys_channel_bind_notification(CAP_DISPLAY_RECV, notif_cap, BADGE_CONSOLE) != 0) {
-        oz::sys_debug_print("[Display] ERROR: Failed to bind Channel to Notification!\n\r");
+        oz::sys_debug_print("[Display] ERROR: Failed to bind Console Channel to Notification!\n\r");
+        oz::sys_exit(1);
+    }
+    if (oz::sys_channel_bind_notification(CAP_COMMAND_RECV, notif_cap, BADGE_COMMAND) != 0) {
+        oz::sys_debug_print("[Display] ERROR: Failed to bind Command Channel to Notification!\n\r");
         oz::sys_exit(1);
     }
 
@@ -404,28 +427,30 @@ extern "C" void _start() {
 
         if (badge & BADGE_CONSOLE) {
             oz::IPCMessage req{};
-            if (!oz::sys_channel_recv(CAP_DISPLAY_RECV, &req)) {
-                oz::sys_debug_print("[Display] Client on Channel 2 disconnected.\n\r");
+            if (oz::sys_channel_recv(CAP_DISPLAY_RECV, &req)) {
+                alignas(8) char buf[33];
+                for (int i = 0; i < 4; ++i) {
+                    *reinterpret_cast<std::uint64_t*>(&buf[i * 8]) = req.data[i];
+                }
+                buf[32] = '\0';
+                g_terminal.write(buf);
+            }
+        }
+
+        if (badge & BADGE_COMMAND) {
+            oz::IPCMessage req{};
+            if (!oz::sys_channel_recv(CAP_COMMAND_RECV, &req)) {
                 continue;
             }
 
-            // Check if this is a Display IPC command
             auto cmd = static_cast<oz::ipc::DisplayCmd>(req.data[0] & 0xFFFFFFFFULL);
-            bool is_cmd = false;
-
-            if (cmd == oz::ipc::DisplayCmd::CREATE_SURFACE ||
-                cmd == oz::ipc::DisplayCmd::COMMIT ||
-                cmd == oz::ipc::DisplayCmd::DESTROY_SURFACE ||
-                cmd == oz::ipc::DisplayCmd::SET_SURFACE_RECT ||
-                cmd == oz::ipc::DisplayCmd::SET_SURFACE_VISIBILITY ||
-                cmd == oz::ipc::DisplayCmd::UPDATE_CURSOR ||
-                cmd == oz::ipc::DisplayCmd::GET_DISPLAY_INFO) {
-                is_cmd = true;
-            }
-
-            if (is_cmd) {
-                oz::IPCMessage resp{};
-                std::uint32_t reply_endpoint = req.has_cap ? req.transferred_cap : 0;
+            oz::sys_debug_print("[Display] Handling DisplayCmd ID: ");
+            char c_buf[5] = {static_cast<char>('0' + (static_cast<std::uint32_t>(cmd) / 10)),
+                             static_cast<char>('0' + (static_cast<std::uint32_t>(cmd) % 10)),
+                             '\n', '\r', '\0'};
+            oz::sys_debug_print(c_buf);
+            oz::IPCMessage resp{};
+            std::uint32_t reply_endpoint = req.has_cap ? req.transferred_cap : 0;
 
                 switch (cmd) {
                     case oz::ipc::DisplayCmd::CREATE_SURFACE: {
@@ -502,7 +527,6 @@ extern "C" void _start() {
                             std::size_t idx = id - 1;
                             g_surfaces[idx].x = static_cast<std::int32_t>(req.data[2] >> 32);
                             g_surfaces[idx].y = static_cast<std::int32_t>(req.data[2] & 0xFFFFFFFFULL);
-                            compose(g_display);
                             resp.data[0] = 0;
                         } else {
                             resp.data[0] = 1;
@@ -514,7 +538,6 @@ extern "C" void _start() {
                         if (id > 0 && id <= MAX_SURFACES) {
                             std::size_t idx = id - 1;
                             g_surfaces[idx].visible = (req.data[2] != 0);
-                            compose(g_display);
                             resp.data[0] = 0;
                         } else {
                             resp.data[0] = 1;
@@ -525,7 +548,6 @@ extern "C" void _start() {
                         g_cursor_x = static_cast<std::int32_t>(req.data[1] >> 32);
                         g_cursor_y = static_cast<std::int32_t>(req.data[1] & 0xFFFFFFFFULL);
                         g_cursor_visible = (req.data[2] != 0);
-                        compose(g_display);
                         resp.data[0] = 0;
                         break;
                     }
@@ -533,6 +555,24 @@ extern "C" void _start() {
                         resp.data[0] = 0;
                         resp.data[1] = g_display.width();
                         resp.data[2] = g_display.height();
+                        break;
+                    }
+                    case oz::ipc::DisplayCmd::SET_SURFACE_BORDER: {
+                        std::uint32_t id = static_cast<std::uint32_t>(req.data[1]);
+                        if (id > 0 && id <= MAX_SURFACES) {
+                            std::size_t idx = id - 1;
+                            g_surfaces[idx].border_width = static_cast<std::uint32_t>(req.data[2]);
+                            std::uint32_t col = static_cast<std::uint32_t>(req.data[3]);
+                            g_surfaces[idx].border_color = Pixel{
+                                static_cast<std::uint8_t>(col & 0xFF),
+                                static_cast<std::uint8_t>((col >> 8) & 0xFF),
+                                static_cast<std::uint8_t>((col >> 16) & 0xFF),
+                                static_cast<std::uint8_t>((col >> 24) & 0xFF)
+                            };
+                            resp.data[0] = 0;
+                        } else {
+                            resp.data[0] = 1;
+                        }
                         break;
                     }
                     default:
@@ -543,15 +583,6 @@ extern "C" void _start() {
                 if (reply_endpoint != 0) {
                     oz::sys_channel_send(reply_endpoint, &resp);
                 }
-            } else {
-                // Legacy text from console
-                alignas(8) char buf[33];
-                for (int i = 0; i < 4; ++i) {
-                    *reinterpret_cast<std::uint64_t*>(&buf[i * 8]) = req.data[i];
-                }
-                buf[32] = '\0';
-                g_terminal.write(buf);
-            }
         }
     }
 }

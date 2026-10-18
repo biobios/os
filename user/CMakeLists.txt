@@ -84,9 +84,14 @@ add_executable(procman src/procman/main.cpp src/procman/linker.ld)
 target_link_libraries(procman oz_syscall)
 target_link_options(procman PRIVATE "-T${CMAKE_CURRENT_SOURCE_DIR}/src/procman/linker.ld" "-nostdlib" "-static")
 
+# wm process (Tiling Window Manager)
+add_executable(wm src/wm/main.cpp src/display/Font.cpp src/wm/linker.ld)
+target_link_libraries(wm oz_syscall)
+target_link_options(wm PRIVATE "-T${CMAKE_CURRENT_SOURCE_DIR}/src/wm/linker.ld" "-nostdlib" "-static")
+
 add_custom_target(initrd ALL
-    COMMAND tar -cvf ${CMAKE_SOURCE_DIR}/assets/initrd.tar -C ${CMAKE_CURRENT_BINARY_DIR} init console vfs ahci xhci display shell manifest_test cat head memman procman
-    DEPENDS init console vfs ahci xhci display shell manifest_test cat head memman procman
+    COMMAND tar -cvf ${CMAKE_SOURCE_DIR}/assets/initrd.tar -C ${CMAKE_CURRENT_BINARY_DIR} init console vfs ahci xhci display shell manifest_test cat head memman procman wm
+    DEPENDS init console vfs ahci xhci display shell manifest_test cat head memman procman wm
 )
 target_sources(oz_syscall PRIVATE lib/malloc.cpp)
 

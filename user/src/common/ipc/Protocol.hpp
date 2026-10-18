@@ -149,24 +149,39 @@ enum class DisplayCmd : std::uint64_t {
     SET_SURFACE_VISIBILITY = 11, // data[1] = surface_id, data[2] = visible (0/1), data[3] = z_order
     UPDATE_CURSOR          = 12, // data[1] = (x << 32) | y, data[2] = visible
     GET_DISPLAY_INFO       = 13, // returns width, height, bpp
+    SET_SURFACE_BORDER     = 14, // data[1] = surface_id, data[2] = border_width, data[3] = border_color (ARGB)
 };
 
 // ===== Window Manager IPC Protocol =====
 // Policy: Windows, layouts, focus, input filtering
 enum class WMCmd : std::uint64_t {
-    CREATE_WINDOW          = 1, // Client -> WM: data[1] = width, data[2] = height
-                                // Returns: data[1] = win_id, data[2] = surface_id, transferred_cap = InputChannelCap
-    DESTROY_WINDOW         = 2, // Client -> WM: data[1] = win_id
-    SET_TITLE              = 3, // Client -> WM: data[1] = win_id, data[2..3] = title chars
-    FOCUS_WINDOW           = 4, // data[1] = win_id
+    CREATE_WINDOW          = 10, // Client -> WM: data[1] = width, data[2] = height
+                                 // Returns: data[1] = win_id, data[2] = surface_id, transferred_cap = InputChannelCap
+    DESTROY_WINDOW         = 11, // Client -> WM: data[1] = win_id
+    SET_TITLE              = 12, // Client -> WM: data[1] = win_id, data[2..3] = title chars
+    FOCUS_WINDOW           = 13, // data[1] = win_id
+    MINIMIZE_WINDOW        = 14, // data[1] = win_id
+    RESTORE_MINIMIZED      = 15, // Restores last minimized window
+    ATTACH_OVERLAY         = 16, // data[1] = parent_win_id, data[2] = overlay_win_id
+    BIND_INPUT_CHANNEL     = 17, // Client -> WM: data[1] = win_id, transferred_cap = client_input_send
+    GET_WINDOW_INFO        = 18, // Client -> WM: data[1] = win_id -> returns x, y, w, h, is_focused
+};
+
+enum class WMModifier : std::uint32_t {
+    NONE  = 0,
+    SHIFT = 1 << 0,
+    CTRL  = 1 << 1,
+    ALT   = 1 << 2,
+    SUPER = 1 << 3,
 };
 
 enum class WMEventType : std::uint64_t {
-    KEY_DOWN               = 1, // data[1] = ascii, data[2] = scancode, data[3] = modifiers
-    KEY_UP                 = 2,
-    MOUSE_MOVE             = 3, // data[1] = rel_x, data[2] = rel_y
-    MOUSE_BUTTON           = 4, // data[1] = buttons, data[2] = rel_x, data[3] = rel_y
-    FOCUS_CHANGED          = 5, // data[1] = 1 (gained) or 0 (lost)
+    KEY_DOWN               = 100, // data[1] = ascii, data[2] = scancode, data[3] = modifiers
+    KEY_UP                 = 101,
+    MOUSE_MOVE             = 102, // data[1] = rel_x, data[2] = rel_y
+    MOUSE_BUTTON           = 103, // data[1] = buttons, data[2] = rel_x, data[3] = rel_y
+    FOCUS_CHANGED          = 104, // data[1] = 1 (gained) or 0 (lost)
+    WINDOW_RESIZED         = 105, // data[1] = new_width, data[2] = new_height
 };
 
 // ===== Memory Manager IPC Protocol =====
