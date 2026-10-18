@@ -2,17 +2,25 @@
 #include "../common/ipc/Protocol.hpp"
 #include "../common/ipc/StartupInfo.hpp"
 #include "../common/utils/utils.hpp"
+#include "../display/Font.hpp"
 #include "../../lib/io.hpp"
 
-// Shell declares its requirements statically (Pure unprivileged User Process!)
+struct Pixel {
+    std::uint8_t b{0};
+    std::uint8_t g{0};
+    std::uint8_t r{0};
+    std::uint8_t a{0};
+};
+
+// Shell declares its requirements statically (User Process with GUI Terminal capability)
 OZ_MANIFEST((oz::ProcessManifest{
     .magic = oz::ProcessManifest::MAGIC,
     .version = 1,
     .needs_console = true,
     .needs_vfs_root = true,
-    .needs_display = false,
-    .needs_wm = false,
-    .needs_untyped = false,
+    .needs_display = true,
+    .needs_wm = true,
+    .needs_untyped = true,
     .default_data_dir = {}
 }));
 
@@ -26,6 +34,131 @@ static constexpr std::uint32_t CAP_PROCMAN_RECV    = 7;
 
 static constexpr std::uint64_t VFS_SHARED_BUF_VIRT = 0x300000000000ULL;
 static char* g_shared_buf = nullptr;
+
+// GUI Terminal state
+static bool g_gui_mode = false;
+static std::uint32_t g_surf_id = 0;
+static std::uint32_t g_win_id = 0;
+static std::uint32_t g_cap_display = 0;
+static std::uint32_t g_cap_wm = 0;
+static std::uint32_t g_input_recv = 0;
+static Pixel* g_win_buffer = nullptr;
+static std::uint32_t g_cursor_col = 0;
+static std::uint32_t g_cursor_row = 0;
+
+static constexpr Pixel BG_COLOR{0x2b, 0x1f, 0x18, 0};      // Dark charcoal/slate (BGR format)
+static constexpr Pixel FG_TEXT{0xee, 0xee, 0xee, 0};       // Off-white
+static constexpr Pixel FG_PROMPT{0xff, 0xff, 0x00, 0};     // Cyan (b=0xff, g=0xff, r=0x00)
+
+static void term_draw_char(std::uint32_t col, std::uint32_t row, char c, Pixel fg, Pixel bg) {
+    if (!g_win_buffer || col >= 80 || row >= 24) return;
+    if (c < 32 || c > 126) return;
+
+    std::uint32_t px = col * FONT_WIDTH;
+    std::uint32_t py = row * FONT_HEIGHT;
+
+    for (int r = 0; r < FONT_HEIGHT; ++r) {
+        for (int c_idx = 0; c_idx < FONT_WIDTH; ++c_idx) {
+            Pixel p = font_bitmap[c - 32][r][c_idx] ? fg : bg;
+            g_win_buffer[(py + r) * 640 + (px + c_idx)] = p;
+        }
+    }
+}
+
+static void term_clear_cell(std::uint32_t col, std::uint32_t row, Pixel bg) {
+    if (!g_win_buffer || col >= 80 || row >= 24) return;
+    std::uint32_t px = col * FONT_WIDTH;
+    std::uint32_t py = row * FONT_HEIGHT;
+    for (int r = 0; r < FONT_HEIGHT; ++r) {
+        for (int c = 0; c < FONT_WIDTH; ++c) {
+            g_win_buffer[(py + r) * 640 + (px + c)] = bg;
+        }
+    }
+}
+
+static void term_scroll() {
+    if (!g_win_buffer) return;
+    std::size_t line_pixels = 640 * FONT_HEIGHT;
+    std::size_t total_pixels = 640 * 384;
+    for (std::size_t i = 0; i < total_pixels - line_pixels; ++i) {
+        g_win_buffer[i] = g_win_buffer[i + line_pixels];
+    }
+    for (std::size_t i = total_pixels - line_pixels; i < total_pixels; ++i) {
+        g_win_buffer[i] = BG_COLOR;
+    }
+}
+
+static void term_clear() {
+    if (!g_win_buffer) return;
+    for (std::size_t i = 0; i < 640 * 384; ++i) {
+        g_win_buffer[i] = BG_COLOR;
+    }
+    g_cursor_col = 0;
+    g_cursor_row = 0;
+}
+
+static void term_commit() {
+    if (!g_gui_mode || g_cap_display == 0) return;
+    oz::sys_debug_print("[Shell] term_commit: start\n\r");
+    oz::IPCMessage commit_msg{};
+    commit_msg.data[0] = static_cast<std::uint64_t>(oz::ipc::DisplayCmd::COMMIT);
+    commit_msg.data[1] = g_surf_id;
+    oz::sys_channel_send(g_cap_display, &commit_msg);
+    oz::sys_debug_print("[Shell] term_commit: done\n\r");
+}
+
+static void term_put_char(char c) {
+    if (c == '\n') {
+        g_cursor_col = 0;
+        g_cursor_row++;
+        if (g_cursor_row >= 24) {
+            term_scroll();
+            g_cursor_row = 23;
+        }
+        return;
+    }
+    if (c == '\r') {
+        g_cursor_col = 0;
+        return;
+    }
+    if (c == '\b' || c == 0x7F) {
+        if (g_cursor_col > 0) {
+            g_cursor_col--;
+            term_clear_cell(g_cursor_col, g_cursor_row, BG_COLOR);
+        }
+        return;
+    }
+    if (c < 32 || c > 126) return;
+
+    if (g_cursor_col >= 80) {
+        g_cursor_col = 0;
+        g_cursor_row++;
+        if (g_cursor_row >= 24) {
+            term_scroll();
+            g_cursor_row = 23;
+        }
+    }
+
+    term_draw_char(g_cursor_col, g_cursor_row, c, FG_TEXT, BG_COLOR);
+    g_cursor_col++;
+}
+
+static void shell_write(const char* str) {
+    if (g_gui_mode) {
+        while (*str) {
+            if (str[0] == '\033' && str[1] == '[' && str[2] == '2' && str[3] == 'J') {
+                term_clear();
+                str += 4;
+                continue;
+            }
+            term_put_char(*str);
+            str++;
+        }
+        term_commit();
+    } else {
+        oz::sys_write(str);
+    }
+}
 
 static int vfs_open(const char* path) {
     oz::IPCMessage req{};
@@ -141,7 +274,7 @@ static bool vfs_list_dir(const char* path) {
         return false;
     }
     if (resp.data[0] == 0 && g_shared_buf) {
-        oz::sys_write(g_shared_buf);
+        shell_write(g_shared_buf);
         return true;
     }
     return false;
@@ -431,7 +564,7 @@ static bool execute_spawn(const CommandArgs& cmd_args, std::uint32_t override_st
     std::size_t prog_idx = 0;
     if (str_equals(cmd_args.args[0], "spawn")) {
         if (cmd_args.argc < 2) {
-            oz::sys_write("Usage: spawn <binary> [args...]\n\r");
+            shell_write("Usage: spawn <binary> [args...]\n\r");
             return false;
         }
         prog_idx = 1;
@@ -447,19 +580,19 @@ static bool execute_spawn(const CommandArgs& cmd_args, std::uint32_t override_st
         auto res = vfs_openat(cmd_args.redirect_stdin, oz::ipc::VfsOpenFlags::FILE);
         if (res.status == oz::ipc::VfsStatus::OK && res.transferred_cap != oz::INVALID_CAP_ID) {
             child_stdin_cap = res.transferred_cap;
-            oz::sys_write("[Shell] STDIN redirected from: ");
-            oz::sys_write(cmd_args.redirect_stdin);
-            oz::sys_write("\n\r");
+            shell_write("[Shell] STDIN redirected from: ");
+            shell_write(cmd_args.redirect_stdin);
+            shell_write("\n\r");
         } else {
-            oz::sys_write("[Shell] Warning: Failed to open redirect file: ");
-            oz::sys_write(cmd_args.redirect_stdin);
-            oz::sys_write("\n\r");
+            shell_write("[Shell] Warning: Failed to open redirect file: ");
+            shell_write(cmd_args.redirect_stdin);
+            shell_write("\n\r");
         }
     }
 
     std::uint32_t sess = 0;
     if (!procman_spawn_init(prog_name, child_stdin_cap, &sess)) {
-        oz::sys_write("Failed to initialize spawn request\n\r");
+        shell_write("Failed to initialize spawn request\n\r");
         return false;
     }
 
@@ -474,13 +607,13 @@ static bool execute_spawn(const CommandArgs& cmd_args, std::uint32_t override_st
         auto res = vfs_openat(path, oz::ipc::VfsOpenFlags::FILE);
         if (res.status == oz::ipc::VfsStatus::OK && res.transferred_cap != oz::INVALID_CAP_ID) {
             procman_spawn_add_cap(path, res.transferred_cap);
-            oz::sys_write("[Powerbox] Delegated file cap: ");
-            oz::sys_write(path);
-            oz::sys_write("\n\r");
+            shell_write("[Powerbox] Delegated file cap: ");
+            shell_write(path);
+            shell_write("\n\r");
         } else {
-            oz::sys_write("[Powerbox] Warning: Could not open delegated file: ");
-            oz::sys_write(path);
-            oz::sys_write("\n\r");
+            shell_write("[Powerbox] Warning: Could not open delegated file: ");
+            shell_write(path);
+            shell_write("\n\r");
         }
     }
 
@@ -492,15 +625,15 @@ static bool execute_spawn(const CommandArgs& cmd_args, std::uint32_t override_st
     // 5. Commit spawn
     std::uint32_t pid = procman_spawn_commit();
     if (pid == 0) {
-        oz::sys_write("ProcMan failed to spawn process: ");
-        oz::sys_write(prog_name);
-        oz::sys_write("\n\r");
+        shell_write("ProcMan failed to spawn process: ");
+        shell_write(prog_name);
+        shell_write("\n\r");
         return false;
     }
 
-    oz::sys_write("Spawned process (via ProcMan): ");
-    oz::sys_write(prog_name);
-    oz::sys_write("\n\r");
+    shell_write("Spawned process (via ProcMan): ");
+    shell_write(prog_name);
+    shell_write("\n\r");
 
     if (out_pid) {
         *out_pid = pid;
@@ -537,17 +670,17 @@ static bool execute_pipeline(const char* line) {
 
     CommandArgs cmd_left{}, cmd_right{};
     if (!parse_command_line(left_cmd, cmd_left) || !parse_command_line(right_cmd, cmd_right)) {
-        oz::sys_write("Pipeline syntax error\n\r");
+        shell_write("Pipeline syntax error\n\r");
         return true;
     }
 
     std::uint32_t pipe_w = 0, pipe_r = 0;
     if (!procman_create_pipe(&pipe_w, &pipe_r)) {
-        oz::sys_write("Failed to create pipeline channel via ProcMan\n\r");
+        shell_write("Failed to create pipeline channel via ProcMan\n\r");
         return true;
     }
 
-    oz::sys_write("[Pipeline] Created Channel pipe via ProcMan: write / read\n\r");
+    shell_write("[Pipeline] Created Channel pipe via ProcMan: write / read\n\r");
 
     std::uint32_t pid_right = 0;
     std::uint32_t pid_left = 0;
@@ -595,29 +728,29 @@ static void execute_command(const char* line) {
     const char* cmd0 = cmd_args.args[0];
 
     if (str_equals(cmd0, "help")) {
-        oz::sys_write("Available commands:\n\r");
-        oz::sys_write("  help              - Show this help message\n\r");
-        oz::sys_write("  clear             - Clear console screen\n\r");
-        oz::sys_write("  ls [path]         - List directory contents via VFS\n\r");
-        oz::sys_write("  cat <path>        - Display file contents via VFS\n\r");
-        oz::sys_write("  spawn <bin> [args]- Load and execute ELF binary with Powerbox delegation\n\r");
-        oz::sys_write("  echo <text>       - Echo text back to console\n\r");
-        oz::sys_write("  app < @\"file\"     - STDIN redirection with File Capability\n\r");
-        oz::sys_write("  app1 | app2       - Inter-process Channel pipeline\n\r");
+        shell_write("Available commands:\n\r");
+        shell_write("  help              - Show this help message\n\r");
+        shell_write("  clear             - Clear console screen\n\r");
+        shell_write("  ls [path]         - List directory contents via VFS\n\r");
+        shell_write("  cat <path>        - Display file contents via VFS\n\r");
+        shell_write("  spawn <bin> [args]- Load and execute ELF binary with Powerbox delegation\n\r");
+        shell_write("  echo <text>       - Echo text back to console\n\r");
+        shell_write("  app < @\"file\"     - STDIN redirection with File Capability\n\r");
+        shell_write("  app1 | app2       - Inter-process Channel pipeline\n\r");
     } else if (str_equals(cmd0, "clear")) {
-        oz::sys_write("\033[2J\033[H");
+        shell_write("\033[2J\033[H");
     } else if (str_equals(cmd0, "echo")) {
         for (std::size_t i = 1; i < cmd_args.argc; ++i) {
-            oz::sys_write(cmd_args.args[i]);
-            if (i + 1 < cmd_args.argc) oz::sys_write(" ");
+            shell_write(cmd_args.args[i]);
+            if (i + 1 < cmd_args.argc) shell_write(" ");
         }
-        oz::sys_write("\n\r");
+        shell_write("\n\r");
     } else if (str_equals(cmd0, "ls")) {
         const char* path = (cmd_args.argc > 1) ? cmd_args.args[1] : "/";
         if (!vfs_list_dir(path)) {
-            oz::sys_write("Failed to list directory: ");
-            oz::sys_write(path);
-            oz::sys_write("\n\r");
+            shell_write("Failed to list directory: ");
+            shell_write(path);
+            shell_write("\n\r");
         }
     } else if (str_equals(cmd0, "cat")) {
         // Built-in fallback cat or spawn cat
@@ -634,11 +767,11 @@ static void execute_command(const char* line) {
                     std::size_t n = vfs_read(fd, offset, read_buf, to_read);
                     if (n == 0) break;
                     read_buf[n] = '\0';
-                    oz::sys_write(read_buf);
+                    shell_write(read_buf);
                     offset += n;
                 }
                 vfs_close(fd);
-                oz::sys_write("\n\r");
+                shell_write("\n\r");
                 return;
             }
         }
@@ -652,16 +785,120 @@ static void execute_command(const char* line) {
             vfs_close(fd);
             execute_spawn(cmd_args);
         } else {
-            oz::sys_write("Unknown command: ");
-            oz::sys_write(cmd0);
-            oz::sys_write("\n\rType 'help' for available commands.\n\r");
+            shell_write("Unknown command: ");
+            shell_write(cmd0);
+            shell_write("\n\rType 'help' for available commands.\n\r");
         }
     }
 }
 
-extern "C" void _start() {
-    oz::sys_write("\n\r=== OZ OS Interactive Shell ===\n\r");
-    oz::sys_write("Type 'help' for a list of commands.\n\r\n\r");
+static bool init_gui_terminal(std::uint32_t cap_wm, std::uint32_t cap_display) {
+    if (cap_wm == 0 || cap_display == 0) return false;
+
+    // 1. Request window from WM (640x384)
+    oz::IPCMessage req{};
+    req.data[0] = static_cast<std::uint64_t>(oz::ipc::WMCmd::CREATE_WINDOW);
+    req.data[1] = 640;
+    req.data[2] = 384;
+
+    std::uint32_t reply_send = 0, reply_recv = 0;
+    if (!oz::sys_channel_create(oz::CAP_UNTYPED, &reply_send, &reply_recv)) {
+        oz::sys_debug_print("[Shell] init_gui_terminal: failed to create reply channel!\n\r");
+        return false;
+    }
+    req.transferred_cap = reply_send;
+    req.has_cap = true;
+
+    oz::sys_debug_print("[Shell] init_gui_terminal: Sending CREATE_WINDOW...\n\r");
+    if (!oz::sys_channel_send(cap_wm, &req)) {
+        oz::sys_debug_print("[Shell] init_gui_terminal: sys_channel_send failed!\n\r");
+        oz::sys_cap_delete(reply_recv);
+        return false;
+    }
+
+    oz::IPCMessage resp{};
+    if (!oz::sys_channel_recv(reply_recv, &resp)) {
+        oz::sys_debug_print("[Shell] init_gui_terminal: sys_channel_recv failed!\n\r");
+        oz::sys_cap_delete(reply_recv);
+        return false;
+    }
+    oz::sys_cap_delete(reply_recv);
+
+    if (resp.data[0] != 0 || !resp.has_cap) {
+        oz::sys_debug_print("[Shell] init_gui_terminal: CREATE_WINDOW returned error or no cap!\n\r");
+        return false;
+    }
+
+    g_win_id = static_cast<std::uint32_t>(resp.data[1]);
+    g_surf_id = static_cast<std::uint32_t>(resp.data[2]);
+    std::uint32_t surf_frame = resp.transferred_cap;
+
+    oz::sys_debug_print("[Shell] init_gui_terminal: Window created! Mapping surface frame...\n\r");
+
+    // 2. Map surface frame into virtual memory
+    static constexpr std::uint64_t SHELL_SURF_VADDR = 0x600000000000ULL;
+    std::size_t surf_size = (640 * 384 * sizeof(Pixel) + 4095) & ~4095ULL;
+    if (oz::sys_vspace_map_with_pagetables(oz::CAP_SELF_VSPACE, oz::CAP_UNTYPED, surf_frame, SHELL_SURF_VADDR, 0x01, surf_size) != 0) {
+        oz::sys_debug_print("[Shell] init_gui_terminal: sys_vspace_map_with_pagetables failed!\n\r");
+        return false;
+    }
+    g_win_buffer = reinterpret_cast<Pixel*>(SHELL_SURF_VADDR);
+
+    // 3. Create input channel and bind to WM
+    std::uint32_t input_send = 0;
+    if (!oz::sys_channel_create(oz::CAP_UNTYPED, &input_send, &g_input_recv)) {
+        oz::sys_debug_print("[Shell] init_gui_terminal: failed to create input channel!\n\r");
+        return false;
+    }
+
+    oz::IPCMessage bind_msg{};
+    bind_msg.data[0] = static_cast<std::uint64_t>(oz::ipc::WMCmd::BIND_INPUT_CHANNEL);
+    bind_msg.data[1] = g_win_id;
+    bind_msg.transferred_cap = input_send;
+    bind_msg.has_cap = true;
+    oz::sys_channel_send(cap_wm, &bind_msg);
+
+    // 4. Set Window Title
+    oz::IPCMessage title_msg{};
+    title_msg.data[0] = static_cast<std::uint64_t>(oz::ipc::WMCmd::SET_TITLE);
+    title_msg.data[1] = g_win_id;
+    char title_chars[16] = "Terminal";
+    for (int k = 0; k < 2; ++k) {
+        title_msg.data[k + 2] = *reinterpret_cast<std::uint64_t*>(&title_chars[k * 8]);
+    }
+    oz::sys_channel_send(cap_wm, &title_msg);
+
+    g_cap_wm = cap_wm;
+    g_cap_display = cap_display;
+    g_gui_mode = true;
+
+    oz::sys_debug_print("[Shell] calling term_clear...\n\r");
+    term_clear();
+    oz::sys_debug_print("[Shell] term_clear done, calling term_commit...\n\r");
+    term_commit();
+    oz::sys_debug_print("[Shell] init_gui_terminal: Terminal GUI successfully initialized!\n\r");
+    return true;
+}
+
+OZ_PROCESS_ENTRY() {
+    oz::sys_debug_print("[Shell] Process started in OZ_PROCESS_ENTRY!\n\r");
+    oz::LocalNamespace::init(info);
+
+    // 1. Resolve Capabilities from Local Namespace
+    std::uint32_t cap_wm = oz::LocalNamespace::get_cap(oz::CapRole::WM);
+    std::uint32_t cap_display = oz::LocalNamespace::get_cap(oz::CapRole::DISPLAY);
+    oz::sys_debug_print("[Shell] Resolved caps: cap_wm=");
+    char num_buf[4] = {static_cast<char>('0' + (cap_wm % 10)), ' ', static_cast<char>('0' + (cap_display % 10)), '\0'};
+    oz::sys_debug_print(num_buf);
+    oz::sys_debug_print("\n\r");
+
+    // 2. Try initializing GUI Terminal Window
+    if (cap_wm != 0 && cap_display != 0) {
+        init_gui_terminal(cap_wm, cap_display);
+    }
+
+    shell_write("\n\r=== OZ OS Interactive Shell ===\n\r");
+    shell_write("Type 'help' for a list of commands.\n\r\n\r");
 
     // VFS shared buffer is pre-mapped by Init at VFS_SHARED_BUF_VIRT
     g_shared_buf = reinterpret_cast<char*>(VFS_SHARED_BUF_VIRT);
@@ -669,35 +906,41 @@ extern "C" void _start() {
     char line_buf[256] = {};
     std::size_t line_len = 0;
 
-    oz::sys_write("oz> ");
+    shell_write("oz> ");
 
-    oz::IPCMessage msg;
     while (true) {
-        if (!oz::sys_channel_recv(CAP_SHELL_INPUT, &msg)) continue;
+        oz::IPCMessage msg{};
+        char c = 0;
+        if (g_gui_mode) {
+            if (!oz::sys_channel_recv(g_input_recv, &msg)) continue;
+            if (msg.data[0] != static_cast<std::uint64_t>(oz::ipc::WMEventType::KEY_DOWN)) continue;
+            c = static_cast<char>(msg.data[1] & 0xFF);
+        } else {
+            if (!oz::sys_channel_recv(CAP_SHELL_INPUT, &msg)) continue;
+            c = static_cast<char>(msg.data[0] & 0xFF);
+        }
 
-        // Unpack ASCII character from msg.data[0]
-        char c = static_cast<char>(msg.data[0] & 0xFF);
         if (c == 0) continue;
 
         if (c == '\r' || c == '\n') {
-            oz::sys_write("\n\r");
+            shell_write("\n\r");
             line_buf[line_len] = '\0';
             execute_command(line_buf);
             line_len = 0;
             line_buf[0] = '\0';
-            oz::sys_write("oz> ");
+            shell_write("oz> ");
         } else if (c == '\b' || c == 0x7F) {
             if (line_len > 0) {
                 line_len--;
                 line_buf[line_len] = '\0';
-                oz::sys_write("\b \b");
+                shell_write("\b \b");
             }
         } else if (c >= 32 && c <= 126) {
             if (line_len + 1 < sizeof(line_buf)) {
                 line_buf[line_len++] = c;
                 line_buf[line_len] = '\0';
                 char echo[2] = {c, '\0'};
-                oz::sys_write(echo);
+                shell_write(echo);
             }
         }
     }

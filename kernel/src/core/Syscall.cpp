@@ -38,6 +38,27 @@ SyscallContext g_syscall_context;
 
 extern "C" void syscall_entry();
 
+static void dprint_hex(std::uint64_t val) {
+    char buf[19];
+    oz::utils::to_hex(val, buf);
+    dprint(buf);
+}
+
+static void dprint_dec(std::uint64_t val) {
+    if (val == 0) {
+        dprint("0");
+        return;
+    }
+    char buf[21];
+    int idx = 20;
+    buf[idx--] = '\0';
+    while (val > 0) {
+        buf[idx--] = '0' + (val % 10);
+        val /= 10;
+    }
+    dprint(&buf[idx + 1]);
+}
+
 // ===========================================================================
 // Phase 5: Security helpers
 // ===========================================================================
@@ -157,7 +178,6 @@ static int do_channel_send(CSpace* cspace, CapID ep_id, const IPCMessage* msg) {
 
     g_block_thread_func();
 
-    // Woken up
     if (ep->is_peer_closed()) {
         // Rollback attached capability if peer closed before reception
         if (current->send_msg.attached_cap.is_valid()) {
@@ -215,6 +235,12 @@ static int do_channel_recv(CSpace* cspace, CapID ep_id, IPCMessage* msg) {
         if (g_unblock_thread_func) {
             g_unblock_thread_func(sender);
         }
+
+        // Re-signal bound notification if more senders are waiting on peer
+        if (peer->has_send_waiters() && ep->get_bound_notification()) {
+            ep->get_bound_notification()->signal(ep->get_bound_badge());
+        }
+
         return 0;
     }
 
@@ -304,20 +330,38 @@ extern "C" std::uint64_t handleSyscall(std::uint64_t rdi, std::uint64_t rsi, std
     } else if (syscall_number == 5) {
         // frame_alloc
         CSpace* cspace = get_cspace();
-        if (!cspace) return -1;
+        if (!cspace) {
+            dprint("frame_alloc: no cspace\n\r");
+            return -1;
+        }
         
         UntypedMemory* untyped = get_cap_typed<UntypedMemory>(
             cspace, static_cast<CapID>(rdi), ObjectType::UntypedMemory, CapRights::WRITE);
-        if (!untyped) return -1;
+        if (!untyped) {
+            dprint("frame_alloc: get_cap_typed failed for untyped cap ");
+            dprint_hex(rdi);
+            dprint("\n\r");
+            return -1;
+        }
         
         Frame* frame = untyped->retypeFrame(rsi);
-        if (!frame) return -1;
+        if (!frame) {
+            dprint("frame_alloc: untyped->retypeFrame failed! requested pages: ");
+            dprint_dec(rsi);
+            dprint(", remaining bytes: ");
+            dprint_dec(untyped->remainingBytes());
+            dprint("\n\r");
+            return -1;
+        }
         
         Capability frame_cap(frame, CapRights::ALL);
         CapID new_id = cspace->add(frame_cap);
         frame->release();
         
-        if (new_id == INVALID_CAP_ID) return static_cast<std::uint64_t>(-1);
+        if (new_id == INVALID_CAP_ID) {
+            dprint("frame_alloc: cspace->add failed\n\r");
+            return static_cast<std::uint64_t>(-1);
+        }
         return static_cast<std::uint64_t>(new_id);
     } else if (syscall_number == 60) {
         // exit
@@ -878,6 +922,13 @@ extern "C" std::uint64_t handleSyscall(std::uint64_t rdi, std::uint64_t rsi, std
         Notification* notif = get_cap_typed<Notification>(
             cspace, static_cast<CapID>(rsi), ObjectType::Notification, CapRights::WRITE);
         if (!notif) return -1;
+        dprint("channel_bind_notification: ep=");
+        dprint_hex(reinterpret_cast<std::uint64_t>(ep));
+        dprint(", notif=");
+        dprint_hex(reinterpret_cast<std::uint64_t>(notif));
+        dprint(", badge=");
+        dprint_hex(rdx);
+        dprint("\n\r");
         ep->bind_notification(notif, rdx);
         return 0;
     } else if (syscall_number == 38) {

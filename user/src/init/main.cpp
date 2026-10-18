@@ -24,6 +24,8 @@ static constexpr std::uint32_t CAP_VFS_RECV = 4;
 static constexpr std::uint32_t CAP_VFS_SHARED_BUF = 5;
 static constexpr std::uint32_t CAP_DISPLAY_SEND = 6;
 static constexpr std::uint32_t CAP_WM_SEND      = 7;
+static constexpr std::uint32_t CAP_PROCMAN_SEND = 8;
+static constexpr std::uint32_t CAP_PROCMAN_RECV = 9;
 
 
 static constexpr std::uint64_t BOOTINFO_VADDR = 0x600000000000ULL;
@@ -579,28 +581,30 @@ extern "C" void _start() {
     oz::sys_channel_create(oz::CAP_UNTYPED, &procman_reply_send, &procman_reply_recv);
 
     oz::loader::TarFile proc_file = oz::loader::tar_find_file(initrd_ptr, initrd_size, "procman");
+    oz::loader::SpawnedProcess procman_proc{};
     if (proc_file.data) {
-        auto proc_proc = oz::loader::spawn_process(oz::CAP_UNTYPED, oz::CAP_SELF_VSPACE, proc_file.data, proc_file.size);
-        if (proc_proc.success) {
+        procman_proc = oz::loader::spawn_process(oz::CAP_UNTYPED, oz::CAP_SELF_VSPACE, proc_file.data, proc_file.size);
+        if (procman_proc.success) {
             // Slot 1: Console Send
-            oz::sys_cspace_cap_insert(proc_proc.cspace_cap, 1, cons_send, static_cast<std::uint32_t>(oz::CapRights::WRITE | oz::CapRights::GRANT));
+            oz::sys_cspace_cap_insert(procman_proc.cspace_cap, 1, cons_send, static_cast<std::uint32_t>(oz::CapRights::WRITE | oz::CapRights::GRANT | oz::CapRights::DUPLICATE));
             // Slot 2: ProcMan Req Recv
-            oz::sys_cspace_cap_insert(proc_proc.cspace_cap, 2, procman_req_recv, static_cast<std::uint32_t>(oz::CapRights::READ));
+            oz::sys_cspace_cap_insert(procman_proc.cspace_cap, 2, procman_req_recv, static_cast<std::uint32_t>(oz::CapRights::READ));
             // Slot 3: ProcMan Reply Send
-            oz::sys_cspace_cap_insert(proc_proc.cspace_cap, 3, procman_reply_send, static_cast<std::uint32_t>(oz::CapRights::WRITE | oz::CapRights::GRANT));
+            oz::sys_cspace_cap_insert(procman_proc.cspace_cap, 3, procman_reply_send, static_cast<std::uint32_t>(oz::CapRights::WRITE | oz::CapRights::GRANT));
             // Slot 4: MemMan Send
-            oz::sys_cspace_cap_insert(proc_proc.cspace_cap, 4, memman_req_send, static_cast<std::uint32_t>(oz::CapRights::WRITE | oz::CapRights::GRANT));
+            oz::sys_cspace_cap_insert(procman_proc.cspace_cap, 4, memman_req_send, static_cast<std::uint32_t>(oz::CapRights::WRITE | oz::CapRights::GRANT));
             // Slot 5: MemMan Recv
-            oz::sys_cspace_cap_insert(proc_proc.cspace_cap, 5, memman_reply_recv, static_cast<std::uint32_t>(oz::CapRights::READ));
+            oz::sys_cspace_cap_insert(procman_proc.cspace_cap, 5, memman_reply_recv, static_cast<std::uint32_t>(oz::CapRights::READ));
             // Slot 6: VFS Send
-            oz::sys_cspace_cap_insert(proc_proc.cspace_cap, 6, vfs_req_send, static_cast<std::uint32_t>(oz::CapRights::WRITE | oz::CapRights::GRANT));
+            oz::sys_cspace_cap_insert(procman_proc.cspace_cap, 6, vfs_req_send, static_cast<std::uint32_t>(oz::CapRights::WRITE | oz::CapRights::GRANT | oz::CapRights::DUPLICATE));
             // Slot 7: VFS Recv
-            oz::sys_cspace_cap_insert(proc_proc.cspace_cap, 7, procman_vfs_reply_recv, static_cast<std::uint32_t>(oz::CapRights::READ));
+            oz::sys_cspace_cap_insert(procman_proc.cspace_cap, 7, procman_vfs_reply_recv, static_cast<std::uint32_t>(oz::CapRights::READ));
             // Slot 8: VFS Shared Buffer
-            oz::sys_cspace_cap_insert(proc_proc.cspace_cap, 8, procman_client_frame, static_cast<std::uint32_t>(oz::CapRights::ALL));
+            oz::sys_cspace_cap_insert(procman_proc.cspace_cap, 8, procman_client_frame, static_cast<std::uint32_t>(oz::CapRights::ALL));
 
-            oz::sys_tcb_resume(proc_proc.tcb_cap);
-            oz::sys_write("[Init] Process Manager (ProcMan) spawned successfully.\n\r");
+            // Register ProcMan channels in Init CSpace
+            oz::sys_cspace_cap_insert(oz::CAP_SELF_CSPACE, CAP_PROCMAN_SEND, procman_req_send, static_cast<std::uint32_t>(oz::CapRights::WRITE | oz::CapRights::GRANT));
+            oz::sys_cspace_cap_insert(oz::CAP_SELF_CSPACE, CAP_PROCMAN_RECV, procman_reply_recv, static_cast<std::uint32_t>(oz::CapRights::READ));
         } else {
             oz::sys_write("[Init] ERROR: Failed to spawn procman!\n\r");
         }
@@ -608,44 +612,7 @@ extern "C" void _start() {
         oz::sys_write("[Init] ERROR: procman not found in initrd!\n\r");
     }
 
-    // 6. Spawn Interactive Shell Server (Unprivileged User Process)
     std::uint32_t xhci_key_send = cons_send;
-    oz::loader::TarFile shell_file = oz::loader::tar_find_file(initrd_ptr, initrd_size, "shell");
-    if (shell_file.data) {
-        auto shell_proc = oz::loader::spawn_process(oz::CAP_UNTYPED, oz::CAP_SELF_VSPACE, shell_file.data, shell_file.size);
-        if (shell_proc.success) {
-            std::uint32_t shell_input_send = 0;
-            std::uint32_t shell_input_recv = 0;
-            oz::sys_channel_create(oz::CAP_UNTYPED, &shell_input_send, &shell_input_recv);
-            xhci_key_send = shell_input_send;
-
-            // Slot 0: Self VSpace
-            oz::sys_cspace_cap_insert(shell_proc.cspace_cap, 0, shell_proc.vspace_cap, static_cast<std::uint32_t>(oz::CapRights::ALL));
-            // Slot 1: Console Send
-            oz::sys_cspace_cap_insert(shell_proc.cspace_cap, 1, cons_send, static_cast<std::uint32_t>(oz::CapRights::WRITE | oz::CapRights::GRANT));
-            // Slot 2: Shell Input Recv (from xHCI)
-            oz::sys_cspace_cap_insert(shell_proc.cspace_cap, 2, shell_input_recv, static_cast<std::uint32_t>(oz::CapRights::READ));
-            // Slot 3: VFS Request Send (shared request channel)
-            oz::sys_cspace_cap_insert(shell_proc.cspace_cap, 3, vfs_req_send, static_cast<std::uint32_t>(oz::CapRights::WRITE | oz::CapRights::GRANT));
-            // Slot 4: VFS Reply Recv (shell dedicated reply channel)
-            oz::sys_cspace_cap_insert(shell_proc.cspace_cap, 4, shell_reply_recv, static_cast<std::uint32_t>(oz::CapRights::READ));
-            // Slot 5: VFS Shared Buffer (shell dedicated buffer frame)
-            oz::sys_cspace_cap_insert(shell_proc.cspace_cap, 5, shell_client_frame, static_cast<std::uint32_t>(oz::CapRights::ALL));
-            // Slot 6: ProcMan Request Send
-            oz::sys_cspace_cap_insert(shell_proc.cspace_cap, 6, procman_req_send, static_cast<std::uint32_t>(oz::CapRights::WRITE | oz::CapRights::GRANT));
-            // Slot 7: ProcMan Reply Recv
-            oz::sys_cspace_cap_insert(shell_proc.cspace_cap, 7, procman_reply_recv, static_cast<std::uint32_t>(oz::CapRights::READ));
-            // NOTE: CAP_UNTYPED is NOT inserted into shell's CSpace! Shell is purely unprivileged!
-
-            // Pre-map VFS shared buffer into shell's VSpace so shell doesn't need UntypedMemory
-            oz::sys_vspace_map_with_pagetables(shell_proc.vspace_cap, oz::CAP_UNTYPED, shell_client_frame, VFS_SHARED_BUF_VIRT, 0x01, 16 * 4096);
-
-            oz::sys_tcb_resume(shell_proc.tcb_cap);
-            oz::sys_write("[Init] Interactive Shell (User Process) spawned successfully.\n\r");
-        } else {
-            oz::sys_write("[Init] ERROR: Failed to spawn shell process!\n\r");
-        }
-    }
 
     // 6.5 Spawn Window Manager (WM)
     std::uint32_t wm_req_send = 0;
@@ -686,6 +653,15 @@ extern "C" void _start() {
 
             // Also keep WM channel in Init
             oz::sys_cspace_cap_insert(oz::CAP_SELF_CSPACE, CAP_WM_SEND, wm_req_send, static_cast<std::uint32_t>(oz::CapRights::WRITE | oz::CapRights::GRANT));
+
+            // Grant WM and Display to ProcMan for delegation to children
+            if (procman_proc.success) {
+                oz::sys_cspace_cap_insert(procman_proc.cspace_cap, 9, wm_req_send, static_cast<std::uint32_t>(oz::CapRights::WRITE | oz::CapRights::GRANT | oz::CapRights::DUPLICATE));
+                oz::sys_cspace_cap_insert(procman_proc.cspace_cap, 10, disp_cmd_send, static_cast<std::uint32_t>(oz::CapRights::WRITE | oz::CapRights::GRANT | oz::CapRights::DUPLICATE));
+                // Resume ProcMan after all slots (1..10) are fully populated
+                oz::sys_tcb_resume(procman_proc.tcb_cap);
+                oz::sys_write("[Init] Process Manager (ProcMan) spawned and resumed successfully.\n\r");
+            }
         } else {
             oz::sys_write("[Init] ERROR: Failed to spawn WM!\n\r");
         }
@@ -1214,11 +1190,46 @@ extern "C" void _start() {
         }
     }
 
-    oz::sys_write("Init process completed. Idling...\n\r");
-
-
-    while (true) {
-        __asm__ volatile("pause");
+    // ========================================================================
+    // Step 5: Launch Interactive Shell via Process Manager (ProcMan)
+    // ========================================================================
+    oz::sys_debug_print("[Init] Launching interactive shell via ProcMan...\n\r");
+    oz::IPCMessage s_init{};
+    s_init.data[0] = static_cast<std::uint64_t>(oz::ipc::ProcCmd::SPAWN_INIT);
+    char sh_name[24] = "shell";
+    for (int k = 0; k < 3; ++k) {
+        s_init.data[k + 1] = *reinterpret_cast<std::uint64_t*>(&sh_name[k * 8]);
     }
+    s_init.has_cap = false;
+
+    if (oz::sys_channel_send(CAP_PROCMAN_SEND, &s_init)) {
+        oz::IPCMessage s_resp{};
+        if (oz::sys_channel_recv(CAP_PROCMAN_RECV, &s_resp) && s_resp.data[0] == 0) {
+            std::uint32_t sess_id = static_cast<std::uint32_t>(s_resp.data[1]);
+            oz::IPCMessage s_commit{};
+            s_commit.data[0] = static_cast<std::uint64_t>(oz::ipc::ProcCmd::SPAWN_COMMIT);
+            s_commit.data[1] = sess_id;
+            if (oz::sys_channel_send(CAP_PROCMAN_SEND, &s_commit)) {
+                oz::IPCMessage s_cresp{};
+                if (oz::sys_channel_recv(CAP_PROCMAN_RECV, &s_cresp) && s_cresp.data[0] == 0) {
+                    std::uint32_t shell_pid = static_cast<std::uint32_t>(s_cresp.data[1]);
+                    oz::sys_debug_print("[Init] Shell process spawned via ProcMan! PID=");
+                    char pid_str[4] = {static_cast<char>('0' + (shell_pid % 10)), '\n', '\r', '\0'};
+                    oz::sys_debug_print(pid_str);
+                } else {
+                    oz::sys_debug_print("[Init] ERROR: ProcMan SPAWN_COMMIT failed for shell, code=");
+                    char c_buf[4] = {static_cast<char>('0' + s_cresp.data[0]), '\n', '\r', '\0'};
+                    oz::sys_debug_print(c_buf);
+                }
+            }
+        } else {
+            oz::sys_debug_print("[Init] ERROR: ProcMan SPAWN_INIT failed for shell, code=");
+            char c_buf[4] = {static_cast<char>('0' + s_resp.data[0]), '\n', '\r', '\0'};
+            oz::sys_debug_print(c_buf);
+        }
+    }
+
+    oz::sys_write("Init process completed. Exiting Init thread...\n\r");
+    oz::sys_exit(0);
 }
 

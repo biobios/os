@@ -65,11 +65,19 @@ void bar_draw_char(std::uint32_t x, std::uint32_t y, char c, Pixel fg, Pixel bg)
     }
 }
 
-// Draw a string in the status bar buffer
+// Draw a string in the status bar buffer with 1px letter spacing
 std::uint32_t bar_draw_string(std::uint32_t x, std::uint32_t y, const char* str, Pixel fg, Pixel bg) {
     while (*str) {
         bar_draw_char(x, y, *str, fg, bg);
-        x += FONT_WIDTH;
+        // Clear 1px column after character to avoid glyph touching
+        if (x + FONT_WIDTH < g_screen_width) {
+            for (int r = 0; r < FONT_HEIGHT; ++r) {
+                if (y + r < oz::wm::STATUS_BAR_HEIGHT) {
+                    g_bar_buffer[(y + r) * g_screen_width + (x + FONT_WIDTH)] = bg;
+                }
+            }
+        }
+        x += FONT_WIDTH + 1;
         str++;
     }
     return x;
@@ -151,7 +159,7 @@ void render_status_bar() {
     // 7. Right-aligned OS Title
     const char* os_title = "OZ Tiling WM";
     std::uint32_t title_len = 12;
-    std::uint32_t right_x = g_screen_width - (title_len * FONT_WIDTH) - 12;
+    std::uint32_t right_x = g_screen_width - (title_len * (FONT_WIDTH + 1)) - 12;
     bar_draw_string(right_x, cy, os_title, fg_inactive, bg_bar);
 
     // Commit bar surface to display
@@ -247,11 +255,12 @@ void sync_state_to_display() {
 
 // Handle Keyboard Input from xHCI
 void handle_key_input(char ascii, std::uint8_t scancode, std::uint32_t modifiers) {
-    bool super_down = (modifiers & static_cast<std::uint32_t>(oz::ipc::WMModifier::SUPER)) != 0;
+    bool mod_down = (modifiers & (static_cast<std::uint32_t>(oz::ipc::WMModifier::SUPER) |
+                                  static_cast<std::uint32_t>(oz::ipc::WMModifier::ALT))) != 0;
     bool shift_down = (modifiers & static_cast<std::uint32_t>(oz::ipc::WMModifier::SHIFT)) != 0;
 
-    // Global WM Hotkeys (Super + ...)
-    if (super_down) {
+    // Global WM Hotkeys (Mod + ...)
+    if (mod_down) {
         // Workspace switching: Super + 1..9
         if (ascii >= '1' && ascii <= '9') {
             std::uint8_t target_ws = static_cast<std::uint8_t>(ascii - '1');

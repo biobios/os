@@ -25,6 +25,8 @@ static constexpr std::uint32_t CAP_MEMMAN_RECV     = 5;
 static constexpr std::uint32_t CAP_VFS_SEND        = 6;
 static constexpr std::uint32_t CAP_VFS_RECV        = 7;
 static constexpr std::uint32_t CAP_VFS_SHARED_BUF  = 8;
+static constexpr std::uint32_t CAP_WM_SEND         = 9;
+static constexpr std::uint32_t CAP_DISPLAY_SEND    = 10;
 
 static constexpr std::uint64_t VFS_SHARED_BUF_VIRT = 0x300000000000ULL;
 static constexpr std::uint64_t STAGING_ADDR        = 0x400000000000ULL;
@@ -187,8 +189,8 @@ static ProcessEntry* find_proc(std::uint32_t pid) {
 extern "C" void _start() {
     oz::sys_write("[ProcMan] Process Manager server started (Ring 3)!\n\r");
 
-    // 1. Request initial working UntypedMemory (2MB) from MemMan for internal objects & staging
-    g_procman_work_untyped = memman_alloc_untyped(2 * 1024 * 1024);
+    // 1. Request initial working UntypedMemory (8MB) from MemMan for internal objects & staging
+    g_procman_work_untyped = memman_alloc_untyped(8 * 1024 * 1024);
     if (g_procman_work_untyped == oz::INVALID_CAP_ID) {
         oz::sys_write("[ProcMan] FATAL: Failed to obtain working memory from MemMan!\n\r");
         oz::sys_exit(1);
@@ -291,6 +293,7 @@ extern "C" void _start() {
 
             std::size_t sz = vfs_get_size(fd);
             if (sz == 0 || sz > 2 * 1024 * 1024) {
+                oz::sys_write("[ProcMan] ERROR: Invalid executable size\n\r");
                 vfs_close(fd);
                 resp.data[0] = 3; // Invalid size
                 oz::sys_channel_send(CAP_PROCMAN_REPLY, &resp);
@@ -316,8 +319,18 @@ extern "C" void _start() {
             // 3. Allocate staging buffer to read ELF
             std::size_t pages = (sz + 4095) / 4096;
             std::uint32_t buf_frame = oz::sys_frame_alloc(g_procman_work_untyped, pages);
-            if (buf_frame == oz::INVALID_CAP_ID ||
-                oz::sys_vspace_map_with_pagetables(oz::CAP_SELF_VSPACE, g_procman_work_untyped, buf_frame, STAGING_ADDR, 0x01, pages * 4096) != 0) {
+            if (buf_frame == oz::INVALID_CAP_ID) {
+                oz::sys_write("[ProcMan] ERROR: sys_frame_alloc failed for staging buffer!\n\r");
+                vfs_close(fd);
+                memman_revoke_untyped(child_untyped);
+                resp.data[0] = 5;
+                oz::sys_channel_send(CAP_PROCMAN_REPLY, &resp);
+                continue;
+            }
+            int map_res = oz::sys_vspace_map_with_pagetables(oz::CAP_SELF_VSPACE, g_procman_work_untyped, buf_frame, STAGING_ADDR, 0x01, pages * 4096);
+            if (map_res != 0) {
+                oz::sys_write("[ProcMan] ERROR: sys_vspace_map_with_pagetables failed for staging buffer!\n\r");
+                oz::sys_cap_delete(buf_frame);
                 vfs_close(fd);
                 memman_revoke_untyped(child_untyped);
                 resp.data[0] = 5;
@@ -330,6 +343,7 @@ extern "C" void _start() {
             vfs_close(fd);
 
             if (read_bytes < sz) {
+                oz::sys_write("[ProcMan] ERROR: Failed to read complete ELF\n\r");
                 for (std::size_t p = 0; p < pages; ++p) {
                     oz::sys_vspace_unmap(oz::CAP_SELF_VSPACE, STAGING_ADDR + p * 4096);
                 }
@@ -366,6 +380,27 @@ extern "C" void _start() {
                 g_session.startup_info.add_cap(child_stdout_slot, oz::CapRole::STDOUT, "stdout", oz::CapType::STREAM);
             }
 
+            // WM
+            std::uint32_t child_wm_slot = 0;
+            if (has_manifest && manifest.needs_wm) {
+                child_wm_slot = next_slot++;
+                g_session.startup_info.add_cap(child_wm_slot, oz::CapRole::WM, "wm", oz::CapType::STREAM);
+            }
+
+            // Display
+            std::uint32_t child_display_slot = 0;
+            if (has_manifest && manifest.needs_display) {
+                child_display_slot = next_slot++;
+                g_session.startup_info.add_cap(child_display_slot, oz::CapRole::DISPLAY, "display", oz::CapType::STREAM);
+            }
+
+            // VFS Root
+            std::uint32_t child_vfs_slot = 0;
+            if (has_manifest && manifest.needs_vfs_root) {
+                child_vfs_slot = next_slot++;
+                g_session.startup_info.add_cap(child_vfs_slot, oz::CapRole::ROOT_DIR, "/", oz::CapType::DIR);
+            }
+
             // Delegated Caps
             for (std::size_t d = 0; d < g_session.num_delegated; ++d) {
                 std::uint32_t slot = next_slot++;
@@ -386,6 +421,7 @@ extern "C" void _start() {
             oz::sys_cap_delete(buf_frame);
 
             if (!proc.success) {
+                oz::sys_write("[ProcMan] ERROR: loader::spawn_process failed!\n\r");
                 memman_revoke_untyped(child_untyped);
                 resp.data[0] = 7; // Spawn failed
                 oz::sys_channel_send(CAP_PROCMAN_REPLY, &resp);
@@ -399,10 +435,31 @@ extern "C" void _start() {
             }
             if (child_stdout_slot != 0 && actual_stdout_cap != 0) {
                 oz::sys_cspace_cap_insert(proc.cspace_cap, child_stdout_slot, actual_stdout_cap,
-                    static_cast<std::uint32_t>(oz::CapRights::READ | oz::CapRights::WRITE | oz::CapRights::GRANT));
+                    static_cast<std::uint32_t>(oz::CapRights::WRITE | oz::CapRights::GRANT | oz::CapRights::DUPLICATE));
+            }
+            if (child_wm_slot != 0) {
+                oz::sys_cspace_cap_insert(proc.cspace_cap, child_wm_slot, CAP_WM_SEND,
+                    static_cast<std::uint32_t>(oz::CapRights::WRITE | oz::CapRights::GRANT | oz::CapRights::DUPLICATE));
+            }
+            if (child_display_slot != 0) {
+                oz::sys_cspace_cap_insert(proc.cspace_cap, child_display_slot, CAP_DISPLAY_SEND,
+                    static_cast<std::uint32_t>(oz::CapRights::WRITE | oz::CapRights::GRANT | oz::CapRights::DUPLICATE));
+            }
+            if (child_vfs_slot != 0) {
+                oz::sys_cspace_cap_insert(proc.cspace_cap, child_vfs_slot, CAP_VFS_SEND,
+                    static_cast<std::uint32_t>(oz::CapRights::WRITE | oz::CapRights::GRANT | oz::CapRights::DUPLICATE));
             }
 
-            std::uint32_t cur_del_slot = (child_stdout_slot > child_stdin_slot ? child_stdout_slot : child_stdin_slot) + 1;
+            // If child needs UntypedMemory for mapping (e.g. Surface FrameCap), allocate and insert
+            if (has_manifest && manifest.needs_untyped) {
+                std::uint32_t app_untyped = memman_alloc_untyped(2 * 1024 * 1024);
+                if (app_untyped != oz::INVALID_CAP_ID) {
+                    oz::sys_cspace_cap_insert(proc.cspace_cap, oz::CAP_UNTYPED, app_untyped,
+                        static_cast<std::uint32_t>(oz::CapRights::ALL));
+                }
+            }
+
+            std::uint32_t cur_del_slot = next_slot - g_session.num_delegated;
             for (std::size_t d = 0; d < g_session.num_delegated; ++d) {
                 oz::sys_cspace_cap_insert(proc.cspace_cap, cur_del_slot++, g_session.delegated[d].cap,
                     static_cast<std::uint32_t>(oz::CapRights::READ | oz::CapRights::WRITE | oz::CapRights::GRANT));

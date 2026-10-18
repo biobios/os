@@ -331,6 +331,15 @@ static std::int32_t g_cursor_x = 200;
 static std::int32_t g_cursor_y = 150;
 static bool g_cursor_visible = true;
 
+bool has_active_surfaces() {
+    for (std::size_t i = 0; i < MAX_SURFACES; ++i) {
+        if (g_surfaces[i].id != 0 && g_surfaces[i].visible && g_surfaces[i].buffer) {
+            return true;
+        }
+    }
+    return false;
+}
+
 void compose(DisplayDriver& disp) {
     oz::sys_debug_print("[Display] compose: start\n\r");
     // 1. Render desktop background
@@ -433,7 +442,9 @@ extern "C" void _start() {
                     *reinterpret_cast<std::uint64_t*>(&buf[i * 8]) = req.data[i];
                 }
                 buf[32] = '\0';
-                g_terminal.write(buf);
+                if (!has_active_surfaces()) {
+                    g_terminal.write(buf);
+                }
             }
         }
 
