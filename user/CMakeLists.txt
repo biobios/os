@@ -50,7 +50,7 @@ target_link_libraries(xhci oz_syscall)
 target_link_options(xhci PRIVATE "-T${CMAKE_CURRENT_SOURCE_DIR}/src/xhci/linker.ld" "-nostdlib" "-static")
 
 # display process (Display server / GUI compositor)
-add_executable(display src/display/main.cpp src/display/linker.ld)
+add_executable(display src/display/main.cpp src/display/Font.cpp src/display/linker.ld)
 target_link_libraries(display oz_syscall)
 target_link_options(display PRIVATE "-T${CMAKE_CURRENT_SOURCE_DIR}/src/display/linker.ld" "-nostdlib" "-static")
 

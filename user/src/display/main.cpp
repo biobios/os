@@ -1,4 +1,5 @@
 #include "syscall.hpp"
+#include "Font.hpp"
 
 namespace {
 
@@ -28,8 +29,6 @@ public:
         height_ = height;
         size_ = size;
 
-        // Map FrameBuffer capability (Slot 246) into self VSpace at FB_VADDR
-        // flags: 0x01 (Writable)
         int res = oz::sys_vspace_map_with_pagetables(oz::CAP_SELF_VSPACE, oz::CAP_UNTYPED, oz::CAP_FRAMEBUFFER, FB_VADDR, 0x01, size);
         if (res != 0) {
             oz::sys_debug_print("[Display] ERROR: Failed to map FrameBuffer!\n\r");
@@ -61,42 +60,187 @@ public:
         fillRect(0, 0, width_, height_, color);
     }
 
+    void drawChar(std::uint32_t x, std::uint32_t y, char c, Pixel fg) {
+        if (c < 32 || c > 126) return;
+        if (x + FONT_WIDTH > width_ || y + FONT_HEIGHT > height_) return;
+
+        for (int r = 0; r < FONT_HEIGHT; ++r) {
+            for (int col = 0; col < FONT_WIDTH; ++col) {
+                if (font_bitmap[c - 32][r][col]) {
+                    fb_[(y + r) * width_ + (x + col)] = fg;
+                }
+            }
+        }
+    }
+
+    void drawString(std::uint32_t x, std::uint32_t y, const char* str, Pixel fg) {
+        while (*str) {
+            drawChar(x, y, *str, fg);
+            x += FONT_WIDTH;
+            str++;
+        }
+    }
+
+    void scrollRegion(std::uint32_t x, std::uint32_t y, std::uint32_t w, std::uint32_t h, std::uint32_t lines, Pixel bg) {
+        if (lines >= h) {
+            fillRect(x, y, w, h, bg);
+            return;
+        }
+        for (std::uint32_t cy = y; cy < y + h - lines; ++cy) {
+            for (std::uint32_t cx = x; cx < x + w; ++cx) {
+                fb_[cy * width_ + cx] = fb_[(cy + lines) * width_ + cx];
+            }
+        }
+        fillRect(x, y + h - lines, w, lines, bg);
+    }
+
     std::uint32_t width() const { return width_; }
     std::uint32_t height() const { return height_; }
 };
 
 static DisplayDriver g_display;
 
-// Simple test GUI rendering
-void renderTestUI(DisplayDriver& disp) {
-    // 1. Dark Slate Blue Background
-    disp.clear(Pixel{0x36, 0x22, 0x1e, 0}); // #1e2236 (BGR: 0x36, 0x22, 0x1e)
+// GUI Terminal Console embedded inside a Window
+class TerminalConsole {
+private:
+    DisplayDriver* disp_{nullptr};
+    std::uint32_t win_x_{0};
+    std::uint32_t win_y_{0};
+    std::uint32_t win_w_{0};
+    std::uint32_t win_h_{0};
 
-    // 2. Draw a desktop panel / top bar (Dark Grey)
-    disp.fillRect(0, 0, disp.width(), 32, Pixel{0x2b, 0x24, 0x1f, 0});
+    std::uint32_t cx_{0};
+    std::uint32_t cy_{0};
+    std::uint32_t cw_{0};
+    std::uint32_t ch_{0};
 
-    // 3. Draw a sample Window in the center
-    std::uint32_t win_w = 400;
-    std::uint32_t win_h = 250;
-    std::uint32_t win_x = (disp.width() > win_w) ? (disp.width() - win_w) / 2 : 50;
-    std::uint32_t win_y = (disp.height() > win_h) ? (disp.height() - win_h) / 2 : 50;
+    std::uint32_t cursor_col_{0};
+    std::uint32_t cursor_row_{0};
+    std::uint32_t max_cols_{0};
+    std::uint32_t max_rows_{0};
 
-    // Window shadow
-    disp.fillRect(win_x + 4, win_y + 4, win_w, win_h, Pixel{0x10, 0x10, 0x10, 0});
-    // Window background (Light Slate)
-    disp.fillRect(win_x, win_y, win_w, win_h, Pixel{0x4a, 0x3b, 0x2e, 0});
-    // Window title bar (Accent Blue)
-    disp.fillRect(win_x, win_y, win_w, 28, Pixel{0x9e, 0x5a, 0x24, 0});
+    Pixel fg_color_{0xe0, 0xe0, 0xe0, 0}; // Light Grey / White
+    Pixel bg_color_{0x1e, 0x16, 0x12, 0}; // Dark Slate
 
-    // Window close button (Red dot)
-    disp.fillRect(win_x + 10, win_y + 8, 12, 12, Pixel{0x40, 0x40, 0xe0, 0});
-    // Window minimize button (Yellow dot)
-    disp.fillRect(win_x + 28, win_y + 8, 12, 12, Pixel{0x30, 0xc0, 0xe0, 0});
-    // Window maximize button (Green dot)
-    disp.fillRect(win_x + 46, win_y + 8, 12, 12, Pixel{0x40, 0xd0, 0x40, 0});
+public:
+    void init(DisplayDriver* disp, std::uint32_t wx, std::uint32_t wy, std::uint32_t ww, std::uint32_t wh) {
+        disp_ = disp;
+        win_x_ = wx;
+        win_y_ = wy;
+        win_w_ = ww;
+        win_h_ = wh;
 
-    // Content area inside window
-    disp.fillRect(win_x + 15, win_y + 45, win_w - 30, win_h - 60, Pixel{0x20, 0x18, 0x12, 0});
+        // Content area inside window frame
+        cx_ = win_x_ + 10;
+        cy_ = win_y_ + 38;
+        cw_ = win_w_ - 20;
+        ch_ = win_h_ - 48;
+
+        max_cols_ = cw_ / FONT_WIDTH;
+        max_rows_ = ch_ / FONT_HEIGHT;
+        cursor_col_ = 0;
+        cursor_row_ = 0;
+
+        renderWindowFrame();
+    }
+
+    void renderWindowFrame() {
+        if (!disp_) return;
+
+        // Window shadow
+        disp_->fillRect(win_x_ + 4, win_y_ + 4, win_w_, win_h_, Pixel{0x10, 0x10, 0x10, 0});
+        // Window background
+        disp_->fillRect(win_x_, win_y_, win_w_, win_h_, Pixel{0x35, 0x2b, 0x22, 0});
+        // Window title bar (Deep Slate Blue)
+        disp_->fillRect(win_x_, win_y_, win_w_, 30, Pixel{0x7a, 0x48, 0x22, 0});
+
+        // Window control buttons
+        disp_->fillRect(win_x_ + 10, win_y_ + 9, 12, 12, Pixel{0x40, 0x40, 0xe0, 0}); // Close (Red)
+        disp_->fillRect(win_x_ + 28, win_y_ + 9, 12, 12, Pixel{0x30, 0xc0, 0xe0, 0}); // Minimize (Yellow)
+        disp_->fillRect(win_x_ + 46, win_y_ + 9, 12, 12, Pixel{0x40, 0xd0, 0x40, 0}); // Maximize (Green)
+
+        // Title text
+        disp_->drawString(win_x_ + 70, win_y_ + 7, "OZ OS Terminal", Pixel{0xff, 0xff, 0xff, 0});
+
+        // Content area
+        disp_->fillRect(cx_, cy_, cw_, ch_, bg_color_);
+    }
+
+    void clear() {
+        if (!disp_) return;
+        disp_->fillRect(cx_, cy_, cw_, ch_, bg_color_);
+        cursor_col_ = 0;
+        cursor_row_ = 0;
+    }
+
+    void newLine() {
+        cursor_col_ = 0;
+        cursor_row_++;
+        if (cursor_row_ >= max_rows_) {
+            disp_->scrollRegion(cx_, cy_, cw_, ch_, FONT_HEIGHT, bg_color_);
+            cursor_row_ = max_rows_ - 1;
+        }
+    }
+
+    void putChar(char c) {
+        if (!disp_) return;
+
+        if (c == '\n') {
+            newLine();
+            return;
+        }
+        if (c == '\r') {
+            cursor_col_ = 0;
+            return;
+        }
+        if (c == '\b' || c == 0x7F) {
+            if (cursor_col_ > 0) {
+                cursor_col_--;
+                disp_->fillRect(cx_ + cursor_col_ * FONT_WIDTH, cy_ + cursor_row_ * FONT_HEIGHT, FONT_WIDTH, FONT_HEIGHT, bg_color_);
+            }
+            return;
+        }
+        if (c < 32 || c > 126) return;
+
+        if (cursor_col_ >= max_cols_) {
+            newLine();
+        }
+
+        // Clear cell before drawing char
+        disp_->fillRect(cx_ + cursor_col_ * FONT_WIDTH, cy_ + cursor_row_ * FONT_HEIGHT, FONT_WIDTH, FONT_HEIGHT, bg_color_);
+        disp_->drawChar(cx_ + cursor_col_ * FONT_WIDTH, cy_ + cursor_row_ * FONT_HEIGHT, c, fg_color_);
+        cursor_col_++;
+    }
+
+    void write(const char* str) {
+        // Simple ANSI escape sequence handling for clear screen
+        while (*str) {
+            if (str[0] == '\033' && str[1] == '[' && str[2] == '2' && str[3] == 'J') {
+                clear();
+                str += 4;
+                continue;
+            }
+            if (str[0] == '\033' && str[1] == '[' && str[2] == 'H') {
+                cursor_col_ = 0;
+                cursor_row_ = 0;
+                str += 3;
+                continue;
+            }
+            putChar(*str);
+            str++;
+        }
+    }
+};
+
+static TerminalConsole g_terminal;
+
+void renderDesktop(DisplayDriver& disp) {
+    // 1. Dark Slate Blue Desktop Background
+    disp.clear(Pixel{0x36, 0x22, 0x1e, 0});
+
+    // 2. Top Bar
+    disp.fillRect(0, 0, disp.width(), 28, Pixel{0x2b, 0x24, 0x1f, 0});
+    disp.drawString(12, 6, "OZ Operating System (Capability-Based Microkernel)", Pixel{0xd0, 0xd0, 0xd0, 0});
 }
 
 } // namespace
@@ -106,27 +250,72 @@ extern "C" void _start() {
 
     // Wait for configuration IPC message from init process on Channel 2
     oz::IPCMessage config_msg{};
-    if (oz::sys_channel_recv(CAP_DISPLAY_RECV, &config_msg)) {
-        std::uint32_t width = static_cast<std::uint32_t>(config_msg.data[0]);
-        std::uint32_t height = static_cast<std::uint32_t>(config_msg.data[1]);
-        std::size_t size = static_cast<std::size_t>(config_msg.data[2]);
-
-        oz::sys_debug_print("[Display] Received config from init.\n\r");
-
-        if (g_display.init(width, height, size)) {
-            oz::sys_debug_print("[Display] Rendering initial GUI scene...\n\r");
-            renderTestUI(g_display);
-            oz::sys_debug_print("[Display] Initial GUI scene rendered!\n\r");
-        }
-    } else {
+    if (!oz::sys_channel_recv(CAP_DISPLAY_RECV, &config_msg)) {
         oz::sys_debug_print("[Display] Failed to receive config message!\n\r");
+        oz::sys_exit(1);
     }
 
-    // Main event loop for IPC requests
-    oz::IPCMessage msg{};
+    std::uint32_t width = static_cast<std::uint32_t>(config_msg.data[0]);
+    std::uint32_t height = static_cast<std::uint32_t>(config_msg.data[1]);
+    std::size_t size = static_cast<std::size_t>(config_msg.data[2]);
+
+    oz::sys_debug_print("[Display] Received config from init.\n\r");
+
+    if (!g_display.init(width, height, size)) {
+        oz::sys_exit(1);
+    }
+
+    // ========================================================================
+    // Notification-driven event loop (seL4 Bound Notification pattern)
+    // ========================================================================
+    std::uint32_t notif_cap = oz::sys_notification_create(oz::CAP_UNTYPED);
+    if (notif_cap == oz::INVALID_CAP_ID) {
+        oz::sys_debug_print("[Display] ERROR: Failed to create Notification!\n\r");
+        oz::sys_exit(1);
+    }
+
+    // Bind CAP_DISPLAY_RECV to notif_cap with badge 1 (Client 0 / Console)
+    static constexpr std::uint64_t BADGE_CONSOLE = 1ULL << 0;
+    if (oz::sys_channel_bind_notification(CAP_DISPLAY_RECV, notif_cap, BADGE_CONSOLE) != 0) {
+        oz::sys_debug_print("[Display] ERROR: Failed to bind Channel to Notification!\n\r");
+        oz::sys_exit(1);
+    }
+
+    // Render desktop background
+    renderDesktop(g_display);
+
+    // Setup interactive terminal window in center of screen
+    std::uint32_t win_w = 640;
+    std::uint32_t win_h = 380;
+    if (win_w + 40 > g_display.width()) win_w = g_display.width() - 40;
+    if (win_h + 60 > g_display.height()) win_h = g_display.height() - 60;
+
+    std::uint32_t win_x = (g_display.width() > win_w) ? (g_display.width() - win_w) / 2 : 20;
+    std::uint32_t win_y = (g_display.height() > win_h) ? (g_display.height() - win_h) / 2 : 40;
+
+    g_terminal.init(&g_display, win_x, win_y, win_w, win_h);
+    oz::sys_debug_print("[Display] Initial GUI and Terminal window rendered!\n\r");
+    oz::sys_debug_print("[Display] Notification event loop ready.\n\r");
+
     while (true) {
-        if (oz::sys_channel_recv(CAP_DISPLAY_RECV, &msg)) {
-            // Future: Handle window creation, draw commands, input events
+        std::uint64_t badge = 0;
+        if (oz::sys_notification_wait(notif_cap, &badge) != 0) {
+            continue;
+        }
+
+        // Handle Console / Shell input text
+        if (badge & BADGE_CONSOLE) {
+            oz::IPCMessage msg{};
+            if (oz::sys_channel_recv(CAP_DISPLAY_RECV, &msg)) {
+                alignas(8) char buf[33];
+                for (int i = 0; i < 4; ++i) {
+                    *reinterpret_cast<std::uint64_t*>(&buf[i * 8]) = msg.data[i];
+                }
+                buf[32] = '\0';
+                g_terminal.write(buf);
+            } else {
+                oz::sys_debug_print("[Display] Client on Channel 2 disconnected.\n\r");
+            }
         }
     }
 }

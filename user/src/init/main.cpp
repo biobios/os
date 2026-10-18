@@ -370,6 +370,10 @@ extern "C" void _start() {
             config_msg.data[3] = boot_info->fb_phys_addr;
             oz::sys_channel_send(init_disp_send, &config_msg);
             oz::sys_write("[Init] Sent framebuffer config to Display server.\n\r");
+
+            // Forward Display Server input channel to Console Server (Slot 2)
+            oz::sys_cspace_cap_insert(cons_proc.cspace_cap, 2, init_disp_send, static_cast<std::uint32_t>(oz::CapRights::WRITE | oz::CapRights::GRANT));
+            oz::sys_write("[Init] Connected Console server to Display server.\n\r");
         } else {
             oz::sys_write("[Init] ERROR: Failed to spawn display server!\n\r");
         }

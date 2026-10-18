@@ -42,6 +42,11 @@ void ChannelEndpoint::bind_notification(Notification* notif, std::uint64_t badge
         notif->add_ref();
         bound_notification_ = notif;
         bound_badge_ = badge;
+
+        // If peer is already closed or has senders waiting, signal immediately!
+        if (is_peer_closed() || (peer && peer->has_send_waiters())) {
+            bound_notification_->signal(bound_badge_);
+        }
     }
 }
 
