@@ -45,6 +45,7 @@ enum class ObjectType : std::uint8_t {
     IRQHandler,
     IOPort,
     PageTable,
+    Notification,
 };
 
 struct Capability;

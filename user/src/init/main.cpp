@@ -299,6 +299,47 @@ extern "C" void _start() {
         oz::sys_debug_print("[Test] C++ LinearCap RAII destructor cleanup: FAILED (slot 51 still valid)\n\r");
     }
 
+    // 5. Test Notification Object & Bound Notification
+    std::uint32_t notif_cap = oz::sys_notification_create(oz::CAP_UNTYPED);
+    if (notif_cap != oz::INVALID_CAP_ID) {
+        oz::sys_debug_print("[Test] Notification creation: PASSED\n\r");
+
+        // Test manual signal and poll
+        oz::sys_notification_signal(notif_cap, 0x42);
+        std::uint64_t polled_bits = 0;
+        if (oz::sys_notification_poll(notif_cap, &polled_bits) == 0 && polled_bits == 0x42) {
+            oz::sys_debug_print("[Test] Notification signal & poll: PASSED\n\r");
+        } else {
+            oz::sys_debug_print("[Test] Notification signal & poll: FAILED\n\r");
+        }
+
+        // Test Bound Notification with Channel
+        std::uint32_t b_ep0 = 0, b_ep1 = 0;
+        if (oz::sys_channel_create(oz::CAP_UNTYPED, &b_ep0, &b_ep1)) {
+            // Bind b_ep1 (server side) to notif_cap with badge 0x100
+            if (oz::sys_channel_bind_notification(b_ep1, notif_cap, 0x100) == 0) {
+                // Client side (b_ep0) sends a message -> should signal notif_cap with 0x100
+                // Note: since receiver is not waiting, send will block unless we test peer close or thread
+                // Let's test peer close: delete client cap b_ep0
+                oz::sys_cap_delete(b_ep0);
+
+                // Now peer was closed! b_ep1 should have signaled notif_cap with 0x100!
+                std::uint64_t close_bits = 0;
+                if (oz::sys_notification_poll(notif_cap, &close_bits) == 0 && (close_bits & 0x100)) {
+                    oz::sys_debug_print("[Test] Bound Notification on client disconnect: PASSED\n\r");
+                } else {
+                    oz::sys_debug_print("[Test] Bound Notification on client disconnect: FAILED\n\r");
+                }
+            } else {
+                oz::sys_debug_print("[Test] Bound Notification binding: FAILED\n\r");
+            }
+            oz::sys_cap_delete(b_ep1);
+        }
+        oz::sys_cap_delete(notif_cap);
+    } else {
+        oz::sys_debug_print("[Test] Notification creation: FAILED\n\r");
+    }
+
 
     // 3.5 Spawn Display Server (GUI mode)
     oz::loader::TarFile disp_file = oz::loader::tar_find_file(initrd_ptr, initrd_size, "display");

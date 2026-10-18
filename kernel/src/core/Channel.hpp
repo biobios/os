@@ -20,6 +20,7 @@ struct InternalIPCMessage {
 
 // Forward declaration
 class Thread;
+class Notification;
 
 class ChannelEndpoint : public KernelObject {
 private:
@@ -40,6 +41,10 @@ private:
     // For asynchronous interrupt notifications (IRQs)
     bool has_pending_notification{false};
     std::uint64_t pending_notification_data{0};
+
+    // Bound notification for event multiplexing
+    Notification* bound_notification_{nullptr};
+    std::uint64_t bound_badge_{0};
 
 public:
     explicit ChannelEndpoint(bool untyped = false) : KernelObject(ObjectType::ChannelEndpoint, untyped) {}
@@ -105,6 +110,11 @@ public:
     bool has_notification() const {
         return has_pending_notification;
     }
+
+    void bind_notification(Notification* notif, std::uint64_t badge);
+    void unbind_notification();
+    Notification* get_bound_notification() const { return bound_notification_; }
+    std::uint64_t get_bound_badge() const { return bound_badge_; }
 };
 
 } // namespace oz

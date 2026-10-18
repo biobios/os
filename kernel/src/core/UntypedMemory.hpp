@@ -5,6 +5,7 @@
 #include "core/TCB.hpp"
 #include "core/CSpaceCap.hpp"
 #include "core/Channel.hpp"
+#include "core/Notification.hpp"
 #include "core/PageTableObject.hpp"
 #include "core/IRQHandler.hpp"
 #include "memory/Address.hpp"
@@ -75,6 +76,12 @@ public:
         } else if (node->objectType() == ObjectType::IRQHandler) {
             auto* irq = static_cast<IRQHandler*>(node);
             irq->unregisterHandler();
+        } else if (node->objectType() == ObjectType::Notification) {
+            auto* notif = static_cast<Notification*>(node);
+            while (Thread* t = notif->pop_waiter()) {
+                t->state = ThreadState::Ready;
+                if (g_unblock_thread_func) g_unblock_thread_func(t);
+            }
         }
 
         // Force invalidate all Capabilities referencing this object
@@ -233,6 +240,17 @@ public:
         *out0 = ep0;
         *out1 = ep1;
         return true;
+    }
+
+    // Retype into a Notification object
+    Notification* retypeNotification() {
+        std::uintptr_t notif_phys = 0;
+        void* notif_mem = allocateBytes(sizeof(Notification), alignof(Notification), notif_phys);
+        if (!notif_mem) return nullptr;
+
+        auto* notif = new (notif_mem) Notification(true);
+        this->addChild(notif);
+        return notif;
     }
 };
 

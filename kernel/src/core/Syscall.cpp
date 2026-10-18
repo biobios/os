@@ -12,6 +12,7 @@
 #include "core/IRQHandler.hpp"
 #include "core/IRQDispatch.hpp"
 #include "core/IOPort.hpp"
+#include "core/Notification.hpp"
 
 #include "core/Kernel.hpp"
 
@@ -149,6 +150,10 @@ static int do_channel_send(CSpace* cspace, CapID ep_id, const IPCMessage* msg) {
     current->send_msg = internal;
     current->state = ThreadState::BlockedOnSend;
     ep->add_send_waiter(current);
+
+    if (peer->get_bound_notification()) {
+        peer->get_bound_notification()->signal(peer->get_bound_badge());
+    }
 
     g_block_thread_func();
 
@@ -797,6 +802,84 @@ extern "C" std::uint64_t handleSyscall(std::uint64_t rdi, std::uint64_t rsi, std
         CapID* out1 = reinterpret_cast<CapID*>(r8);
         if (sys_channel_create_ext(cspace, static_cast<CapID>(rdi), r0, r1, out0, out1)) return 0;
         return -1;
+    } else if (syscall_number == 34) {
+        // notification_create(untyped_cap)
+        CSpace* cspace = get_cspace();
+        if (!cspace) return -1;
+        UntypedMemory* untyped = get_cap_typed<UntypedMemory>(
+            cspace, static_cast<CapID>(rdi), ObjectType::UntypedMemory, CapRights::WRITE);
+        if (!untyped) return -1;
+        Notification* notif = untyped->retypeNotification();
+        if (!notif) return -1;
+        Capability notif_cap(notif, CapRights::ALL);
+        CapID new_id = cspace->add(notif_cap);
+        notif->release();
+        if (new_id == INVALID_CAP_ID) return static_cast<std::uint64_t>(-1);
+        return static_cast<std::uint64_t>(new_id);
+    } else if (syscall_number == 35) {
+        // notification_signal(notif_cap, badge)
+        CSpace* cspace = get_cspace();
+        if (!cspace) return -1;
+        Notification* notif = get_cap_typed<Notification>(
+            cspace, static_cast<CapID>(rdi), ObjectType::Notification, CapRights::WRITE);
+        if (!notif) return -1;
+        notif->signal(rsi);
+        return 0;
+    } else if (syscall_number == 36) {
+        // notification_wait(notif_cap, out_badge_ptr)
+        CSpace* cspace = get_cspace();
+        if (!cspace) return -1;
+        if (!is_user_buffer(rsi, sizeof(std::uint64_t))) return -1;
+        Notification* notif = get_cap_typed<Notification>(
+            cspace, static_cast<CapID>(rdi), ObjectType::Notification, CapRights::READ);
+        if (!notif) return -1;
+
+        if (notif->has_signals()) {
+            *reinterpret_cast<std::uint64_t*>(rsi) = notif->get_and_clear_value();
+            return 0;
+        }
+
+        if (!g_get_current_thread_func || !g_block_thread_func) return -1;
+        Thread* current = g_get_current_thread_func();
+        if (!current) return -1;
+
+        current->state = ThreadState::Blocked;
+        notif->add_waiter(current);
+
+        g_block_thread_func();
+
+        // Woken up by signal
+        *reinterpret_cast<std::uint64_t*>(rsi) = notif->get_and_clear_value();
+        return 0;
+    } else if (syscall_number == 37) {
+        // channel_bind_notification(ep_cap, notif_cap, badge)
+        CSpace* cspace = get_cspace();
+        if (!cspace) return -1;
+        ChannelEndpoint* ep = get_cap_typed<ChannelEndpoint>(
+            cspace, static_cast<CapID>(rdi), ObjectType::ChannelEndpoint, CapRights::READ);
+        if (!ep) return -1;
+
+        if (rsi == INVALID_CAP_ID) {
+            ep->unbind_notification();
+            return 0;
+        }
+
+        Notification* notif = get_cap_typed<Notification>(
+            cspace, static_cast<CapID>(rsi), ObjectType::Notification, CapRights::WRITE);
+        if (!notif) return -1;
+        ep->bind_notification(notif, rdx);
+        return 0;
+    } else if (syscall_number == 38) {
+        // notification_poll(notif_cap, out_badge_ptr)
+        CSpace* cspace = get_cspace();
+        if (!cspace) return -1;
+        if (!is_user_buffer(rsi, sizeof(std::uint64_t))) return -1;
+        Notification* notif = get_cap_typed<Notification>(
+            cspace, static_cast<CapID>(rdi), ObjectType::Notification, CapRights::READ);
+        if (!notif) return -1;
+        std::uint64_t val = notif->poll();
+        *reinterpret_cast<std::uint64_t*>(rsi) = val;
+        return (val != 0) ? 0 : 1;
     }
     
     return static_cast<std::uint64_t>(-1);

@@ -38,6 +38,7 @@ enum class ObjectType : std::uint32_t {
     IRQHandler = 7,
     IOPort = 8,
     PageTable = 9,
+    Notification = 10,
 };
 
 extern "C" {
@@ -104,6 +105,13 @@ int sys_irq_ack(std::uint32_t irq_handler_cap);
 std::uint32_t sys_ioport_create(std::uint32_t parent_ioport_cap, std::uint32_t untyped_cap, std::uint16_t base_port, std::uint32_t port_count);
 std::uint64_t sys_ioport_read(std::uint32_t ioport_cap, std::uint16_t port, std::uint32_t width);
 int sys_ioport_write(std::uint32_t ioport_cap, std::uint16_t port, std::uint64_t value, std::uint32_t width);
+
+// Notification management
+std::uint32_t sys_notification_create(std::uint32_t untyped_cap);
+int sys_notification_signal(std::uint32_t notif_cap, std::uint64_t badge);
+int sys_notification_wait(std::uint32_t notif_cap, std::uint64_t* out_badge);
+int sys_channel_bind_notification(std::uint32_t ep_cap, std::uint32_t notif_cap, std::uint64_t badge);
+int sys_notification_poll(std::uint32_t notif_cap, std::uint64_t* out_badge);
 
 }
 

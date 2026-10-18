@@ -1,11 +1,13 @@
 #include "core/Channel.hpp"
 #include "core/Thread.hpp"
+#include "core/Notification.hpp"
 
 namespace oz {
 
 extern void (*g_unblock_thread_func)(Thread*);
 
 ChannelEndpoint::~ChannelEndpoint() {
+    unbind_notification();
     if (peer) {
         peer->on_peer_closed();
     }
@@ -21,6 +23,9 @@ ChannelEndpoint::~ChannelEndpoint() {
 
 void ChannelEndpoint::on_peer_closed() {
     peer = nullptr;
+    if (bound_notification_) {
+        bound_notification_->signal(bound_badge_);
+    }
     while (Thread* t = pop_recv_waiter()) {
         t->state = ThreadState::Ready;
         if (g_unblock_thread_func) g_unblock_thread_func(t);
@@ -28,6 +33,23 @@ void ChannelEndpoint::on_peer_closed() {
     while (Thread* t = pop_send_waiter()) {
         t->state = ThreadState::Ready;
         if (g_unblock_thread_func) g_unblock_thread_func(t);
+    }
+}
+
+void ChannelEndpoint::bind_notification(Notification* notif, std::uint64_t badge) {
+    unbind_notification();
+    if (notif) {
+        notif->add_ref();
+        bound_notification_ = notif;
+        bound_badge_ = badge;
+    }
+}
+
+void ChannelEndpoint::unbind_notification() {
+    if (bound_notification_) {
+        bound_notification_->release();
+        bound_notification_ = nullptr;
+        bound_badge_ = 0;
     }
 }
 

@@ -218,6 +218,26 @@ int sys_cap_copy(std::uint32_t dest_slot, std::uint32_t src_slot, std::uint32_t 
     return static_cast<int>(syscall(32, dest_slot, src_slot, rights, 0, 0, 0));
 }
 
+std::uint32_t sys_notification_create(std::uint32_t untyped_cap) {
+    return static_cast<std::uint32_t>(syscall(34, untyped_cap, 0, 0, 0, 0, 0));
+}
+
+int sys_notification_signal(std::uint32_t notif_cap, std::uint64_t badge) {
+    return static_cast<int>(syscall(35, notif_cap, badge, 0, 0, 0, 0));
+}
+
+int sys_notification_wait(std::uint32_t notif_cap, std::uint64_t* out_badge) {
+    return static_cast<int>(syscall(36, notif_cap, reinterpret_cast<std::uint64_t>(out_badge), 0, 0, 0, 0));
+}
+
+int sys_channel_bind_notification(std::uint32_t ep_cap, std::uint32_t notif_cap, std::uint64_t badge) {
+    return static_cast<int>(syscall(37, ep_cap, notif_cap, badge, 0, 0, 0));
+}
+
+int sys_notification_poll(std::uint32_t notif_cap, std::uint64_t* out_badge) {
+    return static_cast<int>(syscall(38, notif_cap, reinterpret_cast<std::uint64_t>(out_badge), 0, 0, 0, 0));
+}
+
 } // extern "C"
 
 } // namespace oz
