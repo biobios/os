@@ -322,6 +322,13 @@ void handle_key_input(char ascii, std::uint8_t scancode, std::uint32_t modifiers
             std::uint32_t focused_id = g_wm.focused_window_id();
             if (focused_id != 0) {
                 oz::sys_debug_print("[WM] Hotkey: Close focused window\n\r");
+                auto* win = g_wm.get_window(focused_id);
+                if (win && win->surface_id != 0) {
+                    oz::IPCMessage ds_msg{};
+                    ds_msg.data[0] = static_cast<std::uint64_t>(oz::ipc::DisplayCmd::DESTROY_SURFACE);
+                    ds_msg.data[1] = win->surface_id;
+                    oz::sys_channel_send(CAP_DISPLAY_SEND, &ds_msg);
+                }
                 g_wm.destroy_window(focused_id);
                 sync_state_to_display();
             }
@@ -438,6 +445,7 @@ extern "C" void _start() {
             pos_bar.data[0] = static_cast<std::uint64_t>(oz::ipc::DisplayCmd::SET_SURFACE_RECT);
             pos_bar.data[1] = g_bar_surf_id;
             pos_bar.data[2] = 0; // (x=0, y=0)
+            pos_bar.data[3] = (static_cast<std::uint64_t>(g_screen_width) << 32) | oz::wm::STATUS_BAR_HEIGHT;
             oz::sys_channel_send(CAP_DISPLAY_SEND, &pos_bar);
 
             oz::IPCMessage vis_bar{};

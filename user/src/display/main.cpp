@@ -63,17 +63,24 @@ public:
         fillRect(0, 0, width_, height_, color);
     }
 
-    void blit(std::int32_t dst_x, std::int32_t dst_y, const Pixel* src, std::uint32_t src_w, std::uint32_t src_h) {
+    void blit(std::int32_t dst_x, std::int32_t dst_y, const Pixel* src, std::uint32_t src_w, std::uint32_t src_h,
+              std::uint32_t max_w = 0, std::uint32_t max_h = 0) {
         if (!fb_ || !src) return;
 
         std::int32_t start_x = (dst_x < 0) ? -dst_x : 0;
         std::int32_t start_y = (dst_y < 0) ? -dst_y : 0;
 
         std::int32_t end_x = static_cast<std::int32_t>(src_w);
+        if (max_w > 0 && end_x > static_cast<std::int32_t>(max_w)) {
+            end_x = static_cast<std::int32_t>(max_w);
+        }
         if (dst_x + end_x > static_cast<std::int32_t>(width_)) {
             end_x = static_cast<std::int32_t>(width_) - dst_x;
         }
         std::int32_t end_y = static_cast<std::int32_t>(src_h);
+        if (max_h > 0 && end_y > static_cast<std::int32_t>(max_h)) {
+            end_y = static_cast<std::int32_t>(max_h);
+        }
         if (dst_y + end_y > static_cast<std::int32_t>(height_)) {
             end_y = static_cast<std::int32_t>(height_) - dst_y;
         }
@@ -315,6 +322,8 @@ struct Surface {
     std::uint32_t id{0};
     std::uint32_t width{0};
     std::uint32_t height{0};
+    std::uint32_t rect_w{0};
+    std::uint32_t rect_h{0};
     std::int32_t x{0};
     std::int32_t y{0};
     bool visible{false};
@@ -341,23 +350,26 @@ bool has_active_surfaces() {
 }
 
 void compose(DisplayDriver& disp) {
-    oz::sys_debug_print("[Display] compose: start\n\r");
     // 1. Render desktop background
     renderDesktop(disp);
-    oz::sys_debug_print("[Display] compose: desktop rendered\n\r");
 
     // 2. Render surfaces
     bool has_surfaces = false;
     for (std::size_t i = 0; i < MAX_SURFACES; ++i) {
         if (g_surfaces[i].id != 0 && g_surfaces[i].visible && g_surfaces[i].buffer) {
             has_surfaces = true;
+            std::uint32_t draw_w = (g_surfaces[i].rect_w > 0) ? g_surfaces[i].rect_w : g_surfaces[i].width;
+            std::uint32_t draw_h = (g_surfaces[i].rect_h > 0) ? g_surfaces[i].rect_h : g_surfaces[i].height;
+
             if (g_surfaces[i].border_width > 0) {
                 std::int32_t bw = static_cast<std::int32_t>(g_surfaces[i].border_width);
                 disp.fillRect(g_surfaces[i].x - bw, g_surfaces[i].y - bw,
-                              g_surfaces[i].width + 2 * bw, g_surfaces[i].height + 2 * bw,
+                              draw_w + 2 * bw, draw_h + 2 * bw,
                               g_surfaces[i].border_color);
+                // Fill window interior background (dark slate)
+                disp.fillRect(g_surfaces[i].x, g_surfaces[i].y, draw_w, draw_h, Pixel{0x10, 0x10, 0x10, 0});
             }
-            disp.blit(g_surfaces[i].x, g_surfaces[i].y, g_surfaces[i].buffer, g_surfaces[i].width, g_surfaces[i].height);
+            disp.blit(g_surfaces[i].x, g_surfaces[i].y, g_surfaces[i].buffer, g_surfaces[i].width, g_surfaces[i].height, draw_w, draw_h);
         }
     }
     oz::sys_debug_print("[Display] compose: surfaces blitted\n\r");
@@ -486,6 +498,8 @@ extern "C" void _start() {
                                     g_surfaces[slot].id = slot + 1;
                                     g_surfaces[slot].width = w;
                                     g_surfaces[slot].height = h;
+                                    g_surfaces[slot].rect_w = w;
+                                    g_surfaces[slot].rect_h = h;
                                     g_surfaces[slot].buffer = reinterpret_cast<Pixel*>(virt);
                                     g_surfaces[slot].frame_cap = frame_cap;
                                     g_surfaces[slot].visible = true;
@@ -525,6 +539,9 @@ extern "C" void _start() {
                             g_surfaces[idx].id = 0;
                             g_surfaces[idx].visible = false;
                             g_surfaces[idx].buffer = nullptr;
+                            g_surfaces[idx].rect_w = 0;
+                            g_surfaces[idx].rect_h = 0;
+                            g_surfaces[idx].border_width = 0;
                             compose(g_display);
                             resp.data[0] = 0;
                         } else {
@@ -538,6 +555,12 @@ extern "C" void _start() {
                             std::size_t idx = id - 1;
                             g_surfaces[idx].x = static_cast<std::int32_t>(req.data[2] >> 32);
                             g_surfaces[idx].y = static_cast<std::int32_t>(req.data[2] & 0xFFFFFFFFULL);
+                            std::uint32_t rw = static_cast<std::uint32_t>(req.data[3] >> 32);
+                            std::uint32_t rh = static_cast<std::uint32_t>(req.data[3] & 0xFFFFFFFFULL);
+                            if (rw > 0 && rh > 0) {
+                                g_surfaces[idx].rect_w = rw;
+                                g_surfaces[idx].rect_h = rh;
+                            }
                             resp.data[0] = 0;
                         } else {
                             resp.data[0] = 1;
