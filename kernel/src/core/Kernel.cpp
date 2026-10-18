@@ -114,6 +114,9 @@ Kernel::BootDevices Kernel::probeBootDevices() {
         dprint("[Kernel] AHCI ABAR phys: ");
         dprint(hex_buf);
         dprint("\n\r");
+
+        // Enable PCI bus master and memory space access
+        ahci_func.header->Command |= 0b110;
     }
     
     // 2. Probe xHCI Controller

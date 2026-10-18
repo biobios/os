@@ -6,6 +6,26 @@
 namespace oz {
 namespace AHCI {
 
+// Helper for allocating and mapping DMA memory
+struct DmaBuffer {
+    void* virt;
+    std::uint64_t phys;
+};
+
+static DmaBuffer allocDmaPages(std::size_t num_pages) {
+    static std::uint64_t bump_virt = 0x300000000000;
+    std::uint32_t cap = sys_frame_alloc(CAP_UNTYPED, num_pages);
+    if (!cap) return {nullptr, 0};
+    if (sys_vspace_map_with_pagetables(CAP_SELF_VSPACE, CAP_UNTYPED, cap, bump_virt, 0x01, num_pages * 4096) != 0) {
+        return {nullptr, 0};
+    }
+    std::uint64_t phys = sys_frame_phys_addr(cap);
+    void* virt = reinterpret_cast<void*>(bump_virt);
+    oz::utils::memset(virt, 0, num_pages * 4096);
+    bump_virt += num_pages * 4096;
+    return {virt, phys};
+}
+
 // --- Controller ---
 
 Controller::Controller(std::uint64_t abar_phys)
@@ -20,10 +40,18 @@ bool Controller::initialize() {
     // abar_phys_ now holds the virtual address from main.cpp
     abar = reinterpret_cast<HBA_MEM volatile*>(abar_phys_);
 
-    // Enable AHCI mode and reset
+    // Enable AHCI mode
     abar->ghc |= 0x80000000; // AE (AHCI Enable)
     
-    // Optional: Reset HBA (abar->ghc |= 1, wait for it to clear)
+    // Reset HBA (GHC.HR = 1, wait for it to clear)
+    abar->ghc |= 0x00000001; // HR
+    for (int t = 0; t < 1000000; t++) {
+        if (!(abar->ghc & 0x00000001)) break;
+        __asm__ volatile("pause");
+    }
+    
+    // Re-enable AHCI mode after reset
+    abar->ghc |= 0x80000000; // AE (AHCI Enable)
     
     implemented_ports = abar->pi;
 
@@ -44,16 +72,6 @@ bool Controller::initialize() {
             dbg[22 + h] = hx[(abar_addr >> (60 - h * 4)) & 0xF];
         }
         sys_write(dbg);
-        // char dbg[64] = "[AHCI] Port X: det=X ipm=X sig=XXXXXXXX\n\r";
-        // dbg[12] = '0' + static_cast<char>(i);
-        // dbg[19] = '0' + det;
-        // dbg[25] = '0' + ipm;
-        // const char hx[] = "0123456789ABCDEF";
-        // std::uint32_t sig = port->sig;
-        // for (int h = 0; h < 8; h++) {
-        //     dbg[31 + h] = hx[(sig >> (28 - h * 4)) & 0xF];
-        // }
-        // sys_write(dbg);
     }
 
     probePorts();
@@ -66,23 +84,46 @@ void Controller::probePorts() {
             HBA_PORT volatile* port = &abar->ports[i];
             
             // Stop command engine
-            port->cmd &= ~(0x0001 | 0x0010); // Clear ST and FRE
+            port->cmd &= ~(HBA_PxCMD_ST | HBA_PxCMD_FRE); // Clear ST and FRE
             // Wait for CR and FR to clear
             for (int t = 0; t < 1000000; t++) {
-                if (!(port->cmd & (0x8000 | 0x4000))) break; // CR and FR
+                if (!(port->cmd & (HBA_PxCMD_CR | HBA_PxCMD_FR))) break; // CR and FR
                 __asm__ volatile("pause");
             }
 
-            // TODO: 物理メモリ割り当て
+            // SUD (Spin-Up Device) と POD (Power On Device) に対応しているか確認し有効化
+            if (abar->cap & (1 << 27)) { // CAP.SSS (Staggered Spin-up Supported)
+                port->cmd |= HBA_PxCMD_SUD;
+            }
+            if (abar->cap & (1 << 17)) { // CAP.CPD (Cold Presence Detect Supported)
+                port->cmd |= HBA_PxCMD_POD;
+            }
 
-            // FIS受信の有効化
-            port->cmd |= 0x0010; // FRE
+            // 物理メモリ割り当て (Command List: 1 page, Received FIS: 1 page)
+            DmaBuffer cl_buf = allocDmaPages(1);
+            DmaBuffer fb_buf = allocDmaPages(1);
+            if (!cl_buf.virt || !fb_buf.virt) {
+                char dbg[64] = "[AHCI] Port X: failed to allocate DMA memory!\n\r";
+                dbg[12] = '0' + static_cast<char>(i);
+                sys_write(dbg);
+                continue;
+            }
 
-            // TODO: SUDとPODに対応しているか確認し有効化する
+            port->clb = static_cast<std::uint32_t>(cl_buf.phys);
+            port->clbu = static_cast<std::uint32_t>(cl_buf.phys >> 32);
+            port->fb = static_cast<std::uint32_t>(fb_buf.phys);
+            port->fbu = static_cast<std::uint32_t>(fb_buf.phys >> 32);
+
+            // SERR と割り込みステータスをクリア
+            port->serr = 0xFFFFFFFF;
+            port->is = 0xFFFFFFFF;
+
+            // FIS受信の有効化 (PxFB/PxFBU 設定後に有効化)
+            port->cmd |= HBA_PxCMD_FRE;
             
             // Issue COMRESET via SControl
             port->sctl = (port->sctl & ~0x0F) | 0x01; // DET = 1 (COMRESET)
-            for (int t = 0; t < 100000; t++) { __asm__ volatile("pause"); } // Small delay
+            for (int t = 0; t < 100000; t++) { __asm__ volatile("pause"); } // Small delay (at least 1ms)
             port->sctl &= ~0x0F; // DET = 0 (No action)
             
             // Wait for device detection
@@ -149,7 +190,11 @@ void Controller::probePorts() {
                     sys_write(dbg);
                 }
                 if (sig == SATA_SIG_ATA) {
-                    ports[i] = std::make_unique<AHCIPortDevice>(this, port, i);
+                    ports[i] = std::make_unique<AHCIPortDevice>(
+                        this, port, i,
+                        reinterpret_cast<HBA_CMD_HEADER volatile*>(cl_buf.virt),
+                        reinterpret_cast<void volatile*>(fb_buf.virt)
+                    );
                     if (!ports[i]->initialize()) {
                         ports[i].reset();
                     }
@@ -170,80 +215,58 @@ AHCIPortDevice* Controller::getFirstSataDevice() {
 
 // --- AHCIPortDevice ---
 
-AHCIPortDevice::AHCIPortDevice(Controller* ctrl, HBA_PORT volatile* port_ptr, std::uint8_t port_num)
-    : port(port_ptr), controller(ctrl), port_num(port_num), sector_size(512) {
-    cmd_list = nullptr;
-    fis_recv = nullptr;
+AHCIPortDevice::AHCIPortDevice(Controller* ctrl, HBA_PORT volatile* port_ptr, std::uint8_t port_num,
+                               HBA_CMD_HEADER volatile* cl, void volatile* fb)
+    : port(port_ptr), controller(ctrl), port_num(port_num),
+      cmd_list(cl), fis_recv(fb), sector_size(512),
+      dma_buffer(nullptr), dma_buffer_phys(0), dma_buffer_size(0) {
     for (int i = 0; i < 32; i++) cmd_tbl[i] = nullptr;
 }
 
 bool AHCIPortDevice::initialize() {
-    // 1. Stop port
-    port->cmd &= ~HBA_PxCMD_ST;
-    port->cmd &= ~HBA_PxCMD_FRE;
-    
-    while (port->cmd & HBA_PxCMD_FR || port->cmd & HBA_PxCMD_CR) {
-        // wait
+    // 1. Allocate memory for command list if not already allocated
+    if (!cmd_list) {
+        DmaBuffer cl = allocDmaPages(1);
+        if (!cl.virt) return false;
+        cmd_list = reinterpret_cast<HBA_CMD_HEADER volatile*>(cl.virt);
+        port->clb = static_cast<std::uint32_t>(cl.phys);
+        port->clbu = static_cast<std::uint32_t>(cl.phys >> 32);
     }
 
-    // Allocate memory for DMA buffers from untyped capability
-    // We will map these into our address space at fixed locations
-    // since we don't have a fully general virtual memory manager in AHCI.
-    static std::uint64_t bump_virt = 0x300000000000;
-    
-    // 2. Allocate memory for command list
-    std::uint32_t cl_cap = sys_frame_alloc(CAP_UNTYPED, 1);
-    if (sys_vspace_map_with_pagetables(CAP_SELF_VSPACE, CAP_UNTYPED, cl_cap, bump_virt, 0x01, 4096) != 0) return false;
-    cmd_list = reinterpret_cast<HBA_CMD_HEADER volatile*>(bump_virt);
-    oz::utils::memset((void*)cmd_list, 0, 4096);
-    
-    std::uint64_t cl_phys = sys_frame_phys_addr(cl_cap);
-    port->clb = static_cast<std::uint32_t>(cl_phys);
-    port->clbu = static_cast<std::uint32_t>(cl_phys >> 32);
-    bump_virt += 4096;
+    // 2. Allocate memory for FIS receive area if not already allocated
+    if (!fis_recv) {
+        DmaBuffer fb = allocDmaPages(1);
+        if (!fb.virt) return false;
+        fis_recv = reinterpret_cast<void volatile*>(fb.virt);
+        port->fb = static_cast<std::uint32_t>(fb.phys);
+        port->fbu = static_cast<std::uint32_t>(fb.phys >> 32);
+    }
 
-    // 3. Allocate memory for FIS receive area
-    std::uint32_t fb_cap = sys_frame_alloc(CAP_UNTYPED, 1);
-    if (sys_vspace_map_with_pagetables(CAP_SELF_VSPACE, CAP_UNTYPED, fb_cap, bump_virt, 0x01, 4096) != 0) return false;
-    fis_recv = reinterpret_cast<void*>(bump_virt);
-    oz::utils::memset((void*)fis_recv, 0, 4096);
-    
-    std::uint64_t fb_phys = sys_frame_phys_addr(fb_cap);
-    port->fb = static_cast<std::uint32_t>(fb_phys);
-    port->fbu = static_cast<std::uint32_t>(fb_phys >> 32);
-    bump_virt += 4096;
-
-    // 4. Allocate memory for command tables
+    // 3. Allocate memory for command tables
     for (int i = 0; i < 32; i++) {
         cmd_list[i].prdtl = 8; // 8 PRDT entries max per command table
         
-        std::uint32_t ct_cap = sys_frame_alloc(CAP_UNTYPED, 1);
-        if (sys_vspace_map_with_pagetables(CAP_SELF_VSPACE, CAP_UNTYPED, ct_cap, bump_virt, 0x01, 4096) != 0) return false;
-        cmd_tbl[i] = reinterpret_cast<HBA_CMD_TBL volatile*>(bump_virt);
-        oz::utils::memset((void*)cmd_tbl[i], 0, 4096);
+        DmaBuffer ct = allocDmaPages(1);
+        if (!ct.virt) return false;
+        cmd_tbl[i] = reinterpret_cast<HBA_CMD_TBL volatile*>(ct.virt);
         
-        std::uint64_t ct_phys = sys_frame_phys_addr(ct_cap);
-        cmd_list[i].ctba = static_cast<std::uint32_t>(ct_phys);
-        cmd_list[i].ctbau = static_cast<std::uint32_t>(ct_phys >> 32);
-        bump_virt += 4096;
+        cmd_list[i].ctba = static_cast<std::uint32_t>(ct.phys);
+        cmd_list[i].ctbau = static_cast<std::uint32_t>(ct.phys >> 32);
     }
 
-    // 5. Start port
+    // 4. Start port command engine
     while (port->cmd & HBA_PxCMD_CR);
     
     port->cmd |= HBA_PxCMD_FRE;
     port->cmd |= HBA_PxCMD_ST;
 
-    // Allocate DMA bounce buffer (64KB)
+    // 5. Allocate DMA bounce buffer (64KB)
     dma_buffer_size = 65536;
-    std::uint32_t dma_cap = sys_frame_alloc(CAP_UNTYPED, 16);
-    if (!dma_cap) return false;
-    if (sys_vspace_map_with_pagetables(CAP_SELF_VSPACE, CAP_UNTYPED, dma_cap, bump_virt, 0x01, 16 * 4096) != 0) return false;
+    DmaBuffer dma = allocDmaPages(16);
+    if (!dma.virt) return false;
     
-    dma_buffer_phys = sys_frame_phys_addr(dma_cap);
-    dma_buffer = (void*)bump_virt;
-    bump_virt += 16 * 4096;
-
+    dma_buffer = dma.virt;
+    dma_buffer_phys = dma.phys;
 
     return true;
 }

@@ -30,7 +30,8 @@ private:
     bool waitForPortReady();
 
 public:
-    AHCIPortDevice(Controller* ctrl, HBA_PORT volatile* port_ptr, std::uint8_t port_num);
+    AHCIPortDevice(Controller* ctrl, HBA_PORT volatile* port_ptr, std::uint8_t port_num,
+                   HBA_CMD_HEADER volatile* cl = nullptr, void volatile* fb = nullptr);
     ~AHCIPortDevice() override = default;
 
     bool initialize();
