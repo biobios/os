@@ -74,9 +74,19 @@ add_executable(head src/head/main.cpp src/head/linker.ld)
 target_link_libraries(head oz_syscall)
 target_link_options(head PRIVATE "-T${CMAKE_CURRENT_SOURCE_DIR}/src/head/linker.ld" "-nostdlib" "-static")
 
+# memman process (Memory Manager)
+add_executable(memman src/memman/main.cpp src/memman/linker.ld)
+target_link_libraries(memman oz_syscall)
+target_link_options(memman PRIVATE "-T${CMAKE_CURRENT_SOURCE_DIR}/src/memman/linker.ld" "-nostdlib" "-static")
+
+# procman process (Process Manager)
+add_executable(procman src/procman/main.cpp src/procman/linker.ld)
+target_link_libraries(procman oz_syscall)
+target_link_options(procman PRIVATE "-T${CMAKE_CURRENT_SOURCE_DIR}/src/procman/linker.ld" "-nostdlib" "-static")
+
 add_custom_target(initrd ALL
-    COMMAND tar -cvf ${CMAKE_SOURCE_DIR}/assets/initrd.tar -C ${CMAKE_CURRENT_BINARY_DIR} init console vfs ahci xhci display shell manifest_test cat head
-    DEPENDS init console vfs ahci xhci display shell manifest_test cat head
+    COMMAND tar -cvf ${CMAKE_SOURCE_DIR}/assets/initrd.tar -C ${CMAKE_CURRENT_BINARY_DIR} init console vfs ahci xhci display shell manifest_test cat head memman procman
+    DEPENDS init console vfs ahci xhci display shell manifest_test cat head memman procman
 )
 target_sources(oz_syscall PRIVATE lib/malloc.cpp)
 

@@ -1,11 +1,10 @@
 #include "syscall.hpp"
-#include "loader.hpp"
 #include "../common/ipc/Protocol.hpp"
 #include "../common/ipc/StartupInfo.hpp"
 #include "../common/utils/utils.hpp"
 #include "../../lib/io.hpp"
 
-// Shell declares its requirements statically
+// Shell declares its requirements statically (Pure unprivileged User Process!)
 OZ_MANIFEST((oz::ProcessManifest{
     .magic = oz::ProcessManifest::MAGIC,
     .version = 1,
@@ -13,7 +12,7 @@ OZ_MANIFEST((oz::ProcessManifest{
     .needs_vfs_root = true,
     .needs_display = false,
     .needs_wm = false,
-    .needs_untyped = true,
+    .needs_untyped = false,
     .default_data_dir = {}
 }));
 
@@ -22,6 +21,8 @@ static constexpr std::uint32_t CAP_SHELL_INPUT     = 2;
 static constexpr std::uint32_t CAP_VFS_SEND        = 3;
 static constexpr std::uint32_t CAP_VFS_RECV        = 4;
 static constexpr std::uint32_t CAP_VFS_SHARED_BUF  = 5;
+static constexpr std::uint32_t CAP_PROCMAN_SEND    = 6;
+static constexpr std::uint32_t CAP_PROCMAN_RECV    = 7;
 
 static constexpr std::uint64_t VFS_SHARED_BUF_VIRT = 0x300000000000ULL;
 static char* g_shared_buf = nullptr;
@@ -343,44 +344,88 @@ static std::size_t str_len(const char* s) {
     return len;
 }
 
-struct ProcessHandle {
-    std::uint32_t tcb_cap{oz::INVALID_CAP_ID};
-    std::uint32_t cspace_cap{oz::INVALID_CAP_ID};
-    std::uint32_t vspace_cap{oz::INVALID_CAP_ID};
-    std::uint32_t untyped_cap{oz::INVALID_CAP_ID};
-    std::uint32_t exit_notif{oz::INVALID_CAP_ID};
-
-    int wait_and_reclaim() {
-        int exit_code = 0;
-        if (exit_notif != oz::INVALID_CAP_ID) {
-            std::uint64_t badge = 0;
-            oz::sys_notification_wait(exit_notif, &badge);
-            exit_code = static_cast<int>(badge & 0xFFFFFFFFULL);
-            oz::sys_cap_delete(exit_notif);
-            exit_notif = oz::INVALID_CAP_ID;
-        }
-        if (untyped_cap != oz::INVALID_CAP_ID) {
-            oz::sys_untyped_revoke(untyped_cap);
-            oz::sys_cap_delete(untyped_cap);
-            untyped_cap = oz::INVALID_CAP_ID;
-        }
-        if (tcb_cap != oz::INVALID_CAP_ID) {
-            oz::sys_cap_delete(tcb_cap);
-            tcb_cap = oz::INVALID_CAP_ID;
-        }
-        if (cspace_cap != oz::INVALID_CAP_ID) {
-            oz::sys_cap_delete(cspace_cap);
-            cspace_cap = oz::INVALID_CAP_ID;
-        }
-        if (vspace_cap != oz::INVALID_CAP_ID) {
-            oz::sys_cap_delete(vspace_cap);
-            vspace_cap = oz::INVALID_CAP_ID;
-        }
-        return exit_code;
+// ===== ProcMan IPC Client Helpers =====
+static bool procman_spawn_init(const char* prog_name, std::uint32_t stdin_cap, std::uint32_t* out_sess) {
+    oz::IPCMessage req{};
+    req.data[0] = static_cast<std::uint64_t>(oz::ipc::ProcCmd::SPAWN_INIT);
+    char* dst = reinterpret_cast<char*>(&req.data[1]);
+    for (int i = 0; i < 23 && prog_name[i] != '\0'; ++i) dst[i] = prog_name[i];
+    if (stdin_cap != 0) {
+        req.has_cap = true;
+        req.transferred_cap = stdin_cap;
     }
-};
+    if (!oz::sys_channel_send(CAP_PROCMAN_SEND, &req)) return false;
+    oz::IPCMessage resp{};
+    if (!oz::sys_channel_recv(CAP_PROCMAN_RECV, &resp) || resp.data[0] != 0) return false;
+    if (out_sess) *out_sess = static_cast<std::uint32_t>(resp.data[1]);
+    return true;
+}
 
-static bool execute_spawn(const CommandArgs& cmd_args, std::uint32_t override_stdin_cap = 0, std::uint32_t override_stdout_cap = 0, ProcessHandle* out_handle = nullptr) {
+static bool procman_spawn_set_stdout(std::uint32_t stdout_cap) {
+    oz::IPCMessage req{};
+    req.data[0] = static_cast<std::uint64_t>(oz::ipc::ProcCmd::SPAWN_SET_STDOUT);
+    req.has_cap = true;
+    req.transferred_cap = stdout_cap;
+    if (!oz::sys_channel_send(CAP_PROCMAN_SEND, &req)) return false;
+    oz::IPCMessage resp{};
+    return oz::sys_channel_recv(CAP_PROCMAN_RECV, &resp) && resp.data[0] == 0;
+}
+
+static bool procman_spawn_add_arg(const char* arg) {
+    oz::IPCMessage req{};
+    req.data[0] = static_cast<std::uint64_t>(oz::ipc::ProcCmd::SPAWN_ADD_ARG);
+    char* dst = reinterpret_cast<char*>(&req.data[2]);
+    for (int i = 0; i < 15 && arg[i] != '\0'; ++i) dst[i] = arg[i];
+    if (!oz::sys_channel_send(CAP_PROCMAN_SEND, &req)) return false;
+    oz::IPCMessage resp{};
+    return oz::sys_channel_recv(CAP_PROCMAN_RECV, &resp) && resp.data[0] == 0;
+}
+
+static bool procman_spawn_add_cap(const char* name, std::uint32_t cap) {
+    oz::IPCMessage req{};
+    req.data[0] = static_cast<std::uint64_t>(oz::ipc::ProcCmd::SPAWN_ADD_CAP);
+    char* dst = reinterpret_cast<char*>(&req.data[2]);
+    for (int i = 0; i < 15 && name[i] != '\0'; ++i) dst[i] = name[i];
+    req.has_cap = true;
+    req.transferred_cap = cap;
+    if (!oz::sys_channel_send(CAP_PROCMAN_SEND, &req)) return false;
+    oz::IPCMessage resp{};
+    return oz::sys_channel_recv(CAP_PROCMAN_RECV, &resp) && resp.data[0] == 0;
+}
+
+static std::uint32_t procman_spawn_commit() {
+    oz::IPCMessage req{};
+    req.data[0] = static_cast<std::uint64_t>(oz::ipc::ProcCmd::SPAWN_COMMIT);
+    if (!oz::sys_channel_send(CAP_PROCMAN_SEND, &req)) return 0;
+    oz::IPCMessage resp{};
+    if (!oz::sys_channel_recv(CAP_PROCMAN_RECV, &resp) || resp.data[0] != 0) return 0;
+    return static_cast<std::uint32_t>(resp.data[1]); // pid
+}
+
+static int procman_wait(std::uint32_t pid) {
+    if (pid == 0) return -1;
+    oz::IPCMessage req{};
+    req.data[0] = static_cast<std::uint64_t>(oz::ipc::ProcCmd::WAIT);
+    req.data[1] = pid;
+    if (!oz::sys_channel_send(CAP_PROCMAN_SEND, &req)) return -1;
+    oz::IPCMessage resp{};
+    if (!oz::sys_channel_recv(CAP_PROCMAN_RECV, &resp) || resp.data[0] != 0) return -1;
+    return static_cast<int>(resp.data[1]); // exit_code
+}
+
+static bool procman_create_pipe(std::uint32_t* out_w, std::uint32_t* out_r) {
+    oz::IPCMessage req{};
+    req.data[0] = static_cast<std::uint64_t>(oz::ipc::ProcCmd::CREATE_PIPE);
+    if (!oz::sys_channel_send(CAP_PROCMAN_SEND, &req)) return false;
+    oz::IPCMessage resp{};
+    if (!oz::sys_channel_recv(CAP_PROCMAN_RECV, &resp) || resp.data[0] != 0 || !resp.has_cap) return false;
+    *out_w = static_cast<std::uint32_t>(resp.data[1]);
+    *out_r = resp.transferred_cap;
+    return true;
+}
+
+
+static bool execute_spawn(const CommandArgs& cmd_args, std::uint32_t override_stdin_cap = 0, std::uint32_t override_stdout_cap = 0, std::uint32_t* out_pid = nullptr) {
     if (cmd_args.argc == 0) return false;
 
     std::size_t prog_idx = 0;
@@ -393,65 +438,15 @@ static bool execute_spawn(const CommandArgs& cmd_args, std::uint32_t override_st
     }
 
     const char* prog_name = cmd_args.args[prog_idx];
-    int fd = vfs_open(prog_name);
-    if (fd < 0) {
-        oz::sys_write("Cannot open executable: ");
-        oz::sys_write(prog_name);
-        oz::sys_write("\n\r");
-        return false;
-    }
-
-    std::size_t sz = vfs_get_size(fd);
-    if (sz == 0 || sz > 2 * 1024 * 1024) {
-        oz::sys_write("Invalid executable size\n\r");
-        vfs_close(fd);
-        return false;
-    }
-
-    std::size_t pages = (sz + 4095) / 4096;
-    std::uint32_t buf_frame = oz::sys_frame_alloc(oz::CAP_UNTYPED, pages);
-    if (buf_frame == static_cast<std::uint32_t>(-1)) {
-        oz::sys_write("Failed to allocate memory for executable\n\r");
-        vfs_close(fd);
-        return false;
-    }
-
-    static constexpr std::uint64_t STAGING_ADDR = 0x400000000000ULL;
-    if (oz::sys_vspace_map_with_pagetables(oz::CAP_SELF_VSPACE, oz::CAP_UNTYPED, buf_frame, STAGING_ADDR, 0x01, pages * 4096) != 0) {
-        oz::sys_write("Failed to map staging memory\n\r");
-        vfs_close(fd);
-        return false;
-    }
-
-    char* staging = reinterpret_cast<char*>(STAGING_ADDR);
-    std::size_t read_bytes = vfs_read(fd, 0, staging, sz);
-    vfs_close(fd);
-
-    if (read_bytes < sz) {
-        oz::sys_write("Failed to read complete executable\n\r");
-        oz::sys_vspace_unmap(oz::CAP_SELF_VSPACE, STAGING_ADDR);
-        return false;
-    }
-
-    oz::ProcessManifest manifest{};
-    bool has_manifest = oz::loader::get_elf_manifest(reinterpret_cast<const std::uint8_t*>(staging), sz, manifest);
-
-    oz::ProcessStartupInfo startup_info{};
-    std::uint32_t next_slot = 1;
 
     // 1. Resolve STDIN capability (Override, Redirect, or Default)
     std::uint32_t child_stdin_cap = 0;
-    std::uint32_t child_stdin_slot = 0;
     if (override_stdin_cap != 0) {
-        child_stdin_slot = next_slot++;
         child_stdin_cap = override_stdin_cap;
-        startup_info.add_cap(child_stdin_slot, oz::CapRole::STDIN, "stdin", oz::CapType::STREAM);
     } else if (cmd_args.redirect_stdin[0] != '\0') {
         auto res = vfs_openat(cmd_args.redirect_stdin, oz::ipc::VfsOpenFlags::FILE);
         if (res.status == oz::ipc::VfsStatus::OK && res.transferred_cap != oz::INVALID_CAP_ID) {
-            child_stdin_slot = next_slot++;
             child_stdin_cap = res.transferred_cap;
-            startup_info.add_cap(child_stdin_slot, oz::CapRole::STDIN, cmd_args.redirect_stdin, oz::CapType::FILE);
             oz::sys_write("[Shell] STDIN redirected from: ");
             oz::sys_write(cmd_args.redirect_stdin);
             oz::sys_write("\n\r");
@@ -462,40 +457,23 @@ static bool execute_spawn(const CommandArgs& cmd_args, std::uint32_t override_st
         }
     }
 
-    // 2. Resolve STDOUT capability (Override or Console)
-    std::uint32_t child_stdout_cap = 0;
-    std::uint32_t child_stdout_slot = 0;
+    std::uint32_t sess = 0;
+    if (!procman_spawn_init(prog_name, child_stdin_cap, &sess)) {
+        oz::sys_write("Failed to initialize spawn request\n\r");
+        return false;
+    }
+
+    // 2. Set STDOUT override if provided
     if (override_stdout_cap != 0) {
-        child_stdout_slot = next_slot++;
-        child_stdout_cap = override_stdout_cap;
-        startup_info.add_cap(child_stdout_slot, oz::CapRole::STDOUT, "stdout", oz::CapType::STREAM);
-    } else if (has_manifest && manifest.needs_console) {
-        child_stdout_slot = next_slot++;
-        child_stdout_cap = CAP_CONSOLE_WRITE;
-        startup_info.add_cap(child_stdout_slot, oz::CapRole::STDOUT, "stdout", oz::CapType::STREAM);
+        procman_spawn_set_stdout(override_stdout_cap);
     }
 
-    // Standard root directory if requested
-    if (has_manifest && manifest.needs_vfs_root) {
-        startup_info.add_cap(next_slot++, oz::CapRole::ROOT_DIR, "/");
-    }
-
-    // 3. Resolve delegated capabilities for @"path" arguments (Powerbox pattern!)
-    CommandArgs::DelegatedFile delegated_caps[CommandArgs::MAX_DELEGATED]{};
-    std::size_t num_delegated_caps = 0;
-
+    // 3. Resolve delegated capabilities for @"path" arguments (Powerbox pattern)
     for (std::size_t i = 0; i < cmd_args.num_delegated; ++i) {
         const char* path = cmd_args.delegated[i].path;
         auto res = vfs_openat(path, oz::ipc::VfsOpenFlags::FILE);
         if (res.status == oz::ipc::VfsStatus::OK && res.transferred_cap != oz::INVALID_CAP_ID) {
-            std::uint32_t slot = next_slot++;
-            startup_info.add_cap(slot, oz::CapRole::CUSTOM, path, oz::CapType::FILE);
-            delegated_caps[num_delegated_caps].cap = res.transferred_cap;
-            delegated_caps[num_delegated_caps].cap_slot = slot;
-            for (std::size_t k = 0; k < sizeof(delegated_caps[num_delegated_caps].path); ++k) {
-                delegated_caps[num_delegated_caps].path[k] = path[k];
-            }
-            num_delegated_caps++;
+            procman_spawn_add_cap(path, res.transferred_cap);
             oz::sys_write("[Powerbox] Delegated file cap: ");
             oz::sys_write(path);
             oz::sys_write("\n\r");
@@ -506,87 +484,30 @@ static bool execute_spawn(const CommandArgs& cmd_args, std::uint32_t override_st
         }
     }
 
-    // 4. Add arguments to StartupInfo (argv starting from program name)
+    // 4. Add arguments (argv starting from program name)
     for (std::size_t i = prog_idx; i < cmd_args.argc; ++i) {
-        startup_info.add_arg(cmd_args.args[i]);
+        procman_spawn_add_arg(cmd_args.args[i]);
     }
 
-    // Allocate dedicated child UntypedMemory (at least 2MB, aligned power of two)
-    std::size_t needed = sz + 64 * 1024 + 1024 * 1024;
-    std::size_t child_ut_size = 2 * 1024 * 1024;
-    while (child_ut_size < needed) {
-        child_ut_size <<= 1;
-    }
-
-    std::uint32_t child_untyped = oz::sys_untyped_retype(
-        oz::CAP_UNTYPED,
-        static_cast<std::uint32_t>(oz::ObjectType::UntypedMemory),
-        child_ut_size
-    );
-    if (child_untyped == oz::INVALID_CAP_ID) {
-        oz::sys_write("Failed to allocate Untyped memory for child process\n\r");
-        oz::sys_vspace_unmap(oz::CAP_SELF_VSPACE, STAGING_ADDR);
-        return false;
-    }
-
-    auto proc = oz::loader::spawn_process(
-        child_untyped, oz::CAP_SELF_VSPACE,
-        reinterpret_cast<const std::uint8_t*>(staging), sz,
-        has_manifest ? &startup_info : nullptr
-    );
-    oz::sys_vspace_unmap(oz::CAP_SELF_VSPACE, STAGING_ADDR);
-
-    if (proc.success) {
-        if (child_stdin_cap != 0) {
-            oz::sys_cspace_cap_insert(proc.cspace_cap, child_stdin_slot, child_stdin_cap, static_cast<std::uint32_t>(oz::CapRights::READ | oz::CapRights::GRANT));
-        }
-        if (child_stdout_cap != 0) {
-            oz::sys_cspace_cap_insert(proc.cspace_cap, child_stdout_slot, child_stdout_cap, static_cast<std::uint32_t>(oz::CapRights::WRITE | oz::CapRights::GRANT));
-        }
-        if (!has_manifest) {
-            // Forward console output capability to legacy slot 1
-            oz::sys_cspace_cap_insert(proc.cspace_cap, 1, CAP_CONSOLE_WRITE, static_cast<std::uint32_t>(oz::CapRights::WRITE | oz::CapRights::GRANT));
-        }
-        // Insert delegated file capabilities into child's CSpace
-        for (std::size_t i = 0; i < num_delegated_caps; ++i) {
-            oz::sys_cspace_cap_insert(
-                proc.cspace_cap,
-                delegated_caps[i].cap_slot,
-                delegated_caps[i].cap,
-                static_cast<std::uint32_t>(oz::CapRights::READ | oz::CapRights::WRITE | oz::CapRights::GRANT)
-            );
-        }
-        // Create exit notification for child process
-        std::uint32_t exit_notif = oz::sys_notification_create(oz::CAP_UNTYPED);
-        if (exit_notif != oz::INVALID_CAP_ID) {
-            oz::sys_tcb_set_exit_notification(proc.tcb_cap, exit_notif, 0);
-        }
-
-        ProcessHandle handle{
-            .tcb_cap = proc.tcb_cap,
-            .cspace_cap = proc.cspace_cap,
-            .vspace_cap = proc.vspace_cap,
-            .untyped_cap = child_untyped,
-            .exit_notif = exit_notif,
-        };
-
-        oz::sys_tcb_resume(proc.tcb_cap);
-        oz::sys_write("Spawned process: ");
+    // 5. Commit spawn
+    std::uint32_t pid = procman_spawn_commit();
+    if (pid == 0) {
+        oz::sys_write("ProcMan failed to spawn process: ");
         oz::sys_write(prog_name);
         oz::sys_write("\n\r");
-
-        if (out_handle) {
-            *out_handle = handle;
-        } else {
-            handle.wait_and_reclaim();
-        }
-        return true;
-    } else {
-        oz::sys_untyped_revoke(child_untyped);
-        oz::sys_cap_delete(child_untyped);
-        oz::sys_write("Failed to spawn process\n\r");
         return false;
     }
+
+    oz::sys_write("Spawned process (via ProcMan): ");
+    oz::sys_write(prog_name);
+    oz::sys_write("\n\r");
+
+    if (out_pid) {
+        *out_pid = pid;
+    } else {
+        procman_wait(pid);
+    }
+    return true;
 }
 
 static bool execute_pipeline(const char* line) {
@@ -621,18 +542,18 @@ static bool execute_pipeline(const char* line) {
     }
 
     std::uint32_t pipe_w = 0, pipe_r = 0;
-    if (!oz::sys_channel_create(oz::CAP_UNTYPED, &pipe_w, &pipe_r)) {
-        oz::sys_write("Failed to create pipeline channel\n\r");
+    if (!procman_create_pipe(&pipe_w, &pipe_r)) {
+        oz::sys_write("Failed to create pipeline channel via ProcMan\n\r");
         return true;
     }
 
-    oz::sys_write("[Pipeline] Created Channel pipe: write / read\n\r");
+    oz::sys_write("[Pipeline] Created Channel pipe via ProcMan: write / read\n\r");
 
-    ProcessHandle handle_right{};
-    ProcessHandle handle_left{};
+    std::uint32_t pid_right = 0;
+    std::uint32_t pid_left = 0;
 
     // Spawn right-side command first with pipe_r connected to STDIN (non-blocking)
-    execute_spawn(cmd_right, pipe_r, 0, &handle_right);
+    execute_spawn(cmd_right, pipe_r, 0, &pid_right);
     oz::sys_cap_delete(pipe_r); // Shell drops its own copy of pipe_r so only right-side owns it
 
     // If left-side is "echo", write directly to pipe_w and close
@@ -648,13 +569,13 @@ static bool execute_pipeline(const char* line) {
         oz::sys_cap_delete(pipe_w); // Close write end to signal EOF to right-side
     } else {
         // Spawn left-side command with pipe_w connected to STDOUT (non-blocking)
-        execute_spawn(cmd_left, 0, pipe_w, &handle_left);
+        execute_spawn(cmd_left, 0, pipe_w, &pid_left);
         oz::sys_cap_delete(pipe_w); // Shell drops its own copy of pipe_w so only left-side owns it
     }
 
     // Wait for pipeline children to exit and reclaim their resources
-    handle_left.wait_and_reclaim();
-    handle_right.wait_and_reclaim();
+    if (pid_left != 0) procman_wait(pid_left);
+    if (pid_right != 0) procman_wait(pid_right);
 
     return true;
 }
@@ -742,13 +663,8 @@ extern "C" void _start() {
     oz::sys_write("\n\r=== OZ OS Interactive Shell ===\n\r");
     oz::sys_write("Type 'help' for a list of commands.\n\r\n\r");
 
-    // Ensure staging area intermediate page tables exist in shell's VSpace using CAP_UNTYPED
-    oz::sys_vspace_ensure_pagetables_range(oz::CAP_SELF_VSPACE, oz::CAP_UNTYPED, 0x550000000000ULL, 16 * 1024 * 1024);
-
-    // Map VFS shared buffer if available
-    if (oz::sys_vspace_map_with_pagetables(oz::CAP_SELF_VSPACE, oz::CAP_UNTYPED, CAP_VFS_SHARED_BUF, VFS_SHARED_BUF_VIRT, 0x01, 16 * 4096) == 0) {
-        g_shared_buf = reinterpret_cast<char*>(VFS_SHARED_BUF_VIRT);
-    }
+    // VFS shared buffer is pre-mapped by Init at VFS_SHARED_BUF_VIRT
+    g_shared_buf = reinterpret_cast<char*>(VFS_SHARED_BUF_VIRT);
 
     char line_buf[256] = {};
     std::size_t line_len = 0;

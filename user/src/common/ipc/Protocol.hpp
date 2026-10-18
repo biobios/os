@@ -169,6 +169,36 @@ enum class WMEventType : std::uint64_t {
     FOCUS_CHANGED          = 5, // data[1] = 1 (gained) or 0 (lost)
 };
 
+// ===== Memory Manager IPC Protocol =====
+enum class MemCmd : std::uint64_t {
+    ALLOC_UNTYPED  = 1, // Client -> MemMan: data[1] = size_bytes (aligned power-of-two)
+                        // Resp: data[0] = status (0=OK), transferred_cap = UntypedMemory Cap
+    REVOKE_UNTYPED = 2, // Client -> MemMan: transferred_cap = UntypedMemory Cap to revoke & reclaim
+                        // Resp: data[0] = status (0=OK)
+    GET_INFO       = 3, // Client -> MemMan: returns data[1] = total_bytes, data[2] = free_bytes
+};
+
+// ===== Process Manager IPC Protocol =====
+enum class ProcCmd : std::uint64_t {
+    SPAWN_INIT       = 1, // data[1..3] = prog_name (packed chars, up to 24 chars)
+                          // transferred_cap (optional) = stdin cap (if has_cap is true)
+                          // Resp: data[0] = status, data[1] = session_id
+    SPAWN_SET_STDOUT = 2, // data[1] = session_id, transferred_cap = stdout cap
+                          // Resp: data[0] = status
+    SPAWN_ADD_ARG    = 3, // data[1] = session_id, data[2..3] = arg string (up to 16 chars)
+                          // Resp: data[0] = status
+    SPAWN_ADD_CAP    = 4, // data[1] = session_id, data[2..3] = name (up to 16 chars), transferred_cap = cap
+                          // Resp: data[0] = status
+    SPAWN_COMMIT     = 5, // data[1] = session_id -> launches process
+                          // Resp: data[0] = status, data[1] = pid
+    WAIT             = 6, // data[1] = pid -> waits for exit and reclaims resources
+                          // Resp: data[0] = status, data[1] = exit_code
+    KILL             = 7, // data[1] = pid
+                          // Resp: data[0] = status
+    CREATE_PIPE      = 8, // Requests a new Channel pipe (write-end returned in data[1], read-end in transferred_cap)
+                          // Resp: data[0] = status, data[1] = pipe_write_cap, transferred_cap = pipe_read_cap
+};
+
 } // namespace ipc
 
 } // namespace oz

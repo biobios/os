@@ -19,7 +19,7 @@ static constexpr std::uint32_t CAP_AHCI_SEND = 2;
 static constexpr std::uint32_t CAP_AHCI_RECV = 3;
 static constexpr std::uint32_t CAP_CLIENT_RECV = 4;
 static constexpr std::uint32_t CAP_CLIENT_REPLY_BASE = 5;
-static constexpr std::uint32_t MAX_CLIENTS = 2;
+static constexpr std::uint32_t MAX_CLIENTS = 3;
 
 static constexpr std::uint32_t CAP_CLIENT_BUF_BASE = 243;
 static constexpr std::uint64_t CLIENT_BUF_BASE_VIRT = 0x300000000000ULL;
