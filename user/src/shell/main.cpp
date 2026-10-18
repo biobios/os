@@ -1,7 +1,20 @@
 #include "syscall.hpp"
 #include "loader.hpp"
 #include "../common/ipc/Protocol.hpp"
+#include "../common/ipc/StartupInfo.hpp"
 #include "../common/utils/utils.hpp"
+
+// Shell declares its requirements statically
+OZ_MANIFEST((oz::ProcessManifest{
+    .magic = oz::ProcessManifest::MAGIC,
+    .version = 1,
+    .needs_console = true,
+    .needs_vfs_root = true,
+    .needs_display = false,
+    .needs_wm = false,
+    .needs_untyped = true,
+    .default_data_dir = {}
+}));
 
 static constexpr std::uint32_t CAP_CONSOLE_WRITE   = 1;
 static constexpr std::uint32_t CAP_SHELL_INPUT     = 2;
@@ -246,12 +259,38 @@ static void execute_command(const char* line) {
             return;
         }
 
-        auto proc = oz::loader::spawn_process(oz::CAP_UNTYPED, oz::CAP_SELF_VSPACE, reinterpret_cast<const std::uint8_t*>(staging), sz);
+        oz::ProcessManifest manifest{};
+        bool has_manifest = oz::loader::get_elf_manifest(reinterpret_cast<const std::uint8_t*>(staging), sz, manifest);
+
+        oz::ProcessStartupInfo startup_info{};
+        if (has_manifest) {
+            std::uint32_t slot = 1;
+            if (manifest.needs_console) {
+                startup_info.add_cap(slot++, oz::CapRole::STDOUT, "stdout");
+            }
+            if (manifest.needs_vfs_root) {
+                startup_info.add_cap(slot++, oz::CapRole::ROOT_DIR, "/");
+            }
+        }
+
+        auto proc = oz::loader::spawn_process(
+            oz::CAP_UNTYPED, oz::CAP_SELF_VSPACE,
+            reinterpret_cast<const std::uint8_t*>(staging), sz,
+            has_manifest ? &startup_info : nullptr
+        );
         oz::sys_vspace_unmap(oz::CAP_SELF_VSPACE, STAGING_ADDR);
 
         if (proc.success) {
-            // Forward console output capability
-            oz::sys_cspace_cap_insert(proc.cspace_cap, 1, CAP_CONSOLE_WRITE, static_cast<std::uint32_t>(oz::CapRights::WRITE | oz::CapRights::GRANT));
+            if (has_manifest) {
+                for (std::size_t i = 0; i < startup_info.num_caps; ++i) {
+                    if (startup_info.caps[i].role == oz::CapRole::STDOUT) {
+                        oz::sys_cspace_cap_insert(proc.cspace_cap, startup_info.caps[i].slot, CAP_CONSOLE_WRITE, static_cast<std::uint32_t>(oz::CapRights::WRITE | oz::CapRights::GRANT));
+                    }
+                }
+            } else {
+                // Forward console output capability to legacy slot 1
+                oz::sys_cspace_cap_insert(proc.cspace_cap, 1, CAP_CONSOLE_WRITE, static_cast<std::uint32_t>(oz::CapRights::WRITE | oz::CapRights::GRANT));
+            }
             oz::sys_tcb_resume(proc.tcb_cap);
             oz::sys_write("Spawned process: ");
             oz::sys_write(path);

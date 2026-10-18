@@ -3,6 +3,7 @@
 #include "syscall.hpp"
 #include "elf.hpp"
 #include "../src/common/utils/utils.hpp"
+#include "../src/common/ipc/StartupInfo.hpp"
 #include <cstdint>
 #include <cstddef>
 
@@ -48,6 +49,56 @@ inline TarFile tar_find_file(const std::uint8_t* tar_ptr, std::size_t tar_size, 
     return {};
 }
 
+// Parses the .oz_manifest section from an ELF binary
+inline bool get_elf_manifest(const std::uint8_t* elf_data, std::size_t elf_size, ProcessManifest& out_manifest) {
+    if (!elf_data || elf_size < sizeof(elf::Elf64_Ehdr)) return false;
+    const auto* ehdr = reinterpret_cast<const elf::Elf64_Ehdr*>(elf_data);
+    if (!elf::isValidElf(ehdr)) return false;
+
+    if (ehdr->e_shoff == 0 || ehdr->e_shnum == 0 || ehdr->e_shstrndx >= ehdr->e_shnum) {
+        return false;
+    }
+
+    std::uint64_t sh_table_size = static_cast<std::uint64_t>(ehdr->e_shnum) * ehdr->e_shentsize;
+    if (ehdr->e_shoff > elf_size || sh_table_size > elf_size - ehdr->e_shoff) {
+        return false;
+    }
+
+    // Find section header string table (.shstrtab)
+    const auto* strtab_shdr = reinterpret_cast<const elf::Elf64_Shdr*>(
+        elf_data + ehdr->e_shoff + static_cast<std::uint64_t>(ehdr->e_shstrndx) * ehdr->e_shentsize
+    );
+    if (strtab_shdr->sh_offset > elf_size || strtab_shdr->sh_size > elf_size - strtab_shdr->sh_offset) {
+        return false;
+    }
+    const char* strtab = reinterpret_cast<const char*>(elf_data + strtab_shdr->sh_offset);
+
+    // Look for ".oz_manifest"
+    for (int i = 0; i < ehdr->e_shnum; ++i) {
+        const auto* shdr = reinterpret_cast<const elf::Elf64_Shdr*>(
+            elf_data + ehdr->e_shoff + static_cast<std::uint64_t>(i) * ehdr->e_shentsize
+        );
+        if (shdr->sh_name < strtab_shdr->sh_size) {
+            const char* sname = strtab + shdr->sh_name;
+            const char* target = ".oz_manifest";
+            bool match = true;
+            for (int k = 0; target[k] != '\0'; ++k) {
+                if (sname[k] != target[k]) { match = false; break; }
+            }
+            if (match && sname[12] == '\0') {
+                if (shdr->sh_size >= sizeof(ProcessManifest) && shdr->sh_offset <= elf_size - sizeof(ProcessManifest)) {
+                    const auto* mf = reinterpret_cast<const ProcessManifest*>(elf_data + shdr->sh_offset);
+                    if (mf->magic == ProcessManifest::MAGIC) {
+                        out_manifest = *mf;
+                        return true;
+                    }
+                }
+            }
+        }
+    }
+    return false;
+}
+
 struct SpawnedProcess {
     std::uint32_t cspace_cap{0};
     std::uint32_t vspace_cap{0};
@@ -62,8 +113,30 @@ inline SpawnedProcess spawn_process(
     std::uint32_t self_vspace_cap,
     const std::uint8_t* elf_data,
     std::size_t elf_size,
+    std::uint64_t staging_vaddr = 0x550000000000ULL,
+    const ProcessStartupInfo* startup_info = nullptr
+);
+
+inline SpawnedProcess spawn_process(
+    std::uint32_t untyped_cap,
+    std::uint32_t self_vspace_cap,
+    const std::uint8_t* elf_data,
+    std::size_t elf_size,
+    const ProcessStartupInfo* startup_info,
     std::uint64_t staging_vaddr = 0x550000000000ULL
 ) {
+    return spawn_process(untyped_cap, self_vspace_cap, elf_data, elf_size, staging_vaddr, startup_info);
+}
+
+inline SpawnedProcess spawn_process(
+    std::uint32_t untyped_cap,
+    std::uint32_t self_vspace_cap,
+    const std::uint8_t* elf_data,
+    std::size_t elf_size,
+    std::uint64_t staging_vaddr,
+    const ProcessStartupInfo* startup_info
+) {
+
     SpawnedProcess result{};
 
     if (!elf_data || elf_size < sizeof(elf::Elf64_Ehdr)) return result;
@@ -161,6 +234,31 @@ inline SpawnedProcess spawn_process(
     std::uint32_t stack_frame = sys_frame_alloc(untyped_cap, STACK_SIZE / 4096);
     if (stack_frame == static_cast<std::uint32_t>(-1)) return result;
 
+    result.stack_top = STACK_TOP_VADDR - 8;
+
+    // If startup_info is provided, write it to the top of child stack via staging buffer
+    if (startup_info) {
+        if (sys_vspace_map_with_pagetables(self_vspace_cap, untyped_cap, stack_frame, staging_vaddr, 0x01, STACK_SIZE) == 0) {
+            utils::memset(reinterpret_cast<void*>(staging_vaddr), 0, STACK_SIZE);
+
+            // Layout at top of stack:
+            // [ STACK_TOP_VADDR - info_size - 16 ]: ProcessStartupInfo struct
+            // [ STACK_TOP_VADDR - info_size - 24 ]: Pointer to ProcessStartupInfo (which will be at RSP)
+            std::size_t info_size = sizeof(ProcessStartupInfo);
+            std::uint64_t info_offset = STACK_SIZE - info_size - 16;
+            utils::memcpy(reinterpret_cast<void*>(staging_vaddr + info_offset), startup_info, info_size);
+
+            std::uint64_t child_info_vaddr = stack_base_vaddr + info_offset;
+            *reinterpret_cast<std::uint64_t*>(staging_vaddr + info_offset - 8) = child_info_vaddr;
+
+            result.stack_top = stack_base_vaddr + info_offset - 8;
+
+            for (std::size_t p = 0; p < STACK_SIZE / 4096; ++p) {
+                sys_vspace_unmap(self_vspace_cap, staging_vaddr + p * 4096);
+            }
+        }
+    }
+
     if (sys_vspace_map_with_pagetables(result.vspace_cap, untyped_cap, stack_frame, stack_base_vaddr, 0x01, STACK_SIZE) != 0) {
         return result;
     }
@@ -173,12 +271,12 @@ inline SpawnedProcess spawn_process(
 
     // 6. Configure TCB
     result.entry_point = ehdr->e_entry;
-    result.stack_top = STACK_TOP_VADDR - 8;
 
     if (sys_tcb_configure(result.tcb_cap, result.cspace_cap, result.vspace_cap,
                           result.entry_point, result.stack_top) != 0) {
         return result;
     }
+
 
     result.success = true;
     return result;

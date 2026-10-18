@@ -59,8 +59,14 @@ add_executable(shell src/shell/main.cpp src/shell/linker.ld)
 target_link_libraries(shell oz_syscall)
 target_link_options(shell PRIVATE "-T${CMAKE_CURRENT_SOURCE_DIR}/src/shell/linker.ld" "-nostdlib" "-static")
 
+# manifest_test process (Verification of Step 2: Local Namespace & Manifest Sandboxing)
+add_executable(manifest_test src/manifest_test/main.cpp src/manifest_test/linker.ld)
+target_link_libraries(manifest_test oz_syscall)
+target_link_options(manifest_test PRIVATE "-T${CMAKE_CURRENT_SOURCE_DIR}/src/manifest_test/linker.ld" "-nostdlib" "-static")
+
 add_custom_target(initrd ALL
-    COMMAND tar -cvf ${CMAKE_SOURCE_DIR}/assets/initrd.tar -C ${CMAKE_CURRENT_BINARY_DIR} init console vfs ahci xhci display shell
-    DEPENDS init console vfs ahci xhci display shell
+    COMMAND tar -cvf ${CMAKE_SOURCE_DIR}/assets/initrd.tar -C ${CMAKE_CURRENT_BINARY_DIR} init console vfs ahci xhci display shell manifest_test
+    DEPENDS init console vfs ahci xhci display shell manifest_test
 )
 target_sources(oz_syscall PRIVATE lib/malloc.cpp)
+

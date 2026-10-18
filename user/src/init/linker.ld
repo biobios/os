@@ -11,6 +11,10 @@ SECTIONS {
         *(.rodata .rodata.*)
     }
     
+    .oz_manifest : {
+        KEEP(*(.oz_manifest))
+    }
+    
     .data : {
         *(.data .data.*)
     }

@@ -757,6 +757,49 @@ extern "C" void _start() {
         oz::sys_debug_print("[Test] Display create_surface: FAILED\n\r");
     }
 
+    // ========================================================================
+    // Step 2: Process Startup & Local Namespace Construction Self-Tests
+    // ========================================================================
+    oz::sys_debug_print("[Init] Running Step 2 Local Namespace & Manifest Sandboxing tests...\n\r");
+
+    oz::loader::TarFile test_file = oz::loader::tar_find_file(initrd_ptr, initrd_size, "manifest_test");
+    if (test_file.data) {
+        oz::ProcessManifest manifest{};
+        bool has_manifest = oz::loader::get_elf_manifest(test_file.data, test_file.size, manifest);
+        if (has_manifest) {
+            oz::sys_debug_print("[Init] Found .oz_manifest in manifest_test! Parsed successfully.\n\r");
+
+            oz::ProcessStartupInfo startup_info{};
+            std::uint32_t next_slot = 1;
+
+            if (manifest.needs_console) {
+                startup_info.add_cap(next_slot++, oz::CapRole::STDOUT, "stdout");
+            }
+            if (manifest.needs_vfs_root) {
+                startup_info.add_cap(next_slot++, oz::CapRole::ROOT_DIR, "/");
+            }
+
+            auto test_proc = oz::loader::spawn_process(oz::CAP_UNTYPED, oz::CAP_SELF_VSPACE, test_file.data, test_file.size, &startup_info);
+            if (test_proc.success) {
+                // Insert granted capabilities into child's CSpace
+                for (std::size_t i = 0; i < startup_info.num_caps; ++i) {
+                    if (startup_info.caps[i].role == oz::CapRole::STDOUT) {
+                        oz::sys_cspace_cap_insert(test_proc.cspace_cap, startup_info.caps[i].slot, cons_send, static_cast<std::uint32_t>(oz::CapRights::WRITE | oz::CapRights::GRANT));
+                    }
+                }
+
+                oz::sys_tcb_resume(test_proc.tcb_cap);
+                oz::sys_debug_print("[Init] manifest_test process spawned and resumed.\n\r");
+            } else {
+                oz::sys_debug_print("[Init] ERROR: Failed to spawn manifest_test!\n\r");
+            }
+        } else {
+            oz::sys_debug_print("[Init] ERROR: manifest_test does not have .oz_manifest!\n\r");
+        }
+    } else {
+        oz::sys_debug_print("[Init] ERROR: manifest_test not found in initrd!\n\r");
+    }
+
     oz::sys_write("Init process completed. Idling...\n\r");
 
     while (true) {
