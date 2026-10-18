@@ -62,6 +62,42 @@ enum class VfsStatus : std::uint64_t {
     IO_ERROR     = 4,
 };
 
+// ===== Dedicated File Channel Protocol =====
+// Used when communicating directly with a File Capability Channel
+enum class FileCmd : std::uint32_t {
+    READ     = 1, // data[0] = cmd | (size << 32), data[1] = offset (or FILE_STREAM_OFFSET)
+                  // response: data[0] = status | (bytes_read << 32), data[1..3] = payload (up to 24 bytes)
+    WRITE    = 2, // data[0] = cmd | (size << 32), data[1] = offset, data[2..3] = payload
+    GET_SIZE = 3, // response: data[0] = status, data[1] = size
+    CLOSE    = 4, // response: data[0] = status
+};
+
+static constexpr std::uint64_t FILE_STREAM_OFFSET = 0xFFFFFFFFFFFFFFFFULL;
+
+inline std::uint64_t file_make_cmd(FileCmd cmd, std::uint32_t len = 0) {
+    return static_cast<std::uint64_t>(cmd) | (static_cast<std::uint64_t>(len) << 32);
+}
+
+inline FileCmd file_get_cmd(std::uint64_t data0) {
+    return static_cast<FileCmd>(data0 & 0xFFFFFFFFULL);
+}
+
+inline std::uint32_t file_get_len(std::uint64_t data0) {
+    return static_cast<std::uint32_t>((data0 >> 32) & 0xFFFFFFFFULL);
+}
+
+// ===== Stream Channel Protocol (Pipes / STDIN / STDOUT) =====
+// data[0] = length of payload (1..24 bytes)
+// data[1..3] = payload bytes
+inline std::uint64_t stream_make_header(std::uint32_t len) {
+    return static_cast<std::uint64_t>(len);
+}
+
+inline std::uint32_t stream_get_len(std::uint64_t data0) {
+    return static_cast<std::uint32_t>(data0 & 0xFFFFFFFFULL);
+}
+
+
 // Validates that a path is relative and does NOT contain ".." anywhere.
 // Ambient authority prevention: ".." traversal is strictly forbidden.
 inline bool vfs_is_valid_relative_path(const char* path) {

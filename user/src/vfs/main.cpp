@@ -98,6 +98,84 @@ static void extract_path(const oz::IPCMessage& msg, char* path, std::size_t max_
     path[i] = '\0';
 }
 
+struct FileSession {
+    oz::File* file{nullptr};
+    std::uint32_t vfs_ep{0};
+    std::uint64_t badge{0};
+    std::size_t offset{0};
+    bool in_use{false};
+};
+static constexpr std::size_t MAX_FILE_SESSIONS = 16;
+static FileSession file_sessions[MAX_FILE_SESSIONS] = {};
+
+static void handle_file_session_request(FileSession& sess) {
+    oz::IPCMessage req{};
+    if (!oz::sys_channel_recv(sess.vfs_ep, &req)) return;
+
+    auto cmd = oz::ipc::file_get_cmd(req.data[0]);
+    std::uint32_t req_len = oz::ipc::file_get_len(req.data[0]);
+    oz::IPCMessage resp{};
+
+    switch (cmd) {
+        case oz::ipc::FileCmd::READ: {
+            std::uint64_t offset = req.data[1];
+            if (offset != oz::ipc::FILE_STREAM_OFFSET) {
+                sess.offset = offset;
+            }
+            if (req_len == 0 || req_len > 24) req_len = 24;
+            sess.file->seek(sess.offset);
+
+            char buf[24] = {};
+            std::size_t bytes_read = sess.file->read(buf, req_len);
+            sess.offset += bytes_read;
+
+            resp.data[0] = oz::ipc::file_make_cmd(static_cast<oz::ipc::FileCmd>(oz::ipc::VfsStatus::OK), static_cast<std::uint32_t>(bytes_read));
+            oz::utils::memcpy(&resp.data[1], buf, bytes_read > 24 ? 24 : bytes_read);
+            break;
+        }
+        case oz::ipc::FileCmd::WRITE: {
+            std::uint64_t offset = req.data[1];
+            if (offset != oz::ipc::FILE_STREAM_OFFSET) {
+                sess.offset = offset;
+            }
+            if (req_len > 16) req_len = 16;
+            sess.file->seek(sess.offset);
+
+            char buf[16] = {};
+            oz::utils::memcpy(buf, &req.data[2], req_len);
+            std::size_t bytes_written = sess.file->write(buf, req_len);
+            sess.offset += bytes_written;
+
+            resp.data[0] = oz::ipc::file_make_cmd(static_cast<oz::ipc::FileCmd>(oz::ipc::VfsStatus::OK), static_cast<std::uint32_t>(bytes_written));
+            break;
+        }
+        case oz::ipc::FileCmd::GET_SIZE: {
+            resp.data[0] = static_cast<std::uint64_t>(oz::ipc::VfsStatus::OK);
+            resp.data[1] = sess.file->getSize();
+            break;
+        }
+        case oz::ipc::FileCmd::CLOSE: {
+            sess.file->close();
+            delete sess.file;
+            sess.file = nullptr;
+            oz::sys_channel_bind_notification(sess.vfs_ep, oz::INVALID_CAP_ID, 0);
+            oz::sys_cap_delete(sess.vfs_ep);
+            sess.vfs_ep = 0;
+            sess.in_use = false;
+            resp.data[0] = static_cast<std::uint64_t>(oz::ipc::VfsStatus::OK);
+            break;
+        }
+        default:
+            resp.data[0] = static_cast<std::uint64_t>(oz::ipc::VfsStatus::IO_ERROR);
+            break;
+    }
+
+    if (sess.vfs_ep != 0) {
+        oz::sys_channel_send(sess.vfs_ep, &resp);
+    }
+}
+
+
 extern "C" void _start() {
     oz::sys_write("VFS Server started!\n\r");
     
@@ -135,9 +213,33 @@ extern "C" void _start() {
         }
     }
 
+    // Initialize Notification for multi-endpoint event multiplexing
+    std::uint32_t notif_cap = oz::sys_notification_create(oz::CAP_UNTYPED);
+    if (notif_cap != oz::INVALID_CAP_ID) {
+        oz::sys_channel_bind_notification(CAP_CLIENT_RECV, notif_cap, 1ULL << 0);
+        oz::sys_write("VFS: Multi-endpoint Notification initialized.\n\r");
+    }
+
     // Main request loop
     oz::sys_write("VFS: Ready to serve file requests.\n\r");
     while (true) {
+        if (notif_cap != oz::INVALID_CAP_ID) {
+            std::uint64_t badge_mask = 0;
+            if (oz::sys_notification_wait(notif_cap, &badge_mask) != 0) continue;
+
+            // Handle dedicated file sessions (Bits 1..16)
+            for (std::size_t i = 0; i < MAX_FILE_SESSIONS; ++i) {
+                if (file_sessions[i].in_use && (badge_mask & file_sessions[i].badge)) {
+                    handle_file_session_request(file_sessions[i]);
+                }
+            }
+
+            // If bit 0 is not set, no request on CAP_CLIENT_RECV
+            if (!(badge_mask & (1ULL << 0))) {
+                continue;
+            }
+        }
+
         oz::IPCMessage req{};
         if (!oz::sys_channel_recv(CAP_CLIENT_RECV, &req)) continue;
 
@@ -201,18 +303,41 @@ extern "C" void _start() {
                     auto file = fat32.openFileAt(base_cluster, path);
                     if (file) {
                         std::size_t sz = file->getSize();
-                        int handle = alloc_handle(file.release());
+                        int handle = alloc_handle(file.get());
                         if (handle >= 0) {
-                            std::uint32_t vfs_ep = 0, client_ep = 0;
-                            if (oz::sys_channel_create(oz::CAP_UNTYPED, &vfs_ep, &client_ep)) {
-                                resp.data[0] = static_cast<std::uint64_t>(oz::ipc::VfsStatus::OK);
-                                resp.data[1] = static_cast<std::uint64_t>(handle);
-                                resp.data[2] = static_cast<std::uint64_t>(sz);
-                                resp.transferred_cap = client_ep;
-                                resp.has_cap = true;
-                                oz::sys_write("VFS: OPENAT File succeeded, transferred new Channel Cap.\n\r");
+                            int session_idx = -1;
+                            for (std::size_t s = 0; s < MAX_FILE_SESSIONS; ++s) {
+                                if (!file_sessions[s].in_use) {
+                                    session_idx = static_cast<int>(s);
+                                    break;
+                                }
+                            }
+                            if (session_idx >= 0) {
+                                std::uint32_t vfs_ep = 0, client_ep = 0;
+                                if (oz::sys_channel_create(oz::CAP_UNTYPED, &vfs_ep, &client_ep)) {
+                                    std::uint64_t badge = 1ULL << (1 + session_idx);
+                                    if (notif_cap != oz::INVALID_CAP_ID) {
+                                        oz::sys_channel_bind_notification(vfs_ep, notif_cap, badge);
+                                    }
+                                    file_sessions[session_idx].file = file.release();
+                                    file_sessions[session_idx].vfs_ep = vfs_ep;
+                                    file_sessions[session_idx].badge = badge;
+                                    file_sessions[session_idx].offset = 0;
+                                    file_sessions[session_idx].in_use = true;
+
+                                    resp.data[0] = static_cast<std::uint64_t>(oz::ipc::VfsStatus::OK);
+                                    resp.data[1] = static_cast<std::uint64_t>(handle);
+                                    resp.data[2] = static_cast<std::uint64_t>(sz);
+                                    resp.transferred_cap = client_ep;
+                                    resp.has_cap = true;
+                                    oz::sys_write("VFS: OPENAT File succeeded, created FileSession & transferred Cap.\n\r");
+                                } else {
+                                    free_handle(handle);
+                                    resp.data[0] = static_cast<std::uint64_t>(oz::ipc::VfsStatus::IO_ERROR);
+                                }
                             } else {
-                                resp.data[0] = static_cast<std::uint64_t>(oz::ipc::VfsStatus::IO_ERROR);
+                                free_handle(handle);
+                                resp.data[0] = static_cast<std::uint64_t>(oz::ipc::VfsStatus::TOO_MANY_OPEN);
                             }
                         } else {
                             resp.data[0] = static_cast<std::uint64_t>(oz::ipc::VfsStatus::TOO_MANY_OPEN);

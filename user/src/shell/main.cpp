@@ -3,6 +3,7 @@
 #include "../common/ipc/Protocol.hpp"
 #include "../common/ipc/StartupInfo.hpp"
 #include "../common/utils/utils.hpp"
+#include "../../lib/io.hpp"
 
 // Shell declares its requirements statically
 OZ_MANIFEST((oz::ProcessManifest{
@@ -211,6 +212,8 @@ struct CommandArgs {
     char args[MAX_ARGS][MAX_ARG_LEN]{};
     std::size_t argc{0};
 
+    char redirect_stdin[32]{};
+
     struct DelegatedFile {
         char path[32]{};
         std::uint32_t cap_slot{0};
@@ -242,11 +245,42 @@ struct CommandArgs {
 static bool parse_command_line(const char* line, CommandArgs& out) {
     out.argc = 0;
     out.num_delegated = 0;
+    out.redirect_stdin[0] = '\0';
 
     const char* p = line;
     while (*p) {
         while (*p == ' ' || *p == '\t') p++;
         if (*p == '\0') break;
+
+        // Check for STDIN redirect: < @"path" or < "path" or < path
+        if (*p == '<') {
+            p++;
+            while (*p == ' ' || *p == '\t') p++;
+            bool is_at_quote = false;
+            if (p[0] == '@' && p[1] == '\"') {
+                p += 2;
+                is_at_quote = true;
+            } else if (*p == '\"') {
+                p++;
+                is_at_quote = true;
+            }
+            std::size_t rlen = 0;
+            while (*p) {
+                if (is_at_quote && *p == '\"') {
+                    p++;
+                    break;
+                }
+                if (!is_at_quote && (*p == ' ' || *p == '\t' || *p == '\0')) {
+                    break;
+                }
+                if (rlen + 1 < sizeof(out.redirect_stdin)) {
+                    out.redirect_stdin[rlen++] = *p;
+                }
+                p++;
+            }
+            out.redirect_stdin[rlen] = '\0';
+            continue;
+        }
 
         if (out.argc >= CommandArgs::MAX_ARGS) break;
 
@@ -303,14 +337,20 @@ static bool parse_command_line(const char* line, CommandArgs& out) {
     return out.argc > 0;
 }
 
-static void execute_spawn(const CommandArgs& cmd_args) {
-    if (cmd_args.argc == 0) return;
+static std::size_t str_len(const char* s) {
+    std::size_t len = 0;
+    while (s && s[len]) len++;
+    return len;
+}
+
+static bool execute_spawn(const CommandArgs& cmd_args, std::uint32_t override_stdin_cap = 0, std::uint32_t override_stdout_cap = 0) {
+    if (cmd_args.argc == 0) return false;
 
     std::size_t prog_idx = 0;
     if (str_equals(cmd_args.args[0], "spawn")) {
         if (cmd_args.argc < 2) {
             oz::sys_write("Usage: spawn <binary> [args...]\n\r");
-            return;
+            return false;
         }
         prog_idx = 1;
     }
@@ -321,14 +361,14 @@ static void execute_spawn(const CommandArgs& cmd_args) {
         oz::sys_write("Cannot open executable: ");
         oz::sys_write(prog_name);
         oz::sys_write("\n\r");
-        return;
+        return false;
     }
 
     std::size_t sz = vfs_get_size(fd);
     if (sz == 0 || sz > 2 * 1024 * 1024) {
         oz::sys_write("Invalid executable size\n\r");
         vfs_close(fd);
-        return;
+        return false;
     }
 
     std::size_t pages = (sz + 4095) / 4096;
@@ -336,14 +376,14 @@ static void execute_spawn(const CommandArgs& cmd_args) {
     if (buf_frame == static_cast<std::uint32_t>(-1)) {
         oz::sys_write("Failed to allocate memory for executable\n\r");
         vfs_close(fd);
-        return;
+        return false;
     }
 
     static constexpr std::uint64_t STAGING_ADDR = 0x400000000000ULL;
     if (oz::sys_vspace_map_with_pagetables(oz::CAP_SELF_VSPACE, oz::CAP_UNTYPED, buf_frame, STAGING_ADDR, 0x01, pages * 4096) != 0) {
         oz::sys_write("Failed to map staging memory\n\r");
         vfs_close(fd);
-        return;
+        return false;
     }
 
     char* staging = reinterpret_cast<char*>(STAGING_ADDR);
@@ -353,7 +393,7 @@ static void execute_spawn(const CommandArgs& cmd_args) {
     if (read_bytes < sz) {
         oz::sys_write("Failed to read complete executable\n\r");
         oz::sys_vspace_unmap(oz::CAP_SELF_VSPACE, STAGING_ADDR);
-        return;
+        return false;
     }
 
     oz::ProcessManifest manifest{};
@@ -362,17 +402,48 @@ static void execute_spawn(const CommandArgs& cmd_args) {
     oz::ProcessStartupInfo startup_info{};
     std::uint32_t next_slot = 1;
 
-    // 1. Standard capabilities from Manifest
-    if (has_manifest) {
-        if (manifest.needs_console) {
-            startup_info.add_cap(next_slot++, oz::CapRole::STDOUT, "stdout");
-        }
-        if (manifest.needs_vfs_root) {
-            startup_info.add_cap(next_slot++, oz::CapRole::ROOT_DIR, "/");
+    // 1. Resolve STDIN capability (Override, Redirect, or Default)
+    std::uint32_t child_stdin_cap = 0;
+    std::uint32_t child_stdin_slot = 0;
+    if (override_stdin_cap != 0) {
+        child_stdin_slot = next_slot++;
+        child_stdin_cap = override_stdin_cap;
+        startup_info.add_cap(child_stdin_slot, oz::CapRole::STDIN, "stdin", oz::CapType::STREAM);
+    } else if (cmd_args.redirect_stdin[0] != '\0') {
+        auto res = vfs_openat(cmd_args.redirect_stdin, oz::ipc::VfsOpenFlags::FILE);
+        if (res.status == oz::ipc::VfsStatus::OK && res.transferred_cap != oz::INVALID_CAP_ID) {
+            child_stdin_slot = next_slot++;
+            child_stdin_cap = res.transferred_cap;
+            startup_info.add_cap(child_stdin_slot, oz::CapRole::STDIN, cmd_args.redirect_stdin, oz::CapType::FILE);
+            oz::sys_write("[Shell] STDIN redirected from: ");
+            oz::sys_write(cmd_args.redirect_stdin);
+            oz::sys_write("\n\r");
+        } else {
+            oz::sys_write("[Shell] Warning: Failed to open redirect file: ");
+            oz::sys_write(cmd_args.redirect_stdin);
+            oz::sys_write("\n\r");
         }
     }
 
-    // 2. Resolve delegated capabilities for @"path" arguments (Powerbox pattern!)
+    // 2. Resolve STDOUT capability (Override or Console)
+    std::uint32_t child_stdout_cap = 0;
+    std::uint32_t child_stdout_slot = 0;
+    if (override_stdout_cap != 0) {
+        child_stdout_slot = next_slot++;
+        child_stdout_cap = override_stdout_cap;
+        startup_info.add_cap(child_stdout_slot, oz::CapRole::STDOUT, "stdout", oz::CapType::STREAM);
+    } else if (has_manifest && manifest.needs_console) {
+        child_stdout_slot = next_slot++;
+        child_stdout_cap = CAP_CONSOLE_WRITE;
+        startup_info.add_cap(child_stdout_slot, oz::CapRole::STDOUT, "stdout", oz::CapType::STREAM);
+    }
+
+    // Standard root directory if requested
+    if (has_manifest && manifest.needs_vfs_root) {
+        startup_info.add_cap(next_slot++, oz::CapRole::ROOT_DIR, "/");
+    }
+
+    // 3. Resolve delegated capabilities for @"path" arguments (Powerbox pattern!)
     CommandArgs::DelegatedFile delegated_caps[CommandArgs::MAX_DELEGATED]{};
     std::size_t num_delegated_caps = 0;
 
@@ -381,7 +452,7 @@ static void execute_spawn(const CommandArgs& cmd_args) {
         auto res = vfs_openat(path, oz::ipc::VfsOpenFlags::FILE);
         if (res.status == oz::ipc::VfsStatus::OK && res.transferred_cap != oz::INVALID_CAP_ID) {
             std::uint32_t slot = next_slot++;
-            startup_info.add_cap(slot, oz::CapRole::CUSTOM, path);
+            startup_info.add_cap(slot, oz::CapRole::CUSTOM, path, oz::CapType::FILE);
             delegated_caps[num_delegated_caps].cap = res.transferred_cap;
             delegated_caps[num_delegated_caps].cap_slot = slot;
             for (std::size_t k = 0; k < sizeof(delegated_caps[num_delegated_caps].path); ++k) {
@@ -398,7 +469,7 @@ static void execute_spawn(const CommandArgs& cmd_args) {
         }
     }
 
-    // 3. Add arguments to StartupInfo (argv starting from program name)
+    // 4. Add arguments to StartupInfo (argv starting from program name)
     for (std::size_t i = prog_idx; i < cmd_args.argc; ++i) {
         startup_info.add_arg(cmd_args.args[i]);
     }
@@ -411,35 +482,106 @@ static void execute_spawn(const CommandArgs& cmd_args) {
     oz::sys_vspace_unmap(oz::CAP_SELF_VSPACE, STAGING_ADDR);
 
     if (proc.success) {
-        if (has_manifest) {
-            for (std::size_t i = 0; i < startup_info.num_caps; ++i) {
-                if (startup_info.caps[i].role == oz::CapRole::STDOUT) {
-                    oz::sys_cspace_cap_insert(proc.cspace_cap, startup_info.caps[i].slot, CAP_CONSOLE_WRITE, static_cast<std::uint32_t>(oz::CapRights::WRITE | oz::CapRights::GRANT));
-                }
-            }
-            // Insert delegated file capabilities into child's CSpace
-            for (std::size_t i = 0; i < num_delegated_caps; ++i) {
-                oz::sys_cspace_cap_insert(
-                    proc.cspace_cap,
-                    delegated_caps[i].cap_slot,
-                    delegated_caps[i].cap,
-                    static_cast<std::uint32_t>(oz::CapRights::READ | oz::CapRights::WRITE | oz::CapRights::GRANT)
-                );
-            }
-        } else {
+        if (child_stdin_cap != 0) {
+            oz::sys_cspace_cap_insert(proc.cspace_cap, child_stdin_slot, child_stdin_cap, static_cast<std::uint32_t>(oz::CapRights::READ | oz::CapRights::GRANT));
+        }
+        if (child_stdout_cap != 0) {
+            oz::sys_cspace_cap_insert(proc.cspace_cap, child_stdout_slot, child_stdout_cap, static_cast<std::uint32_t>(oz::CapRights::WRITE | oz::CapRights::GRANT));
+        }
+        if (!has_manifest) {
             // Forward console output capability to legacy slot 1
             oz::sys_cspace_cap_insert(proc.cspace_cap, 1, CAP_CONSOLE_WRITE, static_cast<std::uint32_t>(oz::CapRights::WRITE | oz::CapRights::GRANT));
+        }
+        // Insert delegated file capabilities into child's CSpace
+        for (std::size_t i = 0; i < num_delegated_caps; ++i) {
+            oz::sys_cspace_cap_insert(
+                proc.cspace_cap,
+                delegated_caps[i].cap_slot,
+                delegated_caps[i].cap,
+                static_cast<std::uint32_t>(oz::CapRights::READ | oz::CapRights::WRITE | oz::CapRights::GRANT)
+            );
         }
         oz::sys_tcb_resume(proc.tcb_cap);
         oz::sys_write("Spawned process: ");
         oz::sys_write(prog_name);
         oz::sys_write("\n\r");
+        return true;
     } else {
         oz::sys_write("Failed to spawn process\n\r");
+        return false;
     }
 }
 
+static bool execute_pipeline(const char* line) {
+    const char* pipe_pos = nullptr;
+    for (const char* p = line; *p; ++p) {
+        if (*p == '|') {
+            pipe_pos = p;
+            break;
+        }
+    }
+    if (!pipe_pos) return false;
+
+    char left_cmd[128]{};
+    char right_cmd[128]{};
+
+    std::size_t llen = pipe_pos - line;
+    if (llen >= sizeof(left_cmd)) llen = sizeof(left_cmd) - 1;
+    for (std::size_t i = 0; i < llen; ++i) left_cmd[i] = line[i];
+    left_cmd[llen] = '\0';
+
+    std::size_t rlen = 0;
+    const char* rp = pipe_pos + 1;
+    while (*rp && rlen + 1 < sizeof(right_cmd)) {
+        right_cmd[rlen++] = *rp++;
+    }
+    right_cmd[rlen] = '\0';
+
+    CommandArgs cmd_left{}, cmd_right{};
+    if (!parse_command_line(left_cmd, cmd_left) || !parse_command_line(right_cmd, cmd_right)) {
+        oz::sys_write("Pipeline syntax error\n\r");
+        return true;
+    }
+
+    std::uint32_t pipe_w = 0, pipe_r = 0;
+    if (!oz::sys_channel_create(oz::CAP_UNTYPED, &pipe_w, &pipe_r)) {
+        oz::sys_write("Failed to create pipeline channel\n\r");
+        return true;
+    }
+
+    oz::sys_write("[Pipeline] Created Channel pipe: write / read\n\r");
+
+    // Spawn right-side command first with pipe_r connected to STDIN
+    execute_spawn(cmd_right, pipe_r, 0);
+
+    // If left-side is "echo", write directly to pipe_w and close
+    if (str_equals(cmd_left.args[0], "echo")) {
+        for (std::size_t i = 1; i < cmd_left.argc; ++i) {
+            const char* arg = cmd_left.args[i];
+            oz::io::write_cap(pipe_w, arg, str_len(arg));
+            if (i + 1 < cmd_left.argc) {
+                oz::io::write_cap(pipe_w, " ", 1);
+            }
+        }
+        oz::io::write_cap(pipe_w, "\n\r", 2);
+        oz::sys_cap_delete(pipe_w); // Close write end to signal EOF to right-side
+    } else {
+        // Spawn left-side command with pipe_w connected to STDOUT
+        execute_spawn(cmd_left, 0, pipe_w);
+    }
+
+    return true;
+}
+
 static void execute_command(const char* line) {
+    line = skip_whitespace(line);
+    if (*line == '\0') return;
+
+    // Check for pipeline first: cmd1 | cmd2
+    if (execute_pipeline(line)) {
+        return;
+    }
+
     CommandArgs cmd_args{};
     if (!parse_command_line(line, cmd_args)) return;
 
@@ -453,6 +595,8 @@ static void execute_command(const char* line) {
         oz::sys_write("  cat <path>        - Display file contents via VFS\n\r");
         oz::sys_write("  spawn <bin> [args]- Load and execute ELF binary with Powerbox delegation\n\r");
         oz::sys_write("  echo <text>       - Echo text back to console\n\r");
+        oz::sys_write("  app < @\"file\"     - STDIN redirection with File Capability\n\r");
+        oz::sys_write("  app1 | app2       - Inter-process Channel pipeline\n\r");
     } else if (str_equals(cmd0, "clear")) {
         oz::sys_write("\033[2J\033[H");
     } else if (str_equals(cmd0, "echo")) {
@@ -469,32 +613,29 @@ static void execute_command(const char* line) {
             oz::sys_write("\n\r");
         }
     } else if (str_equals(cmd0, "cat")) {
-        if (cmd_args.argc < 2) {
-            oz::sys_write("Usage: cat <path>\n\r");
-            return;
+        // Built-in fallback cat or spawn cat
+        if (cmd_args.argc > 1) {
+            const char* path = cmd_args.args[1];
+            int fd = vfs_open(path);
+            if (fd >= 0) {
+                std::size_t sz = vfs_get_size(fd);
+                alignas(8) char read_buf[512];
+                std::size_t offset = 0;
+                while (offset < sz) {
+                    std::size_t to_read = sz - offset;
+                    if (to_read > sizeof(read_buf) - 1) to_read = sizeof(read_buf) - 1;
+                    std::size_t n = vfs_read(fd, offset, read_buf, to_read);
+                    if (n == 0) break;
+                    read_buf[n] = '\0';
+                    oz::sys_write(read_buf);
+                    offset += n;
+                }
+                vfs_close(fd);
+                oz::sys_write("\n\r");
+                return;
+            }
         }
-        const char* path = cmd_args.args[1];
-        int fd = vfs_open(path);
-        if (fd < 0) {
-            oz::sys_write("Cannot open file: ");
-            oz::sys_write(path);
-            oz::sys_write("\n\r");
-            return;
-        }
-        std::size_t sz = vfs_get_size(fd);
-        alignas(8) char read_buf[512];
-        std::size_t offset = 0;
-        while (offset < sz) {
-            std::size_t to_read = sz - offset;
-            if (to_read > sizeof(read_buf) - 1) to_read = sizeof(read_buf) - 1;
-            std::size_t n = vfs_read(fd, offset, read_buf, to_read);
-            if (n == 0) break;
-            read_buf[n] = '\0';
-            oz::sys_write(read_buf);
-            offset += n;
-        }
-        vfs_close(fd);
-        oz::sys_write("\n\r");
+        execute_spawn(cmd_args);
     } else if (str_equals(cmd0, "spawn")) {
         execute_spawn(cmd_args);
     } else {

@@ -813,7 +813,33 @@ extern "C" void _start() {
         oz::sys_debug_print("[Init] ERROR: manifest_test not found in initrd!\n\r");
     }
 
+    // ========================================================================
+    // Step 3 & 4 Verification: Sandboxed cat process with delegated FileCap
+    // ========================================================================
+
+    oz::sys_debug_print("[Init] Testing Sandboxed 'cat' execution with FileCap...\n\r");
+    oz::loader::TarFile cat_file = oz::loader::tar_find_file(initrd_ptr, initrd_size, "cat");
+    if (cat_file.data) {
+        auto res = vfs_openat(CAP_VFS_SEND, CAP_VFS_RECV, "test.txt", oz::ipc::VfsOpenFlags::FILE);
+        if (res.status == oz::ipc::VfsStatus::OK && res.transferred_cap != oz::INVALID_CAP_ID) {
+            oz::ProcessStartupInfo cat_startup{};
+            cat_startup.add_cap(1, oz::CapRole::STDOUT, "stdout", oz::CapType::STREAM);
+            cat_startup.add_cap(2, oz::CapRole::CUSTOM, "test.txt", oz::CapType::FILE);
+            cat_startup.add_arg("cat");
+            cat_startup.add_arg("test.txt");
+
+            auto cat_proc = oz::loader::spawn_process(oz::CAP_UNTYPED, oz::CAP_SELF_VSPACE, cat_file.data, cat_file.size, &cat_startup);
+            if (cat_proc.success) {
+                oz::sys_cspace_cap_insert(cat_proc.cspace_cap, 1, cons_send, static_cast<std::uint32_t>(oz::CapRights::WRITE | oz::CapRights::GRANT));
+                oz::sys_cspace_cap_insert(cat_proc.cspace_cap, 2, res.transferred_cap, static_cast<std::uint32_t>(oz::CapRights::READ | oz::CapRights::WRITE | oz::CapRights::GRANT));
+                oz::sys_tcb_resume(cat_proc.tcb_cap);
+                oz::sys_debug_print("[Init] Sandboxed cat process spawned successfully with FileCap!\n\r");
+            }
+        }
+    }
+
     oz::sys_write("Init process completed. Idling...\n\r");
+
 
     while (true) {
         __asm__ volatile("pause");

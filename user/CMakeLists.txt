@@ -64,9 +64,20 @@ add_executable(manifest_test src/manifest_test/main.cpp src/manifest_test/linker
 target_link_libraries(manifest_test oz_syscall)
 target_link_options(manifest_test PRIVATE "-T${CMAKE_CURRENT_SOURCE_DIR}/src/manifest_test/linker.ld" "-nostdlib" "-static")
 
+# cat process (Sandboxed CLI reader)
+add_executable(cat src/cat/main.cpp src/cat/linker.ld)
+target_link_libraries(cat oz_syscall)
+target_link_options(cat PRIVATE "-T${CMAKE_CURRENT_SOURCE_DIR}/src/cat/linker.ld" "-nostdlib" "-static")
+
+# head process (Sandboxed CLI head)
+add_executable(head src/head/main.cpp src/head/linker.ld)
+target_link_libraries(head oz_syscall)
+target_link_options(head PRIVATE "-T${CMAKE_CURRENT_SOURCE_DIR}/src/head/linker.ld" "-nostdlib" "-static")
+
 add_custom_target(initrd ALL
-    COMMAND tar -cvf ${CMAKE_SOURCE_DIR}/assets/initrd.tar -C ${CMAKE_CURRENT_BINARY_DIR} init console vfs ahci xhci display shell manifest_test
-    DEPENDS init console vfs ahci xhci display shell manifest_test
+    COMMAND tar -cvf ${CMAKE_SOURCE_DIR}/assets/initrd.tar -C ${CMAKE_CURRENT_BINARY_DIR} init console vfs ahci xhci display shell manifest_test cat head
+    DEPENDS init console vfs ahci xhci display shell manifest_test cat head
 )
 target_sources(oz_syscall PRIVATE lib/malloc.cpp)
+
 

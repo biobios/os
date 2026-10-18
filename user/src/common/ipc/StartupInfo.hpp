@@ -43,9 +43,16 @@ enum class CapRole : std::uint32_t {
     CUSTOM       = 8, // Named custom service / channel
 };
 
+enum class CapType : std::uint32_t {
+    STREAM  = 0, // Byte stream channel (Pipe, Console, STDIN/STDOUT)
+    FILE    = 1, // Dedicated VFS File Channel (RPC FileCmd)
+    DIR     = 2, // Directory Channel
+};
+
 struct StartupCapEntry {
     std::uint32_t slot{0};       // Slot ID in child's CSpace
     CapRole       role{CapRole::NONE};
+    CapType       type{CapType::STREAM};
     char          name[32]{};    // Logical name (e.g. "stdin", "/", "memo.txt")
 };
 
@@ -89,10 +96,11 @@ struct ProcessStartupInfo {
     }
 
     // Helper: add capability to startup info
-    bool add_cap(std::uint32_t slot, CapRole role, const char* name_str) {
+    bool add_cap(std::uint32_t slot, CapRole role, const char* name_str, CapType type = CapType::STREAM) {
         if (num_caps >= MAX_CAPS) return false;
         caps[num_caps].slot = slot;
         caps[num_caps].role = role;
+        caps[num_caps].type = type;
         std::size_t i = 0;
         if (name_str) {
             for (; i < sizeof(caps[num_caps].name) - 1 && name_str[i] != '\0'; ++i) {
@@ -156,6 +164,36 @@ public:
         if (!g_info) return fallback;
         std::uint32_t slot = g_info->find_slot_by_name(name);
         return (slot != 0) ? slot : fallback;
+    }
+
+    static CapType get_cap_type(std::uint32_t slot) {
+        if (!g_info) return CapType::STREAM;
+        for (std::size_t i = 0; i < g_info->num_caps; ++i) {
+            if (g_info->caps[i].slot == slot) return g_info->caps[i].type;
+        }
+        return CapType::STREAM;
+    }
+
+    static const StartupCapEntry* get_cap_entry(CapRole role) {
+        if (!g_info) return nullptr;
+        for (std::size_t i = 0; i < g_info->num_caps; ++i) {
+            if (g_info->caps[i].role == role) return &g_info->caps[i];
+        }
+        return nullptr;
+    }
+
+    static const StartupCapEntry* get_cap_entry(const char* name) {
+        if (!g_info || !name) return nullptr;
+        for (std::size_t i = 0; i < g_info->num_caps; ++i) {
+            const char* a = g_info->caps[i].name;
+            const char* b = name;
+            bool match = true;
+            while (*a && *b) {
+                if (*a++ != *b++) { match = false; break; }
+            }
+            if (match && *a == *b) return &g_info->caps[i];
+        }
+        return nullptr;
     }
 
     static std::uint32_t get_argc() {
