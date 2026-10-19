@@ -257,6 +257,40 @@ void sync_state_to_display() {
     oz::sys_debug_print("[WM] sync_state_to_display: done\n\r");
 }
 
+// Fast update focus borders and status bar without full recomposition
+void update_focus(std::uint32_t old_focused_id, std::uint32_t new_focused_id) {
+    if (old_focused_id == new_focused_id) return;
+
+    // 1. Update old focused window border to inactive (Dim Slate)
+    if (old_focused_id != 0) {
+        auto* old_win = g_wm.get_window(old_focused_id);
+        if (old_win && old_win->surface_id != 0) {
+            oz::IPCMessage border_msg{};
+            border_msg.data[0] = static_cast<std::uint64_t>(oz::ipc::DisplayCmd::SET_SURFACE_BORDER);
+            border_msg.data[1] = old_win->surface_id;
+            border_msg.data[2] = oz::wm::BORDER_THICKNESS;
+            border_msg.data[3] = 0x00444444; // Inactive
+            oz::sys_channel_send(CAP_DISPLAY_SEND, &border_msg);
+        }
+    }
+
+    // 2. Update new focused window border to active (Cyan)
+    if (new_focused_id != 0) {
+        auto* new_win = g_wm.get_window(new_focused_id);
+        if (new_win && new_win->surface_id != 0) {
+            oz::IPCMessage border_msg{};
+            border_msg.data[0] = static_cast<std::uint64_t>(oz::ipc::DisplayCmd::SET_SURFACE_BORDER);
+            border_msg.data[1] = new_win->surface_id;
+            border_msg.data[2] = oz::wm::BORDER_THICKNESS;
+            border_msg.data[3] = 0x0000FFFF; // Cyan (Active)
+            oz::sys_channel_send(CAP_DISPLAY_SEND, &border_msg);
+        }
+    }
+
+    // 3. Update top status bar with new active window title
+    render_status_bar(/* auto_commit = */ true);
+}
+
 // Handle Keyboard Input from xHCI
 void handle_key_input(char ascii, std::uint8_t scancode, std::uint32_t modifiers) {
     bool mod_down = (modifiers & (static_cast<std::uint32_t>(oz::ipc::WMModifier::SUPER) |
@@ -285,26 +319,15 @@ void handle_key_input(char ascii, std::uint8_t scancode, std::uint32_t modifiers
             return;
         }
 
-        // Focus navigation: Super + h/j/k/l
-        if (ascii == 'h') {
-            oz::sys_debug_print("[WM] Hotkey: Focus LEFT\n\r");
-            g_wm.move_focus(oz::wm::Direction::LEFT);
-            sync_state_to_display();
-            return;
-        } else if (ascii == 'l') {
-            oz::sys_debug_print("[WM] Hotkey: Focus RIGHT\n\r");
-            g_wm.move_focus(oz::wm::Direction::RIGHT);
-            sync_state_to_display();
-            return;
-        } else if (ascii == 'k') {
-            oz::sys_debug_print("[WM] Hotkey: Focus UP\n\r");
-            g_wm.move_focus(oz::wm::Direction::UP);
-            sync_state_to_display();
-            return;
-        } else if (ascii == 'j') {
-            oz::sys_debug_print("[WM] Hotkey: Focus DOWN\n\r");
-            g_wm.move_focus(oz::wm::Direction::DOWN);
-            sync_state_to_display();
+        // Fast Focus navigation: Super + h/j/k/l
+        if (ascii == 'h' || ascii == 'l' || ascii == 'k' || ascii == 'j') {
+            std::uint32_t old_id = g_wm.focused_window_id();
+            if (ascii == 'h') g_wm.move_focus(oz::wm::Direction::LEFT);
+            else if (ascii == 'l') g_wm.move_focus(oz::wm::Direction::RIGHT);
+            else if (ascii == 'k') g_wm.move_focus(oz::wm::Direction::UP);
+            else if (ascii == 'j') g_wm.move_focus(oz::wm::Direction::DOWN);
+            std::uint32_t new_id = g_wm.focused_window_id();
+            update_focus(old_id, new_id);
             return;
         }
 
@@ -489,13 +512,10 @@ extern "C" void _start() {
         }
 
         if (badge & BADGE_WM) {
-            oz::sys_debug_print("[WM] Notification received BADGE_WM!\n\r");
             oz::IPCMessage req{};
             if (!oz::sys_channel_recv(CAP_WM_RECV, &req)) {
-                oz::sys_debug_print("[WM] sys_channel_recv on CAP_WM_RECV failed!\n\r");
                 continue;
             }
-            oz::sys_debug_print("[WM] Received IPC request successfully!\n\r");
 
             // Distinguish between Keyboard Event from xHCI vs WM IPC Command
             if (req.data[0] == static_cast<std::uint64_t>(oz::ipc::WMEventType::KEY_DOWN)) {
@@ -508,11 +528,6 @@ extern "C" void _start() {
 
             // Otherwise, it's a WM IPC Command
             auto cmd = static_cast<oz::ipc::WMCmd>(req.data[0] & 0xFFFFFFFFULL);
-            oz::sys_debug_print("[WM] Processing command ID: ");
-            char c_buf[5] = {static_cast<char>('0' + (static_cast<std::uint32_t>(cmd) / 10)),
-                             static_cast<char>('0' + (static_cast<std::uint32_t>(cmd) % 10)),
-                             '\n', '\r', '\0'};
-            oz::sys_debug_print(c_buf);
             oz::IPCMessage resp{};
             std::uint32_t reply_endpoint = (req.has_cap && cmd != oz::ipc::WMCmd::BIND_INPUT_CHANNEL) ? req.transferred_cap : 0;
 
@@ -603,8 +618,14 @@ extern "C" void _start() {
                     std::uint32_t win_id = static_cast<std::uint32_t>(req.data[1]);
                     auto* win = g_wm.get_window(win_id);
                     if (win) {
-                        g_wm.switch_workspace(win->workspace_idx);
-                        sync_state_to_display();
+                        std::uint32_t old_id = g_wm.focused_window_id();
+                        if (win->workspace_idx != g_wm.active_workspace()) {
+                            g_wm.switch_workspace(win->workspace_idx);
+                            sync_state_to_display();
+                        } else {
+                            g_wm.set_focused_window_id(win_id);
+                            update_focus(old_id, win_id);
+                        }
                         resp.data[0] = 0;
                     } else {
                         resp.data[0] = 1;

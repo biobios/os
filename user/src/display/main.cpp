@@ -60,6 +60,14 @@ public:
         return true;
     }
 
+    Pixel getPixel(std::int32_t x, std::int32_t y) const {
+        if (!back_buffer_ || x < 0 || y < 0 ||
+            static_cast<std::uint32_t>(x) >= width_ || static_cast<std::uint32_t>(y) >= height_) {
+            return Pixel{0, 0, 0, 0};
+        }
+        return back_buffer_[static_cast<std::uint32_t>(y) * width_ + static_cast<std::uint32_t>(x)];
+    }
+
     void putPixel(std::uint32_t x, std::uint32_t y, Pixel color) {
         if (!back_buffer_ || x >= width_ || y >= height_) return;
         back_buffer_[y * width_ + x] = color;
@@ -85,9 +93,19 @@ public:
 
         std::uint32_t ux = static_cast<std::uint32_t>(x);
         std::uint32_t uy = static_cast<std::uint32_t>(y);
+        std::uint32_t p_val = *reinterpret_cast<const std::uint32_t*>(&color);
+        std::uint64_t p_pair = (static_cast<std::uint64_t>(p_val) << 32) | p_val;
+
         for (std::uint32_t cy = uy; cy < uy + h; ++cy) {
-            for (std::uint32_t cx = ux; cx < ux + w; ++cx) {
-                back_buffer_[cy * width_ + cx] = color;
+            Pixel* row = &back_buffer_[cy * width_ + ux];
+            std::uint32_t cx = 0;
+            // 64-bit pair fill
+            while (cx + 1 < w) {
+                *reinterpret_cast<std::uint64_t*>(&row[cx]) = p_pair;
+                cx += 2;
+            }
+            if (cx < w) {
+                row[cx] = color;
             }
         }
     }
@@ -97,35 +115,49 @@ public:
     }
 
     void blit(std::int32_t dst_x, std::int32_t dst_y, const Pixel* src, std::uint32_t src_w, std::uint32_t src_h,
-              std::uint32_t max_w = 0, std::uint32_t max_h = 0) {
+              std::uint32_t max_w = 0, std::uint32_t max_h = 0,
+              std::uint32_t sub_x = 0, std::uint32_t sub_y = 0,
+              std::uint32_t sub_w = 0, std::uint32_t sub_h = 0) {
         if (!back_buffer_ || !src) return;
 
-        std::int32_t start_x = (dst_x < 0) ? -dst_x : 0;
-        std::int32_t start_y = (dst_y < 0) ? -dst_y : 0;
+        std::uint32_t eff_sub_w = (sub_w > 0) ? sub_w : src_w;
+        std::uint32_t eff_sub_h = (sub_h > 0) ? sub_h : src_h;
+        if (sub_x >= src_w || sub_y >= src_h) return;
+        if (sub_x + eff_sub_w > src_w) eff_sub_w = src_w - sub_x;
+        if (sub_y + eff_sub_h > src_h) eff_sub_h = src_h - sub_y;
 
-        std::int32_t end_x = static_cast<std::int32_t>(src_w);
-        if (max_w > 0 && end_x > static_cast<std::int32_t>(max_w)) {
-            end_x = static_cast<std::int32_t>(max_w);
+        std::int32_t render_dst_x = dst_x + static_cast<std::int32_t>(sub_x);
+        std::int32_t render_dst_y = dst_y + static_cast<std::int32_t>(sub_y);
+
+        std::int32_t start_x = (render_dst_x < 0) ? -render_dst_x : 0;
+        std::int32_t start_y = (render_dst_y < 0) ? -render_dst_y : 0;
+
+        std::int32_t end_x = static_cast<std::int32_t>(eff_sub_w);
+        if (max_w > 0 && sub_x + eff_sub_w > max_w) {
+            std::int32_t avail = static_cast<std::int32_t>(max_w) - static_cast<std::int32_t>(sub_x);
+            if (avail < end_x) end_x = (avail > 0) ? avail : 0;
         }
-        if (dst_x + end_x > static_cast<std::int32_t>(width_)) {
-            end_x = static_cast<std::int32_t>(width_) - dst_x;
+        if (render_dst_x + end_x > static_cast<std::int32_t>(width_)) {
+            end_x = static_cast<std::int32_t>(width_) - render_dst_x;
         }
-        std::int32_t end_y = static_cast<std::int32_t>(src_h);
-        if (max_h > 0 && end_y > static_cast<std::int32_t>(max_h)) {
-            end_y = static_cast<std::int32_t>(max_h);
+
+        std::int32_t end_y = static_cast<std::int32_t>(eff_sub_h);
+        if (max_h > 0 && sub_y + eff_sub_h > max_h) {
+            std::int32_t avail = static_cast<std::int32_t>(max_h) - static_cast<std::int32_t>(sub_y);
+            if (avail < end_y) end_y = (avail > 0) ? avail : 0;
         }
-        if (dst_y + end_y > static_cast<std::int32_t>(height_)) {
-            end_y = static_cast<std::int32_t>(height_) - dst_y;
+        if (render_dst_y + end_y > static_cast<std::int32_t>(height_)) {
+            end_y = static_cast<std::int32_t>(height_) - render_dst_y;
         }
 
         std::int32_t copy_w = end_x - start_x;
         if (copy_w <= 0) return;
 
         for (std::int32_t sy = start_y; sy < end_y; ++sy) {
-            std::int32_t dy = dst_y + sy;
+            std::int32_t dy = render_dst_y + sy;
             if (dy < 0 || dy >= static_cast<std::int32_t>(height_)) continue;
-            std::size_t dst_offset = static_cast<std::size_t>(dy) * width_ + static_cast<std::size_t>(dst_x + start_x);
-            std::size_t src_offset = static_cast<std::size_t>(sy) * src_w + static_cast<std::size_t>(start_x);
+            std::size_t dst_offset = static_cast<std::size_t>(dy) * width_ + static_cast<std::size_t>(render_dst_x + start_x);
+            std::size_t src_offset = static_cast<std::size_t>(sub_y + sy) * src_w + static_cast<std::size_t>(sub_x + start_x);
             __builtin_memcpy(&back_buffer_[dst_offset], &src[src_offset], static_cast<std::size_t>(copy_w) * sizeof(Pixel));
         }
     }
@@ -158,9 +190,9 @@ public:
             return;
         }
         for (std::uint32_t cy = y; cy < y + h - lines; ++cy) {
-            for (std::uint32_t cx = x; cx < x + w; ++cx) {
-                back_buffer_[cy * width_ + cx] = back_buffer_[(cy + lines) * width_ + cx];
-            }
+            std::size_t dst_offset = static_cast<std::size_t>(cy) * width_ + x;
+            std::size_t src_offset = static_cast<std::size_t>(cy + lines) * width_ + x;
+            __builtin_memcpy(&back_buffer_[dst_offset], &back_buffer_[src_offset], static_cast<std::size_t>(w) * sizeof(Pixel));
         }
         fillRect(x, y + h - lines, w, lines, bg);
     }
@@ -183,6 +215,15 @@ public:
         if (static_cast<std::uint32_t>(x) + w > width_) w = width_ - static_cast<std::uint32_t>(x);
         if (static_cast<std::uint32_t>(y) + h > height_) h = height_ - static_cast<std::uint32_t>(y);
         if (w == 0 || h == 0) return;
+
+        // If flushing entire screen width continuously, copy in a single memcpy
+        if (x == 0 && w == width_) {
+            std::size_t offset = static_cast<std::size_t>(y) * width_;
+            Pixel* dst = fb_ + offset;
+            const Pixel* src = back_buffer_ + offset;
+            __builtin_memcpy(dst, src, static_cast<std::size_t>(h) * width_ * sizeof(Pixel));
+            return;
+        }
 
         for (std::uint32_t r = 0; r < h; ++r) {
             std::size_t offset = static_cast<std::size_t>(static_cast<std::uint32_t>(y) + r) * width_ + static_cast<std::uint32_t>(x);
@@ -415,6 +456,70 @@ bool has_active_surfaces() {
     return false;
 }
 
+static Pixel g_cursor_backup[16][16] = {};
+static std::int32_t g_saved_cursor_x = -1;
+static std::int32_t g_saved_cursor_y = -1;
+static bool g_cursor_has_backup = false;
+
+void restoreCursorBackground(DisplayDriver& disp) {
+    if (!g_cursor_has_backup) return;
+    for (int r = 0; r < 16; ++r) {
+        for (int c = 0; c < 16; ++c) {
+            disp.putPixel(g_saved_cursor_x + c, g_saved_cursor_y + r, g_cursor_backup[r][c]);
+        }
+    }
+    g_cursor_has_backup = false;
+}
+
+void saveAndDrawCursor(DisplayDriver& disp, std::int32_t x, std::int32_t y) {
+    if (!g_cursor_visible) return;
+    for (int r = 0; r < 16; ++r) {
+        for (int c = 0; c < 16; ++c) {
+            g_cursor_backup[r][c] = disp.getPixel(x + c, y + r);
+        }
+    }
+    g_saved_cursor_x = x;
+    g_saved_cursor_y = y;
+    g_cursor_has_backup = true;
+
+    drawCursor(disp, x, y);
+}
+
+void drawSurfaceBorders(DisplayDriver& disp, const Surface& surf) {
+    if (surf.id == 0 || !surf.visible || surf.border_width == 0) return;
+    std::uint32_t draw_w = (surf.rect_w > 0) ? surf.rect_w : surf.width;
+    std::uint32_t draw_h = (surf.rect_h > 0) ? surf.rect_h : surf.height;
+    std::int32_t bw = static_cast<std::int32_t>(surf.border_width);
+
+    // Top edge
+    disp.fillRect(surf.x - bw, surf.y - bw, draw_w + 2 * bw, bw, surf.border_color);
+    disp.flush(surf.x - bw, surf.y - bw, draw_w + 2 * bw, bw);
+
+    // Bottom edge
+    disp.fillRect(surf.x - bw, surf.y + static_cast<std::int32_t>(draw_h), draw_w + 2 * bw, bw, surf.border_color);
+    disp.flush(surf.x - bw, surf.y + static_cast<std::int32_t>(draw_h), draw_w + 2 * bw, bw);
+
+    // Left edge
+    disp.fillRect(surf.x - bw, surf.y, bw, draw_h, surf.border_color);
+    disp.flush(surf.x - bw, surf.y, bw, draw_h);
+
+    // Right edge
+    disp.fillRect(surf.x + static_cast<std::int32_t>(draw_w), surf.y, bw, draw_h, surf.border_color);
+    disp.flush(surf.x + static_cast<std::int32_t>(draw_w), surf.y, bw, draw_h);
+}
+
+void renderSurfaceSubRect(DisplayDriver& disp, const Surface& surf,
+                          std::uint32_t sub_x, std::uint32_t sub_y,
+                          std::uint32_t sub_w, std::uint32_t sub_h) {
+    if (surf.id == 0 || !surf.visible || !surf.buffer) return;
+
+    std::uint32_t draw_w = (surf.rect_w > 0) ? surf.rect_w : surf.width;
+    std::uint32_t draw_h = (surf.rect_h > 0) ? surf.rect_h : surf.height;
+
+    disp.blit(surf.x, surf.y, surf.buffer, surf.width, surf.height,
+              draw_w, draw_h, sub_x, sub_y, sub_w, sub_h);
+}
+
 void renderSurface(DisplayDriver& disp, const Surface& surf, bool render_border = true) {
     if (surf.id == 0 || !surf.visible || !surf.buffer) return;
 
@@ -447,17 +552,9 @@ void renderSurface(DisplayDriver& disp, const Surface& surf, bool render_border 
     disp.blit(surf.x, surf.y, surf.buffer, surf.width, surf.height, draw_w, draw_h);
 }
 
-bool drawCursorIfInRect(DisplayDriver& disp, std::int32_t rx, std::int32_t ry, std::uint32_t rw, std::uint32_t rh) {
-    if (!g_cursor_visible) return false;
-    if (g_cursor_x + 11 >= rx && g_cursor_x < static_cast<std::int32_t>(rx + rw) &&
-        g_cursor_y + 16 >= ry && g_cursor_y < static_cast<std::int32_t>(ry + rh)) {
-        drawCursor(disp, g_cursor_x, g_cursor_y);
-        return true;
-    }
-    return false;
-}
-
 void compose(DisplayDriver& disp) {
+    g_cursor_has_backup = false;
+
     // 1. Render desktop background into BackBuffer
     renderDesktop(disp);
 
@@ -477,7 +574,7 @@ void compose(DisplayDriver& disp) {
 
     // 4. Render cursor on top
     if (g_cursor_visible) {
-        drawCursor(disp, g_cursor_x, g_cursor_y);
+        saveAndDrawCursor(disp, g_cursor_x, g_cursor_y);
     }
 }
 
@@ -564,11 +661,6 @@ extern "C" void _start() {
             }
 
             auto cmd = static_cast<oz::ipc::DisplayCmd>(req.data[0] & 0xFFFFFFFFULL);
-            oz::sys_debug_print("[Display] Handling DisplayCmd ID: ");
-            char c_buf[5] = {static_cast<char>('0' + (static_cast<std::uint32_t>(cmd) / 10)),
-                             static_cast<char>('0' + (static_cast<std::uint32_t>(cmd) % 10)),
-                             '\n', '\r', '\0'};
-            oz::sys_debug_print(c_buf);
             oz::IPCMessage resp{};
             std::uint32_t reply_endpoint = req.has_cap ? req.transferred_cap : 0;
 
@@ -635,16 +727,51 @@ extern "C" void _start() {
                                 break;
                             }
 
-                            // 2. Client commit: blit surface content (border remains intact)
-                            renderSurface(g_display, surf, /* render_border = */ false);
-
                             std::uint32_t draw_w = (surf.rect_w > 0) ? surf.rect_w : surf.width;
                             std::uint32_t draw_h = (surf.rect_h > 0) ? surf.rect_h : surf.height;
 
-                            bool cursor_drawn = drawCursorIfInRect(g_display, surf.x, surf.y, draw_w, draw_h);
-                            g_display.flush(surf.x, surf.y, draw_w, draw_h);
-                            if (cursor_drawn) {
-                                // Flush full cursor bounding box (16x16) to prevent edge clipping
+                            std::uint32_t dirty_x = static_cast<std::uint32_t>(req.data[2] >> 32);
+                            std::uint32_t dirty_y = static_cast<std::uint32_t>(req.data[2] & 0xFFFFFFFFULL);
+                            std::uint32_t dirty_w = static_cast<std::uint32_t>(req.data[3] >> 32);
+                            std::uint32_t dirty_h = static_cast<std::uint32_t>(req.data[3] & 0xFFFFFFFFULL);
+
+                            if (dirty_w == 0 || dirty_h == 0) {
+                                dirty_x = 0;
+                                dirty_y = 0;
+                                dirty_w = draw_w;
+                                dirty_h = draw_h;
+                            }
+
+                            if (dirty_x >= draw_w || dirty_y >= draw_h) {
+                                resp.data[0] = 0;
+                                break;
+                            }
+                            if (dirty_x + dirty_w > draw_w) dirty_w = draw_w - dirty_x;
+                            if (dirty_y + dirty_h > draw_h) dirty_h = draw_h - dirty_y;
+
+                            std::int32_t flush_x = surf.x + static_cast<std::int32_t>(dirty_x);
+                            std::int32_t flush_y = surf.y + static_cast<std::int32_t>(dirty_y);
+
+                            // Check if mouse cursor intersects with dirty rect
+                            bool cursor_overlap = false;
+                            if (g_cursor_visible && g_cursor_has_backup) {
+                                if (g_cursor_x + 16 > flush_x && g_cursor_x < flush_x + static_cast<std::int32_t>(dirty_w) &&
+                                    g_cursor_y + 16 > flush_y && g_cursor_y < flush_y + static_cast<std::int32_t>(dirty_h)) {
+                                    cursor_overlap = true;
+                                    restoreCursorBackground(g_display);
+                                }
+                            }
+
+                            // 2. Client commit: blit only dirty rect into BackBuffer
+                            renderSurfaceSubRect(g_display, surf, dirty_x, dirty_y, dirty_w, dirty_h);
+
+                            if (cursor_overlap) {
+                                saveAndDrawCursor(g_display, g_cursor_x, g_cursor_y);
+                            }
+
+                            // 3. Flush only dirty rect to physical VRAM
+                            g_display.flush(flush_x, flush_y, dirty_w, dirty_h);
+                            if (cursor_overlap) {
                                 g_display.flush(g_cursor_x, g_cursor_y, 16, 16);
                             }
                         } else {
@@ -703,16 +830,32 @@ extern "C" void _start() {
                         break;
                     }
                     case oz::ipc::DisplayCmd::UPDATE_CURSOR: {
-                        std::int32_t old_x = g_cursor_x;
-                        std::int32_t old_y = g_cursor_y;
-                        g_cursor_x = static_cast<std::int32_t>(req.data[1] >> 32);
-                        g_cursor_y = static_cast<std::int32_t>(req.data[1] & 0xFFFFFFFFULL);
-                        g_cursor_visible = (req.data[2] != 0);
+                        std::int32_t new_x = static_cast<std::int32_t>(req.data[1] >> 32);
+                        std::int32_t new_y = static_cast<std::int32_t>(req.data[1] & 0xFFFFFFFFULL);
+                        bool new_vis = (req.data[2] != 0);
 
-                        // Recompose BackBuffer and flush only old and new 16x16 cursor bounding boxes
-                        compose(g_display);
-                        g_display.flush(old_x, old_y, 16, 16);
-                        g_display.flush(g_cursor_x, g_cursor_y, 16, 16);
+                        std::int32_t old_x = g_saved_cursor_x;
+                        std::int32_t old_y = g_saved_cursor_y;
+
+                        // 1. Restore previous cursor background in BackBuffer (NO compose()!!)
+                        restoreCursorBackground(g_display);
+
+                        g_cursor_x = new_x;
+                        g_cursor_y = new_y;
+                        g_cursor_visible = new_vis;
+
+                        // 2. Save new background and draw cursor in BackBuffer
+                        if (g_cursor_visible) {
+                            saveAndDrawCursor(g_display, g_cursor_x, g_cursor_y);
+                        }
+
+                        // 3. High-speed flush of only old and new 16x16 cursor bounding boxes
+                        if (old_x >= 0 && old_y >= 0) {
+                            g_display.flush(old_x, old_y, 16, 16);
+                        }
+                        if (g_cursor_visible) {
+                            g_display.flush(g_cursor_x, g_cursor_y, 16, 16);
+                        }
                         resp.data[0] = 0;
                         break;
                     }
@@ -734,6 +877,10 @@ extern "C" void _start() {
                                 static_cast<std::uint8_t>((col >> 16) & 0xFF),
                                 static_cast<std::uint8_t>((col >> 24) & 0xFF)
                             };
+                            // Fast path: if visible and borders defined, update borders immediately
+                            if (g_surfaces[idx].visible && g_surfaces[idx].border_width > 0) {
+                                drawSurfaceBorders(g_display, g_surfaces[idx]);
+                            }
                             resp.data[0] = 0;
                         } else {
                             resp.data[0] = 1;

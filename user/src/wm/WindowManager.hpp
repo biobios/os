@@ -72,6 +72,7 @@ public:
     Rect work_area() const { return work_area_; }
     std::uint8_t active_workspace() const { return active_workspace_; }
     std::uint32_t focused_window_id() const { return focused_win_id_; }
+    void set_focused_window_id(std::uint32_t id) { focused_win_id_ = id; }
     WMMode mode() const { return mode_; }
     void set_mode(WMMode m) { mode_ = m; }
     std::size_t scratchpad_count() const { return scratchpad_count_; }

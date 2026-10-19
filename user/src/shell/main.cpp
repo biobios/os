@@ -80,28 +80,36 @@ static void term_scroll() {
     if (!g_win_buffer) return;
     std::size_t line_pixels = 640 * FONT_HEIGHT;
     std::size_t total_pixels = 640 * 384;
-    for (std::size_t i = 0; i < total_pixels - line_pixels; ++i) {
-        g_win_buffer[i] = g_win_buffer[i + line_pixels];
-    }
-    for (std::size_t i = total_pixels - line_pixels; i < total_pixels; ++i) {
-        g_win_buffer[i] = BG_COLOR;
+    __builtin_memcpy(g_win_buffer, g_win_buffer + line_pixels, (total_pixels - line_pixels) * sizeof(Pixel));
+
+    Pixel bg = BG_COLOR;
+    std::uint32_t bg_val = *reinterpret_cast<const std::uint32_t*>(&bg);
+    std::uint64_t bg_pair = (static_cast<std::uint64_t>(bg_val) << 32) | bg_val;
+    Pixel* clear_start = g_win_buffer + (total_pixels - line_pixels);
+    for (std::size_t i = 0; i < line_pixels; i += 2) {
+        *reinterpret_cast<std::uint64_t*>(&clear_start[i]) = bg_pair;
     }
 }
 
 static void term_clear() {
     if (!g_win_buffer) return;
-    for (std::size_t i = 0; i < 640 * 384; ++i) {
-        g_win_buffer[i] = BG_COLOR;
+    Pixel bg = BG_COLOR;
+    std::uint32_t bg_val = *reinterpret_cast<const std::uint32_t*>(&bg);
+    std::uint64_t bg_pair = (static_cast<std::uint64_t>(bg_val) << 32) | bg_val;
+    for (std::size_t i = 0; i < 640 * 384; i += 2) {
+        *reinterpret_cast<std::uint64_t*>(&g_win_buffer[i]) = bg_pair;
     }
     g_cursor_col = 0;
     g_cursor_row = 0;
 }
 
-static void term_commit() {
+static void term_commit(std::uint32_t dx = 0, std::uint32_t dy = 0, std::uint32_t dw = 0, std::uint32_t dh = 0) {
     if (!g_gui_mode || g_cap_display == 0) return;
     oz::IPCMessage commit_msg{};
     commit_msg.data[0] = static_cast<std::uint64_t>(oz::ipc::DisplayCmd::COMMIT);
     commit_msg.data[1] = g_surf_id;
+    commit_msg.data[2] = (static_cast<std::uint64_t>(dx) << 32) | dy;
+    commit_msg.data[3] = (static_cast<std::uint64_t>(dw) << 32) | dh;
     oz::sys_channel_send(g_cap_display, &commit_msg);
 }
 
@@ -143,16 +151,35 @@ static void term_put_char(char c) {
 
 static void shell_write(const char* str) {
     if (g_gui_mode) {
+        bool scrolled = false;
+        std::uint32_t min_row = g_cursor_row;
+        std::uint32_t max_row = g_cursor_row;
+
         while (*str) {
             if (str[0] == '\033' && str[1] == '[' && str[2] == '2' && str[3] == 'J') {
                 term_clear();
+                scrolled = true;
                 str += 4;
                 continue;
             }
+            std::uint32_t prev_row = g_cursor_row;
             term_put_char(*str);
+            if (g_cursor_row < prev_row) {
+                scrolled = true;
+            }
+            if (g_cursor_row < min_row) min_row = g_cursor_row;
+            if (g_cursor_row > max_row) max_row = g_cursor_row;
             str++;
         }
-        term_commit();
+
+        if (scrolled) {
+            term_commit(); // Full surface commit
+        } else {
+            // Commit only the affected lines (640 x N rows)
+            std::uint32_t dy = min_row * FONT_HEIGHT;
+            std::uint32_t dh = (max_row - min_row + 1) * FONT_HEIGHT;
+            term_commit(0, dy, 640, dh);
+        }
     } else {
         oz::sys_write(str);
     }

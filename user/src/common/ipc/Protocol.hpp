@@ -142,7 +142,7 @@ inline std::uint64_t vfs_make_openat_command(std::uint32_t client_id, VfsOpenFla
 // Pure mechanism: Surface composition and pixel blitting
 enum class DisplayCmd : std::uint64_t {
     CREATE_SURFACE         = 1, // data[1] = width, data[2] = height -> returns surface_id & FrameCap
-    COMMIT                 = 2, // data[1] = surface_id (surface updated)
+    COMMIT                 = 2, // data[1] = surface_id (0=full), data[2] = (dirty_x << 32) | dirty_y, data[3] = (dirty_w << 32) | dirty_h
     DESTROY_SURFACE        = 3, // data[1] = surface_id
     // Admin / Window Manager commands
     SET_SURFACE_RECT       = 10, // data[1] = surface_id, data[2] = (x << 32) | y, data[3] = (w << 32) | h
