@@ -28,6 +28,34 @@ private:
     bool use_ring_{false};
     std::uint64_t next_req_id_{0};
 
+    bool waitResponse(std::uint64_t target_req_id, AsyncBlockResp* out_resp) {
+        while (true) {
+            AsyncBlockResp resp{};
+            if (ring_->cq.pop(&resp)) {
+                if (resp.req_id == target_req_id) {
+                    if (out_resp) *out_resp = resp;
+                    return true;
+                }
+                continue;
+            }
+
+            ring_->cq.set_need_signal(true);
+            // Double check before blocking
+            if (ring_->cq.pop(&resp)) {
+                ring_->cq.set_need_signal(false);
+                if (resp.req_id == target_req_id) {
+                    if (out_resp) *out_resp = resp;
+                    return true;
+                }
+                continue;
+            }
+
+            std::uint64_t badge = 0;
+            sys_notification_wait(notif_vfs_cap, &badge);
+            ring_->cq.set_need_signal(false);
+        }
+    }
+
 public:
     IPCBlockDevice(std::uint32_t send_cap_id, std::uint32_t recv_cap_id,
                    std::uint32_t notif_ahci = 8, std::uint32_t notif_vfs = 9,
@@ -50,6 +78,7 @@ public:
         static constexpr std::uint64_t RING_BUF_VIRT = 0x205000000000;
         if (sys_vspace_map_with_pagetables(oz::CAP_SELF_VSPACE, oz::CAP_UNTYPED, ring_buf_cap, RING_BUF_VIRT, 0x01, 4096) == 0) {
             ring_ = reinterpret_cast<volatile BlockIORing*>(RING_BUF_VIRT);
+            utils::memset(const_cast<void*>(reinterpret_cast<volatile void*>(ring_)), 0, sizeof(BlockIORing));
             use_ring_ = true;
             sys_write("VFS: IPCBlockDevice using RingBuffer + Notification mode.\n\r");
         } else {
@@ -69,20 +98,9 @@ public:
             }
 
             AsyncBlockResp resp{};
-            while (true) {
-                if (ring_->cq.pop(&resp)) {
-                    if (resp.req_id == req.req_id) {
-                        sector_sz = resp.info;
-                        if (sector_sz == 0) sector_sz = 512;
-                        break;
-                    }
-                } else {
-                    ring_->cq.set_need_signal(true);
-                    std::uint64_t badge = 0;
-                    sys_notification_wait(notif_vfs_cap, &badge);
-                    ring_->cq.set_need_signal(false);
-                }
-            }
+            waitResponse(req.req_id, &resp);
+            sector_sz = resp.info;
+            if (sector_sz == 0) sector_sz = 512;
         } else {
             IPCMessage req{};
             req.data[0] = static_cast<std::uint64_t>(ipc::BlockCmd::GET_INFO);
@@ -118,18 +136,7 @@ public:
             }
 
             AsyncBlockResp resp{};
-            while (true) {
-                if (ring_->cq.pop(&resp)) {
-                    if (resp.req_id == req.req_id) {
-                        break;
-                    }
-                } else {
-                    ring_->cq.set_need_signal(true);
-                    std::uint64_t badge = 0;
-                    sys_notification_wait(notif_vfs_cap, &badge);
-                    ring_->cq.set_need_signal(false);
-                }
-            }
+            waitResponse(req.req_id, &resp);
 
             if (resp.status != 0) return false;
             utils::memcpy(buffer, shared_buf, total_bytes);
@@ -175,18 +182,8 @@ public:
             }
 
             AsyncBlockResp resp{};
-            while (true) {
-                if (ring_->cq.pop(&resp)) {
-                    if (resp.req_id == req.req_id) {
-                        return resp.status == 0;
-                    }
-                } else {
-                    ring_->cq.set_need_signal(true);
-                    std::uint64_t badge = 0;
-                    sys_notification_wait(notif_vfs_cap, &badge);
-                    ring_->cq.set_need_signal(false);
-                }
-            }
+            waitResponse(req.req_id, &resp);
+            return resp.status == 0;
         }
 
         // Fallback: Synchronous Channel IPC

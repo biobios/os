@@ -75,33 +75,38 @@ extern "C" void _start() {
             if (!got_req) {
                 // Ring buffer is empty, wait for notification
                 ring->sq.set_need_signal(true);
-                std::uint64_t badge = 0;
-                oz::sys_notification_wait(NOTIF_AHCI_CAP, &badge);
-                ring->sq.set_need_signal(false);
-
-                // Check if legacy channel request arrived
-                if (badge & BADGE_CHANNEL) {
-                    oz::IPCMessage legacy_req{};
-                    if (oz::sys_channel_recv(3, &legacy_req)) {
-                        auto cmd = static_cast<oz::ipc::BlockCmd>(legacy_req.data[0]);
-                        oz::IPCMessage resp{};
-                        if (cmd == oz::ipc::BlockCmd::READ) {
-                            void* buf = reinterpret_cast<void*>(SHARED_BUF_VIRT);
-                            resp.data[0] = dev->readSectors(legacy_req.data[1], static_cast<std::uint32_t>(legacy_req.data[2]), buf) ? 0 : 1;
-                        } else if (cmd == oz::ipc::BlockCmd::WRITE) {
-                            void* buf = reinterpret_cast<void*>(SHARED_BUF_VIRT);
-                            resp.data[0] = dev->writeSectors(legacy_req.data[1], static_cast<std::uint32_t>(legacy_req.data[2]), buf) ? 0 : 1;
-                        } else if (cmd == oz::ipc::BlockCmd::GET_INFO) {
-                            resp.data[0] = 0;
-                            resp.data[1] = dev->getSectorSize();
-                        } else {
-                            resp.data[0] = static_cast<std::uint64_t>(-1);
-                        }
-                        oz::sys_channel_send(4, &resp);
-                    }
-                }
-
                 got_req = ring->sq.pop(&req);
+                if (!got_req) {
+                    std::uint64_t badge = 0;
+                    oz::sys_notification_wait(NOTIF_AHCI_CAP, &badge);
+                    ring->sq.set_need_signal(false);
+
+                    // Check if legacy channel request arrived
+                    if (badge & BADGE_CHANNEL) {
+                        oz::IPCMessage legacy_req{};
+                        if (oz::sys_channel_recv(3, &legacy_req)) {
+                            auto cmd = static_cast<oz::ipc::BlockCmd>(legacy_req.data[0]);
+                            oz::IPCMessage resp{};
+                            if (cmd == oz::ipc::BlockCmd::READ) {
+                                void* buf = reinterpret_cast<void*>(SHARED_BUF_VIRT);
+                                resp.data[0] = dev->readSectors(legacy_req.data[1], static_cast<std::uint32_t>(legacy_req.data[2]), buf) ? 0 : 1;
+                            } else if (cmd == oz::ipc::BlockCmd::WRITE) {
+                                void* buf = reinterpret_cast<void*>(SHARED_BUF_VIRT);
+                                resp.data[0] = dev->writeSectors(legacy_req.data[1], static_cast<std::uint32_t>(legacy_req.data[2]), buf) ? 0 : 1;
+                            } else if (cmd == oz::ipc::BlockCmd::GET_INFO) {
+                                resp.data[0] = 0;
+                                resp.data[1] = dev->getSectorSize();
+                            } else {
+                                resp.data[0] = static_cast<std::uint64_t>(-1);
+                            }
+                            oz::sys_channel_send(4, &resp);
+                        }
+                    }
+
+                    got_req = ring->sq.pop(&req);
+                } else {
+                    ring->sq.set_need_signal(false);
+                }
             }
 
             // Process all pending ring requests in batch
