@@ -1,16 +1,21 @@
 #pragma once
 #include "BlockDevice.hpp"
 #include "syscall.hpp"
+#include "ring_buffer.hpp"
 #include "../common/ipc/Protocol.hpp"
 #include "../common/utils/utils.hpp"
 
 namespace oz {
 
-// BlockDevice implementation that proxies read/write to the AHCI server via IPC
+// BlockDevice implementation that proxies read/write to the AHCI server
+// via Shared-Memory RingBuffer + Notification (with legacy Channel fallback)
 class IPCBlockDevice : public BlockDevice {
 private:
-    std::uint32_t send_cap;  // Cap for sending requests to AHCI
-    std::uint32_t recv_cap;  // Cap for receiving responses from AHCI
+    std::uint32_t send_cap{0};        // Cap for sending legacy requests to AHCI
+    std::uint32_t recv_cap{0};        // Cap for receiving legacy responses from AHCI
+    std::uint32_t notif_ahci_cap{0};  // Cap for signaling AHCI (Notification)
+    std::uint32_t notif_vfs_cap{0};   // Cap for receiving completion from AHCI (Notification)
+    std::uint32_t ring_buf_cap{0};    // Cap for shared BlockIORing frame
     std::uint32_t sector_sz{512};
     
     // Shared buffer for data transfer (physical memory shared between VFS and AHCI)
@@ -18,12 +23,21 @@ private:
     std::uint64_t shared_buf_phys{0};
     static constexpr std::size_t SHARED_BUF_SIZE = 64 * 1024; // 64KB
 
+    // Shared Ring Buffer
+    volatile BlockIORing* ring_{nullptr};
+    bool use_ring_{false};
+    std::uint64_t next_req_id_{0};
+
 public:
-    IPCBlockDevice(std::uint32_t send_cap_id, std::uint32_t recv_cap_id)
-        : send_cap(send_cap_id), recv_cap(recv_cap_id) {}
+    IPCBlockDevice(std::uint32_t send_cap_id, std::uint32_t recv_cap_id,
+                   std::uint32_t notif_ahci = 8, std::uint32_t notif_vfs = 9,
+                   std::uint32_t ring_cap = 250)
+        : send_cap(send_cap_id), recv_cap(recv_cap_id),
+          notif_ahci_cap(notif_ahci), notif_vfs_cap(notif_vfs),
+          ring_buf_cap(ring_cap) {}
 
     bool initialize() {
-        // Map shared buffer Frame (slot 242) into our VSpace
+        // 1. Map shared data buffer Frame (slot 242) into our VSpace
         static constexpr std::uint64_t SHARED_BUF_VIRT = 0x200000000000;
         if (sys_vspace_map_with_pagetables(oz::CAP_SELF_VSPACE, oz::CAP_UNTYPED, 242, SHARED_BUF_VIRT, 0x01, 16 * 4096) != 0) {
             return false; // 0x01 = writable
@@ -31,17 +45,55 @@ public:
         shared_buf = reinterpret_cast<void*>(SHARED_BUF_VIRT);
         shared_buf_phys = sys_frame_phys_addr(242);
         if (!shared_buf_phys) return false;
+
+        // 2. Map shared Ring Buffer Frame (slot 250) if available
+        static constexpr std::uint64_t RING_BUF_VIRT = 0x205000000000;
+        if (sys_vspace_map_with_pagetables(oz::CAP_SELF_VSPACE, oz::CAP_UNTYPED, ring_buf_cap, RING_BUF_VIRT, 0x01, 4096) == 0) {
+            ring_ = reinterpret_cast<volatile BlockIORing*>(RING_BUF_VIRT);
+            use_ring_ = true;
+            sys_write("VFS: IPCBlockDevice using RingBuffer + Notification mode.\n\r");
+        } else {
+            sys_write("VFS: IPCBlockDevice falling back to synchronous Channel IPC.\n\r");
+        }
         
-        // Query sector size
-        IPCMessage req{};
-        req.data[0] = static_cast<std::uint64_t>(ipc::BlockCmd::GET_INFO);
-        sys_channel_send(send_cap, &req);
-        
-        IPCMessage resp{};
-        sys_channel_recv(recv_cap, &resp);
-        if (resp.data[0] == 0) {
-            sector_sz = static_cast<std::uint32_t>(resp.data[1]);
-            if (sector_sz == 0) sector_sz = 512;
+        // 3. Query sector size
+        if (use_ring_) {
+            AsyncBlockReq req{};
+            req.req_id = ++next_req_id_;
+            req.cmd = static_cast<std::uint32_t>(AsyncBlockCmd::GET_INFO);
+            
+            bool need_signal = false;
+            while (!ring_->sq.push(req, &need_signal)) {}
+            if (need_signal) {
+                sys_notification_signal(notif_ahci_cap, 1ULL);
+            }
+
+            AsyncBlockResp resp{};
+            while (true) {
+                if (ring_->cq.pop(&resp)) {
+                    if (resp.req_id == req.req_id) {
+                        sector_sz = resp.info;
+                        if (sector_sz == 0) sector_sz = 512;
+                        break;
+                    }
+                } else {
+                    ring_->cq.set_need_signal(true);
+                    std::uint64_t badge = 0;
+                    sys_notification_wait(notif_vfs_cap, &badge);
+                    ring_->cq.set_need_signal(false);
+                }
+            }
+        } else {
+            IPCMessage req{};
+            req.data[0] = static_cast<std::uint64_t>(ipc::BlockCmd::GET_INFO);
+            sys_channel_send(send_cap, &req);
+            
+            IPCMessage resp{};
+            sys_channel_recv(recv_cap, &resp);
+            if (resp.data[0] == 0) {
+                sector_sz = static_cast<std::uint32_t>(resp.data[1]);
+                if (sector_sz == 0) sector_sz = 512;
+            }
         }
         
         return true;
@@ -51,6 +103,40 @@ public:
         std::uint64_t total_bytes = static_cast<std::uint64_t>(count) * sector_sz;
         if (total_bytes > SHARED_BUF_SIZE) return false;
 
+        if (use_ring_) {
+            AsyncBlockReq req{};
+            req.req_id = ++next_req_id_;
+            req.cmd = static_cast<std::uint32_t>(AsyncBlockCmd::READ);
+            req.lba = lba;
+            req.count = count;
+            req.buf_offset = 0;
+
+            bool need_signal = false;
+            while (!ring_->sq.push(req, &need_signal)) {}
+            if (need_signal) {
+                sys_notification_signal(notif_ahci_cap, 1ULL);
+            }
+
+            AsyncBlockResp resp{};
+            while (true) {
+                if (ring_->cq.pop(&resp)) {
+                    if (resp.req_id == req.req_id) {
+                        break;
+                    }
+                } else {
+                    ring_->cq.set_need_signal(true);
+                    std::uint64_t badge = 0;
+                    sys_notification_wait(notif_vfs_cap, &badge);
+                    ring_->cq.set_need_signal(false);
+                }
+            }
+
+            if (resp.status != 0) return false;
+            utils::memcpy(buffer, shared_buf, total_bytes);
+            return true;
+        }
+
+        // Fallback: Synchronous Channel IPC
         IPCMessage req{};
         req.data[0] = static_cast<std::uint64_t>(ipc::BlockCmd::READ);
         req.data[1] = lba;
@@ -64,7 +150,6 @@ public:
         
         if (resp.data[0] != 0) return false;
         
-        // Copy from shared buffer to caller's buffer
         utils::memcpy(buffer, shared_buf, total_bytes);
         return true;
     }
@@ -73,9 +158,38 @@ public:
         std::uint64_t total_bytes = static_cast<std::uint64_t>(count) * sector_sz;
         if (total_bytes > SHARED_BUF_SIZE) return false;
         
-        // Copy to shared buffer
         utils::memcpy(shared_buf, buffer, total_bytes);
-        
+
+        if (use_ring_) {
+            AsyncBlockReq req{};
+            req.req_id = ++next_req_id_;
+            req.cmd = static_cast<std::uint32_t>(AsyncBlockCmd::WRITE);
+            req.lba = lba;
+            req.count = count;
+            req.buf_offset = 0;
+
+            bool need_signal = false;
+            while (!ring_->sq.push(req, &need_signal)) {}
+            if (need_signal) {
+                sys_notification_signal(notif_ahci_cap, 1ULL);
+            }
+
+            AsyncBlockResp resp{};
+            while (true) {
+                if (ring_->cq.pop(&resp)) {
+                    if (resp.req_id == req.req_id) {
+                        return resp.status == 0;
+                    }
+                } else {
+                    ring_->cq.set_need_signal(true);
+                    std::uint64_t badge = 0;
+                    sys_notification_wait(notif_vfs_cap, &badge);
+                    ring_->cq.set_need_signal(false);
+                }
+            }
+        }
+
+        // Fallback: Synchronous Channel IPC
         IPCMessage req{};
         req.data[0] = static_cast<std::uint64_t>(ipc::BlockCmd::WRITE);
         req.data[1] = lba;

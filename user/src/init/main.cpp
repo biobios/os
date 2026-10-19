@@ -463,15 +463,25 @@ extern "C" void _start() {
     // Shared buffer (16 pages = 64KB) for block I/O
     std::uint32_t shared_buf_frame = oz::sys_frame_alloc(oz::CAP_UNTYPED, 16);
 
+    // Shared Ring Buffer (1 page = 4KB) for Async Block I/O
+    std::uint32_t ring_buf_frame = oz::sys_frame_alloc(oz::CAP_UNTYPED, 1);
+
+    // Notifications for AHCI and VFS async coordination
+    std::uint32_t notif_ahci = oz::sys_notification_create(oz::CAP_UNTYPED);
+    std::uint32_t notif_vfs = oz::sys_notification_create(oz::CAP_UNTYPED);
+
     oz::sys_cspace_cap_insert(ahci_proc.cspace_cap, 1, cons_send, static_cast<std::uint32_t>(oz::CapRights::WRITE | oz::CapRights::GRANT));
     oz::sys_cspace_cap_insert(ahci_proc.cspace_cap, 2, ahci_init_recv, static_cast<std::uint32_t>(oz::CapRights::READ));
     oz::sys_cspace_cap_insert(ahci_proc.cspace_cap, 3, ahci_vfs_recv, static_cast<std::uint32_t>(oz::CapRights::READ));
     oz::sys_cspace_cap_insert(ahci_proc.cspace_cap, 4, ahci_vfs_send, static_cast<std::uint32_t>(oz::CapRights::WRITE | oz::CapRights::GRANT));
+    oz::sys_cspace_cap_insert(ahci_proc.cspace_cap, 5, notif_ahci, static_cast<std::uint32_t>(oz::CapRights::ALL));
+    oz::sys_cspace_cap_insert(ahci_proc.cspace_cap, 6, notif_vfs, static_cast<std::uint32_t>(oz::CapRights::WRITE | oz::CapRights::GRANT));
     oz::sys_cspace_cap_insert(ahci_proc.cspace_cap, oz::CAP_UNTYPED, oz::CAP_UNTYPED, static_cast<std::uint32_t>(oz::CapRights::ALL));
     if (ahci_abar_phys != 0) {
         oz::sys_cspace_cap_insert(ahci_proc.cspace_cap, 241, oz::CAP_AHCI_MMIO, static_cast<std::uint32_t>(oz::CapRights::ALL));
     }
     oz::sys_cspace_cap_insert(ahci_proc.cspace_cap, 242, shared_buf_frame, static_cast<std::uint32_t>(oz::CapRights::ALL));
+    oz::sys_cspace_cap_insert(ahci_proc.cspace_cap, 244, ring_buf_frame, static_cast<std::uint32_t>(oz::CapRights::ALL));
 
     oz::sys_tcb_resume(ahci_proc.tcb_cap);
     oz::sys_write("[Init] AHCI server spawned successfully.\n\r");
@@ -514,8 +524,11 @@ extern "C" void _start() {
     oz::sys_cspace_cap_insert(vfs_proc.cspace_cap, 4, vfs_req_recv, static_cast<std::uint32_t>(oz::CapRights::READ));
     oz::sys_cspace_cap_insert(vfs_proc.cspace_cap, 5, vfs_init_reply_send, static_cast<std::uint32_t>(oz::CapRights::WRITE | oz::CapRights::GRANT));
     oz::sys_cspace_cap_insert(vfs_proc.cspace_cap, 6, vfs_shell_reply_send, static_cast<std::uint32_t>(oz::CapRights::WRITE | oz::CapRights::GRANT));
+    oz::sys_cspace_cap_insert(vfs_proc.cspace_cap, 8, notif_ahci, static_cast<std::uint32_t>(oz::CapRights::WRITE | oz::CapRights::GRANT));
+    oz::sys_cspace_cap_insert(vfs_proc.cspace_cap, 9, notif_vfs, static_cast<std::uint32_t>(oz::CapRights::ALL));
     oz::sys_cspace_cap_insert(vfs_proc.cspace_cap, oz::CAP_UNTYPED, oz::CAP_UNTYPED, static_cast<std::uint32_t>(oz::CapRights::ALL));
     oz::sys_cspace_cap_insert(vfs_proc.cspace_cap, 242, shared_buf_frame, static_cast<std::uint32_t>(oz::CapRights::ALL));
+    oz::sys_cspace_cap_insert(vfs_proc.cspace_cap, 250, ring_buf_frame, static_cast<std::uint32_t>(oz::CapRights::ALL));
 
     // Dedicated shared buffer for Client 0 (init) (16 pages = 64KB)
     std::uint32_t init_client_frame = oz::sys_frame_alloc(oz::CAP_UNTYPED, 16);
