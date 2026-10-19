@@ -25,6 +25,7 @@ struct WindowInfo {
     char title[32]{};
     std::uint8_t workspace_idx{0}; // 0-based index (0..8)
     bool is_minimized{false};
+    bool was_visible{false};
     bool is_overlay{false};
     std::uint32_t parent_window_id{0}; // For sheet/dialog overlays
     Rect overlay_rect{};

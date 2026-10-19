@@ -99,12 +99,10 @@ static void term_clear() {
 
 static void term_commit() {
     if (!g_gui_mode || g_cap_display == 0) return;
-    oz::sys_debug_print("[Shell] term_commit: start\n\r");
     oz::IPCMessage commit_msg{};
     commit_msg.data[0] = static_cast<std::uint64_t>(oz::ipc::DisplayCmd::COMMIT);
     commit_msg.data[1] = g_surf_id;
     oz::sys_channel_send(g_cap_display, &commit_msg);
-    oz::sys_debug_print("[Shell] term_commit: done\n\r");
 }
 
 static void term_put_char(char c) {

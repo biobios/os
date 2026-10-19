@@ -84,7 +84,7 @@ std::uint32_t bar_draw_string(std::uint32_t x, std::uint32_t y, const char* str,
 }
 
 // Render Top Status Bar
-void render_status_bar() {
+void render_status_bar(bool auto_commit = true) {
     if (!g_bar_buffer) return;
 
     Pixel bg_bar{0x2b, 0x24, 0x1f, 0};      // Dark brown/grey
@@ -162,11 +162,13 @@ void render_status_bar() {
     std::uint32_t right_x = g_screen_width - (title_len * (FONT_WIDTH + 1)) - 12;
     bar_draw_string(right_x, cy, os_title, fg_inactive, bg_bar);
 
-    // Commit bar surface to display
-    oz::IPCMessage commit_msg{};
-    commit_msg.data[0] = static_cast<std::uint64_t>(oz::ipc::DisplayCmd::COMMIT);
-    commit_msg.data[1] = g_bar_surf_id;
-    oz::sys_channel_send(CAP_DISPLAY_SEND, &commit_msg);
+    // Commit bar surface to display if requested
+    if (auto_commit) {
+        oz::IPCMessage commit_msg{};
+        commit_msg.data[0] = static_cast<std::uint64_t>(oz::ipc::DisplayCmd::COMMIT);
+        commit_msg.data[1] = g_bar_surf_id;
+        oz::sys_channel_send(CAP_DISPLAY_SEND, &commit_msg);
+    }
 }
 
 // Recursive helper to update surface positions and borders for active workspace
@@ -229,23 +231,25 @@ void sync_state_to_display() {
     for (std::size_t i = 0; i < oz::wm::MAX_WINDOWS; ++i) {
         auto* win = g_wm.get_window(static_cast<std::uint32_t>(i + 1));
         if (win && win->surface_id != 0) {
-            if (win->workspace_idx != cur_ws || win->is_minimized) {
+            bool is_active = (win->workspace_idx == cur_ws && !win->is_minimized);
+            if (!is_active) {
                 oz::IPCMessage hide_msg{};
                 hide_msg.data[0] = static_cast<std::uint64_t>(oz::ipc::DisplayCmd::SET_SURFACE_VISIBILITY);
                 hide_msg.data[1] = win->surface_id;
                 hide_msg.data[2] = 0;
                 oz::sys_channel_send(CAP_DISPLAY_SEND, &hide_msg);
             }
+            win->was_visible = is_active;
         }
     }
 
     // 2. Position and show active workspace windows
     sync_node_to_display(g_wm.current_layout().root(), focused_id);
 
-    // 3. Redraw status bar
-    render_status_bar();
+    // 3. Redraw status bar into its buffer without triggering separate commit
+    render_status_bar(/* auto_commit = */ false);
 
-    // 4. Commit all surface composition
+    // 4. Commit all surface composition in a single atomic frame
     oz::IPCMessage commit_msg{};
     commit_msg.data[0] = static_cast<std::uint64_t>(oz::ipc::DisplayCmd::COMMIT);
     commit_msg.data[1] = 0; // Commit all

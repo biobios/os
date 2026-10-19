@@ -16,10 +16,12 @@ static constexpr std::uint32_t CAP_CONSOLE_SEND = 1;
 static constexpr std::uint32_t CAP_DISPLAY_RECV = 2;
 static constexpr std::uint32_t CAP_COMMAND_RECV = 3;
 static constexpr std::uint64_t FB_VADDR = 0x650000000000ULL;
+static constexpr std::uint64_t BACK_BUF_VADDR = 0x660000000000ULL;
 
 class DisplayDriver {
 private:
-    Pixel* fb_ = nullptr;
+    Pixel* fb_ = nullptr;          // Physical VRAM
+    Pixel* back_buffer_ = nullptr; // Off-screen RAM back buffer
     std::uint32_t width_ = 0;
     std::uint32_t height_ = 0;
     std::size_t size_ = 0;
@@ -32,29 +34,60 @@ public:
         height_ = height;
         size_ = size;
 
+        // 1. Map physical FrameBuffer (VRAM)
         int res = oz::sys_vspace_map_with_pagetables(oz::CAP_SELF_VSPACE, oz::CAP_UNTYPED, oz::CAP_FRAMEBUFFER, FB_VADDR, 0x01, size);
         if (res != 0) {
             oz::sys_debug_print("[Display] ERROR: Failed to map FrameBuffer!\n\r");
             return false;
         }
-
         fb_ = reinterpret_cast<Pixel*>(FB_VADDR);
-        oz::sys_debug_print("[Display] FrameBuffer mapped successfully.\n\r");
+
+        // 2. Allocate and map BackBuffer (RAM)
+        std::uint64_t num_pages = (size + 4095) / 4096;
+        std::uint32_t back_cap = oz::sys_frame_alloc(oz::CAP_UNTYPED, num_pages);
+        if (back_cap == oz::INVALID_CAP_ID) {
+            oz::sys_debug_print("[Display] ERROR: Failed to allocate BackBuffer frame!\n\r");
+            return false;
+        }
+        res = oz::sys_vspace_map_with_pagetables(oz::CAP_SELF_VSPACE, oz::CAP_UNTYPED, back_cap, BACK_BUF_VADDR, 0x01, size);
+        if (res != 0) {
+            oz::sys_debug_print("[Display] ERROR: Failed to map BackBuffer!\n\r");
+            return false;
+        }
+        back_buffer_ = reinterpret_cast<Pixel*>(BACK_BUF_VADDR);
+
+        oz::sys_debug_print("[Display] FrameBuffer & BackBuffer mapped successfully.\n\r");
         return true;
     }
 
     void putPixel(std::uint32_t x, std::uint32_t y, Pixel color) {
-        if (x >= width_ || y >= height_) return;
-        fb_[y * width_ + x] = color;
+        if (!back_buffer_ || x >= width_ || y >= height_) return;
+        back_buffer_[y * width_ + x] = color;
     }
 
-    void fillRect(std::uint32_t x, std::uint32_t y, std::uint32_t w, std::uint32_t h, Pixel color) {
-        std::uint32_t x_end = (x + w > width_) ? width_ : x + w;
-        std::uint32_t y_end = (y + h > height_) ? height_ : y + h;
+    void fillRect(std::int32_t x, std::int32_t y, std::uint32_t w, std::uint32_t h, Pixel color) {
+        if (!back_buffer_ || w == 0 || h == 0) return;
 
-        for (std::uint32_t cy = y; cy < y_end; ++cy) {
-            for (std::uint32_t cx = x; cx < x_end; ++cx) {
-                fb_[cy * width_ + cx] = color;
+        if (x < 0) {
+            if (static_cast<std::int32_t>(w) <= -x) return;
+            w = static_cast<std::uint32_t>(static_cast<std::int32_t>(w) + x);
+            x = 0;
+        }
+        if (y < 0) {
+            if (static_cast<std::int32_t>(h) <= -y) return;
+            h = static_cast<std::uint32_t>(static_cast<std::int32_t>(h) + y);
+            y = 0;
+        }
+        if (static_cast<std::uint32_t>(x) >= width_ || static_cast<std::uint32_t>(y) >= height_) return;
+        if (static_cast<std::uint32_t>(x) + w > width_) w = width_ - static_cast<std::uint32_t>(x);
+        if (static_cast<std::uint32_t>(y) + h > height_) h = height_ - static_cast<std::uint32_t>(y);
+        if (w == 0 || h == 0) return;
+
+        std::uint32_t ux = static_cast<std::uint32_t>(x);
+        std::uint32_t uy = static_cast<std::uint32_t>(y);
+        for (std::uint32_t cy = uy; cy < uy + h; ++cy) {
+            for (std::uint32_t cx = ux; cx < ux + w; ++cx) {
+                back_buffer_[cy * width_ + cx] = color;
             }
         }
     }
@@ -65,7 +98,7 @@ public:
 
     void blit(std::int32_t dst_x, std::int32_t dst_y, const Pixel* src, std::uint32_t src_w, std::uint32_t src_h,
               std::uint32_t max_w = 0, std::uint32_t max_h = 0) {
-        if (!fb_ || !src) return;
+        if (!back_buffer_ || !src) return;
 
         std::int32_t start_x = (dst_x < 0) ? -dst_x : 0;
         std::int32_t start_y = (dst_y < 0) ? -dst_y : 0;
@@ -85,25 +118,26 @@ public:
             end_y = static_cast<std::int32_t>(height_) - dst_y;
         }
 
+        std::int32_t copy_w = end_x - start_x;
+        if (copy_w <= 0) return;
+
         for (std::int32_t sy = start_y; sy < end_y; ++sy) {
             std::int32_t dy = dst_y + sy;
             if (dy < 0 || dy >= static_cast<std::int32_t>(height_)) continue;
-            for (std::int32_t sx = start_x; sx < end_x; ++sx) {
-                std::int32_t dx = dst_x + sx;
-                if (dx < 0 || dx >= static_cast<std::int32_t>(width_)) continue;
-                fb_[dy * width_ + dx] = src[sy * src_w + sx];
-            }
+            std::size_t dst_offset = static_cast<std::size_t>(dy) * width_ + static_cast<std::size_t>(dst_x + start_x);
+            std::size_t src_offset = static_cast<std::size_t>(sy) * src_w + static_cast<std::size_t>(start_x);
+            __builtin_memcpy(&back_buffer_[dst_offset], &src[src_offset], static_cast<std::size_t>(copy_w) * sizeof(Pixel));
         }
     }
 
     void drawChar(std::uint32_t x, std::uint32_t y, char c, Pixel fg) {
-        if (c < 32 || c > 126) return;
+        if (!back_buffer_ || c < 32 || c > 126) return;
         if (x + FONT_WIDTH > width_ || y + FONT_HEIGHT > height_) return;
 
         for (int r = 0; r < FONT_HEIGHT; ++r) {
             for (int col = 0; col < FONT_WIDTH; ++col) {
                 if (font_bitmap[c - 32][r][col]) {
-                    fb_[(y + r) * width_ + (x + col)] = fg;
+                    back_buffer_[(y + r) * width_ + (x + col)] = fg;
                 }
             }
         }
@@ -118,16 +152,48 @@ public:
     }
 
     void scrollRegion(std::uint32_t x, std::uint32_t y, std::uint32_t w, std::uint32_t h, std::uint32_t lines, Pixel bg) {
+        if (!back_buffer_) return;
         if (lines >= h) {
             fillRect(x, y, w, h, bg);
             return;
         }
         for (std::uint32_t cy = y; cy < y + h - lines; ++cy) {
             for (std::uint32_t cx = x; cx < x + w; ++cx) {
-                fb_[cy * width_ + cx] = fb_[(cy + lines) * width_ + cx];
+                back_buffer_[cy * width_ + cx] = back_buffer_[(cy + lines) * width_ + cx];
             }
         }
         fillRect(x, y + h - lines, w, lines, bg);
+    }
+
+    // High-speed scanline flush from BackBuffer to physical VRAM
+    void flush(std::int32_t x, std::int32_t y, std::uint32_t w, std::uint32_t h) {
+        if (!fb_ || !back_buffer_) return;
+
+        if (x < 0) {
+            if (static_cast<std::int32_t>(w) <= -x) return;
+            w = static_cast<std::uint32_t>(static_cast<std::int32_t>(w) + x);
+            x = 0;
+        }
+        if (y < 0) {
+            if (static_cast<std::int32_t>(h) <= -y) return;
+            h = static_cast<std::uint32_t>(static_cast<std::int32_t>(h) + y);
+            y = 0;
+        }
+        if (static_cast<std::uint32_t>(x) >= width_ || static_cast<std::uint32_t>(y) >= height_) return;
+        if (static_cast<std::uint32_t>(x) + w > width_) w = width_ - static_cast<std::uint32_t>(x);
+        if (static_cast<std::uint32_t>(y) + h > height_) h = height_ - static_cast<std::uint32_t>(y);
+        if (w == 0 || h == 0) return;
+
+        for (std::uint32_t r = 0; r < h; ++r) {
+            std::size_t offset = static_cast<std::size_t>(static_cast<std::uint32_t>(y) + r) * width_ + static_cast<std::uint32_t>(x);
+            Pixel* dst = fb_ + offset;
+            const Pixel* src = back_buffer_ + offset;
+            __builtin_memcpy(dst, src, static_cast<std::size_t>(w) * sizeof(Pixel));
+        }
+    }
+
+    void flushAll() {
+        flush(0, 0, width_, height_);
     }
 
     std::uint32_t width() const { return width_; }
@@ -349,30 +415,60 @@ bool has_active_surfaces() {
     return false;
 }
 
+void renderSurface(DisplayDriver& disp, const Surface& surf, bool render_border = true) {
+    if (surf.id == 0 || !surf.visible || !surf.buffer) return;
+
+    std::uint32_t draw_w = (surf.rect_w > 0) ? surf.rect_w : surf.width;
+    std::uint32_t draw_h = (surf.rect_h > 0) ? surf.rect_h : surf.height;
+
+    // 1. Draw 4 border edges only (never overwrite the interior window area)
+    if (render_border && surf.border_width > 0) {
+        std::int32_t bw = static_cast<std::int32_t>(surf.border_width);
+        // Top edge
+        disp.fillRect(surf.x - bw, surf.y - bw, draw_w + 2 * bw, bw, surf.border_color);
+        // Bottom edge
+        disp.fillRect(surf.x - bw, surf.y + static_cast<std::int32_t>(draw_h), draw_w + 2 * bw, bw, surf.border_color);
+        // Left edge
+        disp.fillRect(surf.x - bw, surf.y, bw, draw_h, surf.border_color);
+        // Right edge
+        disp.fillRect(surf.x + static_cast<std::int32_t>(draw_w), surf.y, bw, draw_h, surf.border_color);
+    }
+
+    // 2. Fill background only if surface buffer is smaller than target rect (unused margins)
+    if (surf.width < draw_w) {
+        disp.fillRect(surf.x + static_cast<std::int32_t>(surf.width), surf.y, draw_w - surf.width, draw_h, Pixel{0x10, 0x10, 0x10, 0});
+    }
+    if (surf.height < draw_h) {
+        std::uint32_t fill_w = (surf.width < draw_w) ? surf.width : draw_w;
+        disp.fillRect(surf.x, surf.y + static_cast<std::int32_t>(surf.height), fill_w, draw_h - surf.height, Pixel{0x10, 0x10, 0x10, 0});
+    }
+
+    // 3. Blit surface buffer directly
+    disp.blit(surf.x, surf.y, surf.buffer, surf.width, surf.height, draw_w, draw_h);
+}
+
+bool drawCursorIfInRect(DisplayDriver& disp, std::int32_t rx, std::int32_t ry, std::uint32_t rw, std::uint32_t rh) {
+    if (!g_cursor_visible) return false;
+    if (g_cursor_x + 11 >= rx && g_cursor_x < static_cast<std::int32_t>(rx + rw) &&
+        g_cursor_y + 16 >= ry && g_cursor_y < static_cast<std::int32_t>(ry + rh)) {
+        drawCursor(disp, g_cursor_x, g_cursor_y);
+        return true;
+    }
+    return false;
+}
+
 void compose(DisplayDriver& disp) {
-    // 1. Render desktop background
+    // 1. Render desktop background into BackBuffer
     renderDesktop(disp);
 
-    // 2. Render surfaces
+    // 2. Render surfaces into BackBuffer
     bool has_surfaces = false;
     for (std::size_t i = 0; i < MAX_SURFACES; ++i) {
         if (g_surfaces[i].id != 0 && g_surfaces[i].visible && g_surfaces[i].buffer) {
             has_surfaces = true;
-            std::uint32_t draw_w = (g_surfaces[i].rect_w > 0) ? g_surfaces[i].rect_w : g_surfaces[i].width;
-            std::uint32_t draw_h = (g_surfaces[i].rect_h > 0) ? g_surfaces[i].rect_h : g_surfaces[i].height;
-
-            if (g_surfaces[i].border_width > 0) {
-                std::int32_t bw = static_cast<std::int32_t>(g_surfaces[i].border_width);
-                disp.fillRect(g_surfaces[i].x - bw, g_surfaces[i].y - bw,
-                              draw_w + 2 * bw, draw_h + 2 * bw,
-                              g_surfaces[i].border_color);
-                // Fill window interior background (dark slate)
-                disp.fillRect(g_surfaces[i].x, g_surfaces[i].y, draw_w, draw_h, Pixel{0x10, 0x10, 0x10, 0});
-            }
-            disp.blit(g_surfaces[i].x, g_surfaces[i].y, g_surfaces[i].buffer, g_surfaces[i].width, g_surfaces[i].height, draw_w, draw_h);
+            renderSurface(disp, g_surfaces[i]);
         }
     }
-    oz::sys_debug_print("[Display] compose: surfaces blitted\n\r");
 
     // 3. Render legacy terminal (only if no managed surfaces exist)
     if (!has_surfaces) {
@@ -383,7 +479,6 @@ void compose(DisplayDriver& disp) {
     if (g_cursor_visible) {
         drawCursor(disp, g_cursor_x, g_cursor_y);
     }
-    oz::sys_debug_print("[Display] compose: done\n\r");
 }
 
 } // namespace
@@ -438,6 +533,7 @@ extern "C" void _start() {
 
     g_terminal.init(&g_display, win_x, win_y, win_w, win_h);
     compose(g_display);
+    g_display.flushAll();
     oz::sys_debug_print("[Display] Notification event loop ready (Surface & Blit engine).\n\r");
 
     while (true) {
@@ -456,6 +552,7 @@ extern "C" void _start() {
                 buf[32] = '\0';
                 if (!has_active_surfaces()) {
                     g_terminal.write(buf);
+                    g_display.flush(win_x, win_y, win_w, win_h);
                 }
             }
         }
@@ -528,7 +625,33 @@ extern "C" void _start() {
                         break;
                     }
                     case oz::ipc::DisplayCmd::COMMIT: {
-                        compose(g_display);
+                        std::uint32_t surf_id = static_cast<std::uint32_t>(req.data[1]);
+                        if (surf_id > 0 && surf_id <= MAX_SURFACES) {
+                            const auto& surf = g_surfaces[surf_id - 1];
+
+                            // 1. If surface is hidden/unmapped, drop commit immediately!
+                            if (!surf.visible || !surf.buffer) {
+                                resp.data[0] = 0;
+                                break;
+                            }
+
+                            // 2. Client commit: blit surface content (border remains intact)
+                            renderSurface(g_display, surf, /* render_border = */ false);
+
+                            std::uint32_t draw_w = (surf.rect_w > 0) ? surf.rect_w : surf.width;
+                            std::uint32_t draw_h = (surf.rect_h > 0) ? surf.rect_h : surf.height;
+
+                            bool cursor_drawn = drawCursorIfInRect(g_display, surf.x, surf.y, draw_w, draw_h);
+                            g_display.flush(surf.x, surf.y, draw_w, draw_h);
+                            if (cursor_drawn) {
+                                // Flush full cursor bounding box (16x16) to prevent edge clipping
+                                g_display.flush(g_cursor_x, g_cursor_y, 16, 16);
+                            }
+                        } else {
+                            // Full-screen commit (surf_id == 0)
+                            compose(g_display);
+                            g_display.flushAll();
+                        }
                         resp.data[0] = 0;
                         break;
                     }
@@ -543,6 +666,7 @@ extern "C" void _start() {
                             g_surfaces[idx].rect_h = 0;
                             g_surfaces[idx].border_width = 0;
                             compose(g_display);
+                            g_display.flushAll();
                             resp.data[0] = 0;
                         } else {
                             resp.data[0] = 1;
@@ -579,9 +703,16 @@ extern "C" void _start() {
                         break;
                     }
                     case oz::ipc::DisplayCmd::UPDATE_CURSOR: {
+                        std::int32_t old_x = g_cursor_x;
+                        std::int32_t old_y = g_cursor_y;
                         g_cursor_x = static_cast<std::int32_t>(req.data[1] >> 32);
                         g_cursor_y = static_cast<std::int32_t>(req.data[1] & 0xFFFFFFFFULL);
                         g_cursor_visible = (req.data[2] != 0);
+
+                        // Recompose BackBuffer and flush only old and new 16x16 cursor bounding boxes
+                        compose(g_display);
+                        g_display.flush(old_x, old_y, 16, 16);
+                        g_display.flush(g_cursor_x, g_cursor_y, 16, 16);
                         resp.data[0] = 0;
                         break;
                     }

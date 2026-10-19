@@ -182,6 +182,7 @@ enum class WMEventType : std::uint64_t {
     MOUSE_BUTTON           = 103, // data[1] = buttons, data[2] = rel_x, data[3] = rel_y
     FOCUS_CHANGED          = 104, // data[1] = 1 (gained) or 0 (lost)
     WINDOW_RESIZED         = 105, // data[1] = new_width, data[2] = new_height
+    VISIBILITY_CHANGED     = 106, // data[1] = 1 (visible) or 0 (hidden)
 };
 
 // ===== Memory Manager IPC Protocol =====
