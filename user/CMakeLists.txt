@@ -17,7 +17,14 @@ include_directories(lib)
 add_library(oz_syscall STATIC lib/syscall.cpp)
 
 # init process
-add_executable(init src/init/main.cpp src/init/linker.ld)
+option(ENABLE_BOOT_TESTS "Run self tests on boot" OFF)
+set(INIT_SRCS src/init/main.cpp src/init/linker.ld)
+if(ENABLE_BOOT_TESTS)
+    list(APPEND INIT_SRCS src/init/tests.cpp)
+    add_compile_definitions(ENABLE_BOOT_TESTS)
+endif()
+
+add_executable(init ${INIT_SRCS})
 target_link_libraries(init oz_syscall)
 target_link_options(init PRIVATE "-T${CMAKE_CURRENT_SOURCE_DIR}/src/init/linker.ld" "-nostdlib" "-static")
 

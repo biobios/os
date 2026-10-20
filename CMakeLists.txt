@@ -27,6 +27,7 @@ find_package(Python3 COMPONENTS Interpreter REQUIRED)
 find_program(QEMU_EXECUTABLE qemu-system-x86_64)
 
 # Configuration options
+option(ENABLE_BOOT_TESTS "Run self tests on boot" OFF)
 set(OVMF_PATH "/usr/share/ovmf/OVMF.fd" CACHE FILEPATH "Path to OVMF bios file")
 set(HDD_IMAGE "${CMAKE_BINARY_DIR}/hdd.img" CACHE FILEPATH "Path to output HDD image")
 set(HDD_SIZE_MB 200 CACHE STRING "Disk image size in MB")
