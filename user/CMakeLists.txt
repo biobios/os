@@ -101,6 +101,87 @@ add_executable(sched src/sched/main.cpp src/sched/linker.ld)
 target_link_libraries(sched oz_syscall)
 target_link_options(sched PRIVATE "-T${CMAKE_CURRENT_SOURCE_DIR}/src/sched/linker.ld" "-nostdlib" "-static")
 
+# =============================================================================
+# Standalone Subsystem Test Runners
+# =============================================================================
+set(TEST_LINKER_SCRIPT "${CMAKE_CURRENT_SOURCE_DIR}/tests/common/linker.ld")
+
+# 1. ktest (Kernel Core Tests)
+add_executable(ktest tests/ktest/main.cpp tests/common/linker.ld)
+target_link_libraries(ktest oz_syscall)
+target_link_options(ktest PRIVATE "-T${TEST_LINKER_SCRIPT}" "-nostdlib" "-static")
+
+add_custom_target(initrd_ktest
+    COMMAND ${CMAKE_COMMAND} -E make_directory ${CMAKE_CURRENT_BINARY_DIR}/pack_ktest
+    COMMAND ${CMAKE_COMMAND} -E copy $<TARGET_FILE:ktest> ${CMAKE_CURRENT_BINARY_DIR}/pack_ktest/init
+    COMMAND tar -cvf ${CMAKE_BINARY_DIR}/initrd_ktest.tar -C ${CMAKE_CURRENT_BINARY_DIR}/pack_ktest init
+    DEPENDS ktest
+    COMMENT "Building test initrd for ktest"
+    VERBATIM
+)
+
+# 2. stest (Scheduler & Radix-64 Notification Tests)
+add_executable(stest tests/stest/main.cpp tests/common/linker.ld)
+target_link_libraries(stest oz_syscall)
+target_link_options(stest PRIVATE "-T${TEST_LINKER_SCRIPT}" "-nostdlib" "-static")
+
+add_custom_target(initrd_stest
+    COMMAND ${CMAKE_COMMAND} -E make_directory ${CMAKE_CURRENT_BINARY_DIR}/pack_stest
+    COMMAND ${CMAKE_COMMAND} -E copy $<TARGET_FILE:stest> ${CMAKE_CURRENT_BINARY_DIR}/pack_stest/init
+    COMMAND ${CMAKE_COMMAND} -E copy $<TARGET_FILE:sched> ${CMAKE_CURRENT_BINARY_DIR}/pack_stest/sched
+    COMMAND tar -cvf ${CMAKE_BINARY_DIR}/initrd_stest.tar -C ${CMAKE_CURRENT_BINARY_DIR}/pack_stest init sched
+    DEPENDS stest sched
+    COMMENT "Building test initrd for stest"
+    VERBATIM
+)
+
+# 3. vtest (VFS & Storage Tests)
+add_executable(vtest tests/vtest/main.cpp tests/common/linker.ld)
+target_link_libraries(vtest oz_syscall)
+target_link_options(vtest PRIVATE "-T${TEST_LINKER_SCRIPT}" "-nostdlib" "-static")
+
+add_custom_target(initrd_vtest
+    COMMAND ${CMAKE_COMMAND} -E make_directory ${CMAKE_CURRENT_BINARY_DIR}/pack_vtest
+    COMMAND ${CMAKE_COMMAND} -E copy $<TARGET_FILE:vtest> ${CMAKE_CURRENT_BINARY_DIR}/pack_vtest/init
+    COMMAND ${CMAKE_COMMAND} -E copy $<TARGET_FILE:ahci> ${CMAKE_CURRENT_BINARY_DIR}/pack_vtest/ahci
+    COMMAND ${CMAKE_COMMAND} -E copy $<TARGET_FILE:vfs> ${CMAKE_CURRENT_BINARY_DIR}/pack_vtest/vfs
+    COMMAND tar -cvf ${CMAKE_BINARY_DIR}/initrd_vtest.tar -C ${CMAKE_CURRENT_BINARY_DIR}/pack_vtest init ahci vfs
+    DEPENDS vtest ahci vfs
+    COMMENT "Building test initrd for vtest"
+    VERBATIM
+)
+
+# 4. guitest (Display & WM GUI Tests)
+add_executable(guitest tests/guitest/main.cpp tests/common/linker.ld)
+target_link_libraries(guitest oz_syscall)
+target_link_options(guitest PRIVATE "-T${TEST_LINKER_SCRIPT}" "-nostdlib" "-static")
+
+add_custom_target(initrd_guitest
+    COMMAND ${CMAKE_COMMAND} -E make_directory ${CMAKE_CURRENT_BINARY_DIR}/pack_guitest
+    COMMAND ${CMAKE_COMMAND} -E copy $<TARGET_FILE:guitest> ${CMAKE_CURRENT_BINARY_DIR}/pack_guitest/init
+    COMMAND ${CMAKE_COMMAND} -E copy $<TARGET_FILE:display> ${CMAKE_CURRENT_BINARY_DIR}/pack_guitest/display
+    COMMAND ${CMAKE_COMMAND} -E copy $<TARGET_FILE:wm> ${CMAKE_CURRENT_BINARY_DIR}/pack_guitest/wm
+    COMMAND tar -cvf ${CMAKE_BINARY_DIR}/initrd_guitest.tar -C ${CMAKE_CURRENT_BINARY_DIR}/pack_guitest init display wm
+    DEPENDS guitest display wm
+    COMMENT "Building test initrd for guitest"
+    VERBATIM
+)
+
+# 5. xhcitest (xHCI Driver & Keyboard Tests)
+add_executable(xhcitest tests/xhcitest/main.cpp tests/common/linker.ld)
+target_link_libraries(xhcitest oz_syscall)
+target_link_options(xhcitest PRIVATE "-T${TEST_LINKER_SCRIPT}" "-nostdlib" "-static")
+
+add_custom_target(initrd_xhcitest
+    COMMAND ${CMAKE_COMMAND} -E make_directory ${CMAKE_CURRENT_BINARY_DIR}/pack_xhcitest
+    COMMAND ${CMAKE_COMMAND} -E copy $<TARGET_FILE:xhcitest> ${CMAKE_CURRENT_BINARY_DIR}/pack_xhcitest/init
+    COMMAND ${CMAKE_COMMAND} -E copy $<TARGET_FILE:xhci> ${CMAKE_CURRENT_BINARY_DIR}/pack_xhcitest/xhci
+    COMMAND tar -cvf ${CMAKE_BINARY_DIR}/initrd_xhcitest.tar -C ${CMAKE_CURRENT_BINARY_DIR}/pack_xhcitest init xhci
+    DEPENDS xhcitest xhci
+    COMMENT "Building test initrd for xhcitest"
+    VERBATIM
+)
+
 add_custom_target(initrd ALL
     COMMAND tar -cvf ${CMAKE_SOURCE_DIR}/assets/initrd.tar -C ${CMAKE_CURRENT_BINARY_DIR} init console vfs ahci xhci display shell manifest_test cat head memman procman wm sched
     COMMAND cp ${CMAKE_CURRENT_BINARY_DIR}/shell ${CMAKE_CURRENT_BINARY_DIR}/manifest_test ${CMAKE_CURRENT_BINARY_DIR}/cat ${CMAKE_CURRENT_BINARY_DIR}/head ${CMAKE_SOURCE_DIR}/assets/

@@ -38,6 +38,8 @@ add_subdirectory(bootloader)
 add_subdirectory(kernel)
 add_subdirectory(user)
 
+set(HDD_KTEST_IMAGE "${CMAKE_BINARY_DIR}/hdd_ktest.img" CACHE FILEPATH "Path to kernel test HDD image")
+
 # Custom target: image (creates / updates FAT32 disk image)
 add_custom_target(image
     COMMAND ${Python3_EXECUTABLE} "${CMAKE_CURRENT_SOURCE_DIR}/scripts/create_image.py"
@@ -80,6 +82,65 @@ if(QEMU_EXECUTABLE)
             -serial file:${CMAKE_CURRENT_SOURCE_DIR}/kernel.log
         DEPENDS image
         COMMENT "Running OZ OS in QEMU (Waiting for GDB on :1234)"
+        VERBATIM
+    )
+endif()
+
+# =============================================================================
+# Subsystem Test Target Helper Function
+# =============================================================================
+function(add_os_test_target NAME INITRD_TARGET)
+    set(TEST_IMG "${CMAKE_BINARY_DIR}/hdd_${NAME}.img")
+    set(EXTRA_QEMU_ARGS ${ARGN})
+
+    add_custom_target(image-${NAME}
+        COMMAND ${CMAKE_COMMAND} -E make_directory "${CMAKE_BINARY_DIR}/assets_${NAME}"
+        COMMAND ${CMAKE_COMMAND} -E copy_directory "${CMAKE_CURRENT_SOURCE_DIR}/assets" "${CMAKE_BINARY_DIR}/assets_${NAME}"
+        COMMAND ${CMAKE_COMMAND} -E copy "${CMAKE_BINARY_DIR}/initrd_${NAME}.tar" "${CMAKE_BINARY_DIR}/assets_${NAME}/initrd.tar"
+        COMMAND ${Python3_EXECUTABLE} "${CMAKE_CURRENT_SOURCE_DIR}/scripts/create_image.py"
+            --image "${TEST_IMG}"
+            --size-mb "${HDD_SIZE_MB}"
+            --bootloader "$<TARGET_FILE:bootloader>"
+            --kernel "$<TARGET_FILE:kernel>"
+            --assets "${CMAKE_BINARY_DIR}/assets_${NAME}"
+        DEPENDS bootloader kernel ${INITRD_TARGET} "${CMAKE_CURRENT_SOURCE_DIR}/scripts/create_image.py" "${CMAKE_CURRENT_SOURCE_DIR}/assets"
+        COMMENT "Generating disk image for ${NAME} (${TEST_IMG})"
+        VERBATIM
+    )
+
+    if(QEMU_EXECUTABLE)
+        add_custom_target(run-${NAME}
+            COMMAND ${Python3_EXECUTABLE} "${CMAKE_CURRENT_SOURCE_DIR}/scripts/run_qemu_test.py"
+                ${QEMU_EXECUTABLE}
+                -m ${QEMU_MEMORY}
+                -M q35
+                -bios "${OVMF_PATH}"
+                -hda "${TEST_IMG}"
+                -display none
+                -serial stdio
+                -device isa-debug-exit,iobase=0xf4,iosize=0x04
+                ${EXTRA_QEMU_ARGS}
+            DEPENDS image-${NAME}
+            COMMENT "Running ${NAME} in QEMU"
+            VERBATIM
+        )
+    endif()
+endfunction()
+
+add_os_test_target(ktest    initrd_ktest)
+add_os_test_target(stest    initrd_stest)
+add_os_test_target(vtest    initrd_vtest)
+add_os_test_target(guitest  initrd_guitest)
+add_os_test_target(xhcitest initrd_xhcitest -device qemu-xhci,id=xhci -device usb-kbd,bus=xhci.0)
+
+if(QEMU_EXECUTABLE)
+    add_custom_target(test-all
+        COMMAND ${CMAKE_COMMAND} --build "${CMAKE_BINARY_DIR}" --target run-ktest
+        COMMAND ${CMAKE_COMMAND} --build "${CMAKE_BINARY_DIR}" --target run-stest
+        COMMAND ${CMAKE_COMMAND} --build "${CMAKE_BINARY_DIR}" --target run-vtest
+        COMMAND ${CMAKE_COMMAND} --build "${CMAKE_BINARY_DIR}" --target run-guitest
+        COMMAND ${CMAKE_COMMAND} --build "${CMAKE_BINARY_DIR}" --target run-xhcitest
+        COMMENT "Running all subsystem test suites"
         VERBATIM
     )
 endif()

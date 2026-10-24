@@ -187,11 +187,6 @@ extern "C" void _start() {
     oz::sys_debug_print("[Init] InitRD mapped successfully.\n\r");
     const std::uint8_t* initrd_ptr = reinterpret_cast<const std::uint8_t*>(INITRD_VADDR + boot_info->initrd_offset);
     
-    #ifdef ENABLE_BOOT_TESTS
-    oz::init_tests::run_capability_semantics_tests();
-    oz::init_tests::run_user_scheduler_and_cancel_tests();
-    #endif
-    
     std::uint32_t cons_tcb_cap = oz::INVALID_CAP_ID;
     std::uint32_t disp_tcb_cap = oz::INVALID_CAP_ID;
     std::uint32_t ahci_tcb_cap = oz::INVALID_CAP_ID;
