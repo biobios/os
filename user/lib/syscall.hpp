@@ -39,9 +39,40 @@ enum class ObjectType : std::uint32_t {
     IOPort = 8,
     PageTable = 9,
     Notification = 10,
+    Baton = 11,
+    InterruptThread = 12,
 };
 
+constexpr int SYS_ERR_INVALID      = -1;
+constexpr int SYS_ERR_WOULDBLOCK   = -2;
+constexpr int SYS_ERR_CANCELLED    = -3;
+constexpr int SYS_ERR_DEADLK       = -4;
+constexpr int SYS_ERR_INVALID_TYPE = -5;
+
+enum class SchedReason : std::uint64_t {
+    NONE      = 0,
+    TIMEOUT   = 1,
+    YIELD     = 2,
+    BLOCKED   = 3,
+    EXIT      = 4,
+    PREEMPTED = 5,
+    FAULT     = 6,
+    ORPHANED  = 7
+};
+
+constexpr SchedReason SYS_BATON_SWITCH_TIMEOUT = SchedReason::TIMEOUT;
+
+struct SchedResult {
+    SchedReason reason{SchedReason::NONE};
+    std::uint64_t consumed_cycles{0}; // PREEMPTED時は時間切れとなったirq_vector
+};
+
+using ReplyToken = std::uint64_t;
+constexpr ReplyToken INVALID_REPLY_TOKEN = 0;
+
 extern "C" {
+
+std::uint64_t syscall(std::uint64_t number, std::uint64_t arg1, std::uint64_t arg2, std::uint64_t arg3, std::uint64_t arg4, std::uint64_t arg5, std::uint64_t arg6);
 
 struct IPCMessage {
     std::uint64_t data[4];
@@ -50,15 +81,16 @@ struct IPCMessage {
 };
 
 void sys_exit(int status);
+int sys_yield();
 
 std::size_t sys_write(const char* str);
 
-bool sys_channel_send(std::uint32_t cap_id, const IPCMessage* msg);
+// Note: sys_channel_send/try_send is deprecated and removed in favor of sys_call / sys_reply_recv
 bool sys_channel_recv(std::uint32_t cap_id, IPCMessage* msg);
 bool sys_channel_create(std::uint32_t untyped_cap, std::uint32_t* out_cap0, std::uint32_t* out_cap1);
 bool sys_channel_create_ext(std::uint32_t untyped_cap, std::uint32_t rights0, std::uint32_t rights1, std::uint32_t* out_cap0, std::uint32_t* out_cap1);
 bool sys_call(std::uint32_t cap_id, const IPCMessage* send_msg, IPCMessage* recv_msg);
-bool sys_reply_recv(std::uint32_t cap_id, const IPCMessage* reply_msg, IPCMessage* recv_msg);
+ReplyToken sys_reply_recv(ReplyToken reply_token, std::uint32_t ep_cap, const IPCMessage* reply_msg, IPCMessage* recv_msg);
 
 // Capability-based memory management
 int sys_vspace_map(std::uint32_t vspace_cap, std::uint32_t frame_cap,
@@ -95,6 +127,21 @@ int sys_tcb_resume(std::uint32_t tcb_cap);
 int sys_tcb_suspend(std::uint32_t tcb_cap);
 int sys_tcb_set_fault_endpoint(std::uint32_t tcb_cap, std::uint32_t ep_cap);
 int sys_tcb_set_exit_notification(std::uint32_t tcb_cap, std::uint32_t notif_cap, std::uint64_t badge);
+int sys_tcb_cancel_ipc(std::uint32_t tcb_cap);
+int sys_tcb_get_cpu_time(std::uint32_t tcb_cap, std::uint64_t* out_cycles);
+int sys_tcb_get_id(std::uint32_t tcb_cap, std::uint64_t* out_id);
+int sys_tcb_set_sched_notification(std::uint32_t tcb_cap, std::uint32_t notif_cap, std::uint64_t badge);
+int sys_tcb_bind_baton(std::uint32_t tcb_cap, std::uint32_t baton_cap);
+int sys_baton_bind_notification(std::uint32_t baton_cap, std::uint32_t notif_cap, std::uint64_t badge);
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wreturn-type-c-linkage"
+SchedResult sys_baton_switch(std::uint32_t target_baton_cap);
+SchedResult sys_baton_split(std::uint32_t target_tcb_cap, std::uint64_t budget_us);
+SchedResult sys_donate_time(std::uint32_t target_tcb_cap, std::uint64_t time_budget_us);
+#pragma GCC diagnostic pop
+int sys_baton_inject(std::uint32_t target_baton_cap, std::uint64_t budget_us);
+int sys_irq_wait(std::uint32_t irq_handler_cap);
+int sys_irq_handler_set_notification(std::uint32_t irq_handler_cap, std::uint32_t notif_cap, std::uint64_t badge);
 std::uint32_t sys_cspace_create(std::uint32_t untyped_cap);
 int sys_cspace_cap_insert(std::uint32_t cspace_cap, std::uint32_t target_slot,
                           std::uint32_t src_cap, std::uint32_t rights);
@@ -113,6 +160,8 @@ int sys_notification_signal(std::uint32_t notif_cap, std::uint64_t badge);
 int sys_notification_wait(std::uint32_t notif_cap, std::uint64_t* out_badge);
 int sys_channel_bind_notification(std::uint32_t ep_cap, std::uint32_t notif_cap, std::uint64_t badge);
 int sys_notification_poll(std::uint32_t notif_cap, std::uint64_t* out_badge);
+int sys_notification_bind_parent(std::uint32_t child_notif_cap, std::uint32_t parent_notif_cap, std::uint64_t badge);
+int sys_notification_unbind_parent(std::uint32_t child_notif_cap);
 
 }
 
@@ -126,6 +175,8 @@ static constexpr std::uint32_t CAP_INITRD = 244;
 static constexpr std::uint32_t CAP_SELF_CSPACE = 245;
 static constexpr std::uint32_t CAP_FRAMEBUFFER = 246;
 static constexpr std::uint32_t CAP_ROOT_IOPORT = 247;
+static constexpr std::uint32_t CAP_ROOT_BATON = 248;
+static constexpr std::uint32_t CAP_NULL = 0;
 static constexpr std::uint32_t INVALID_CAP_ID = 0xFFFFFFFF;
 
 // ============================================================================
@@ -222,10 +273,10 @@ public:
     bool isValid() const { return slot_ != INVALID_CAP_ID; }
     std::uint32_t get() const { return slot_; }
 
-    bool send(const IPCMessage& msg) {
+    bool call(const IPCMessage& msg, IPCMessage* resp) {
         if (slot_ == INVALID_CAP_ID) return false;
-        bool res = sys_channel_send(slot_, &msg);
-        // Consumed by kernel on send; invalidate user-space handle as well
+        bool res = sys_call(slot_, &msg, resp);
+        // Consumed by kernel on call; invalidate user-space handle as well
         slot_ = INVALID_CAP_ID;
         return res;
     }

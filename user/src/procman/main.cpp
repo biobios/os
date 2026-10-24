@@ -40,10 +40,8 @@ static std::uint32_t memman_alloc_untyped(std::size_t size) {
     req.data[0] = static_cast<std::uint64_t>(oz::ipc::MemCmd::ALLOC_UNTYPED);
     req.data[1] = size;
 
-    if (!oz::sys_channel_send(CAP_MEMMAN_SEND, &req)) return oz::INVALID_CAP_ID;
-
     oz::IPCMessage resp{};
-    if (!oz::sys_channel_recv(CAP_MEMMAN_RECV, &resp)) return oz::INVALID_CAP_ID;
+    if (!oz::sys_call(CAP_MEMMAN_SEND, &req, &resp)) return oz::INVALID_CAP_ID;
 
     if (resp.data[0] == 0 && resp.has_cap) {
         return resp.transferred_cap;
@@ -59,10 +57,8 @@ static bool memman_revoke_untyped(std::uint32_t untyped_cap) {
     req.has_cap = true;
     req.transferred_cap = untyped_cap;
 
-    if (!oz::sys_channel_send(CAP_MEMMAN_SEND, &req)) return false;
-
     oz::IPCMessage resp{};
-    if (!oz::sys_channel_recv(CAP_MEMMAN_RECV, &resp)) return false;
+    if (!oz::sys_call(CAP_MEMMAN_SEND, &req, &resp)) return false;
 
     return resp.data[0] == 0;
 }
@@ -79,7 +75,7 @@ static int vfs_open(const char* path) {
     dst[i] = '\0';
 
     oz::IPCMessage resp{};
-    if (oz::sys_channel_send(CAP_VFS_SEND, &req) && oz::sys_channel_recv(CAP_VFS_RECV, &resp)) {
+    if (oz::sys_call(CAP_VFS_SEND, &req, &resp)) {
         if (resp.data[0] == 0) return static_cast<int>(resp.data[1]);
     }
     return -1;
@@ -99,10 +95,9 @@ static std::size_t vfs_read(int handle, std::size_t offset, char* buf, std::size
         req.data[3] = static_cast<std::uint64_t>(chunk);
 
         oz::IPCMessage resp{};
-        if (!oz::sys_channel_send(CAP_VFS_SEND, &req) || !oz::sys_channel_recv(CAP_VFS_RECV, &resp)) {
+        if (!oz::sys_call(CAP_VFS_SEND, &req, &resp) || resp.data[0] != 0) {
             break;
         }
-        if (resp.data[0] != 0) break;
         std::size_t bytes_read = static_cast<std::size_t>(resp.data[1]);
         if (bytes_read == 0) break;
 
@@ -120,7 +115,7 @@ static std::size_t vfs_get_size(int handle) {
     req.data[0] = oz::ipc::vfs_make_command(oz::ipc::VfsCmd::GET_SIZE, 2);
     req.data[1] = static_cast<std::uint64_t>(handle);
     oz::IPCMessage resp{};
-    if (oz::sys_channel_send(CAP_VFS_SEND, &req) && oz::sys_channel_recv(CAP_VFS_RECV, &resp)) {
+    if (oz::sys_call(CAP_VFS_SEND, &req, &resp)) {
         if (resp.data[0] == 0) return static_cast<std::size_t>(resp.data[1]);
     }
     return 0;
@@ -131,9 +126,7 @@ static void vfs_close(int handle) {
     req.data[0] = oz::ipc::vfs_make_command(oz::ipc::VfsCmd::CLOSE, 2);
     req.data[1] = static_cast<std::uint64_t>(handle);
     oz::IPCMessage resp{};
-    if (oz::sys_channel_send(CAP_VFS_SEND, &req)) {
-        oz::sys_channel_recv(CAP_VFS_RECV, &resp);
-    }
+    oz::sys_call(CAP_VFS_SEND, &req, &resp);
 }
 
 // ===== Process & Session Tracking =====
@@ -209,14 +202,18 @@ extern "C" void _start() {
 
     oz::sys_write("[ProcMan] Process Manager ready to serve spawn/wait requests.\n\r");
 
+    oz::ReplyToken token = oz::INVALID_REPLY_TOKEN;
+    oz::IPCMessage resp{};
+    oz::IPCMessage req{};
+
     while (true) {
-        oz::IPCMessage req{};
-        if (!oz::sys_channel_recv(CAP_PROCMAN_RECV, &req)) {
+        token = oz::sys_reply_recv(token, CAP_PROCMAN_RECV, (token != oz::INVALID_REPLY_TOKEN) ? &resp : nullptr, &req);
+        if (token == oz::INVALID_REPLY_TOKEN) {
             continue;
         }
 
         auto cmd = static_cast<oz::ipc::ProcCmd>(req.data[0]);
-        oz::IPCMessage resp{};
+        resp = oz::IPCMessage{};
 
         if (cmd == oz::ipc::ProcCmd::SPAWN_INIT) {
             g_session.reset();
@@ -236,16 +233,12 @@ extern "C" void _start() {
             resp.data[0] = 0;
             resp.data[1] = 1; // session_id = 1
             resp.has_cap = false;
-            oz::sys_channel_send(CAP_PROCMAN_REPLY, &resp);
-
         } else if (cmd == oz::ipc::ProcCmd::SPAWN_SET_STDOUT) {
             if (req.has_cap) {
                 g_session.stdout_cap = req.transferred_cap;
             }
             resp.data[0] = 0;
             resp.has_cap = false;
-            oz::sys_channel_send(CAP_PROCMAN_REPLY, &resp);
-
         } else if (cmd == oz::ipc::ProcCmd::SPAWN_ADD_ARG) {
             const char* arg_src = reinterpret_cast<const char*>(&req.data[2]);
             char arg_buf[17] = {};
@@ -256,8 +249,6 @@ extern "C" void _start() {
 
             resp.data[0] = 0;
             resp.has_cap = false;
-            oz::sys_channel_send(CAP_PROCMAN_REPLY, &resp);
-
         } else if (cmd == oz::ipc::ProcCmd::SPAWN_ADD_CAP) {
             if (g_session.num_delegated < 8 && req.has_cap) {
                 const char* name_src = reinterpret_cast<const char*>(&req.data[2]);
@@ -271,12 +262,10 @@ extern "C" void _start() {
             }
             resp.data[0] = 0;
             resp.has_cap = false;
-            oz::sys_channel_send(CAP_PROCMAN_REPLY, &resp);
 
         } else if (cmd == oz::ipc::ProcCmd::SPAWN_COMMIT) {
             if (!g_session.in_use) {
                 resp.data[0] = 1;
-                oz::sys_channel_send(CAP_PROCMAN_REPLY, &resp);
                 continue;
             }
 
@@ -287,7 +276,6 @@ extern "C" void _start() {
                 oz::sys_write(g_session.prog_name);
                 oz::sys_write("\n\r");
                 resp.data[0] = 2; // File not found
-                oz::sys_channel_send(CAP_PROCMAN_REPLY, &resp);
                 continue;
             }
 
@@ -296,7 +284,6 @@ extern "C" void _start() {
                 oz::sys_write("[ProcMan] ERROR: Invalid executable size\n\r");
                 vfs_close(fd);
                 resp.data[0] = 3; // Invalid size
-                oz::sys_channel_send(CAP_PROCMAN_REPLY, &resp);
                 continue;
             }
 
@@ -312,7 +299,6 @@ extern "C" void _start() {
                 oz::sys_write("[ProcMan] ERROR: MemMan failed to allocate child UntypedMemory\n\r");
                 vfs_close(fd);
                 resp.data[0] = 4; // Out of memory
-                oz::sys_channel_send(CAP_PROCMAN_REPLY, &resp);
                 continue;
             }
 
@@ -324,7 +310,6 @@ extern "C" void _start() {
                 vfs_close(fd);
                 memman_revoke_untyped(child_untyped);
                 resp.data[0] = 5;
-                oz::sys_channel_send(CAP_PROCMAN_REPLY, &resp);
                 continue;
             }
             int map_res = oz::sys_vspace_map_with_pagetables(oz::CAP_SELF_VSPACE, g_procman_work_untyped, buf_frame, STAGING_ADDR, 0x01, pages * 4096);
@@ -334,7 +319,6 @@ extern "C" void _start() {
                 vfs_close(fd);
                 memman_revoke_untyped(child_untyped);
                 resp.data[0] = 5;
-                oz::sys_channel_send(CAP_PROCMAN_REPLY, &resp);
                 continue;
             }
 
@@ -350,7 +334,6 @@ extern "C" void _start() {
                 oz::sys_cap_delete(buf_frame);
                 memman_revoke_untyped(child_untyped);
                 resp.data[0] = 6;
-                oz::sys_channel_send(CAP_PROCMAN_REPLY, &resp);
                 continue;
             }
 
@@ -424,7 +407,6 @@ extern "C" void _start() {
                 oz::sys_write("[ProcMan] ERROR: loader::spawn_process failed!\n\r");
                 memman_revoke_untyped(child_untyped);
                 resp.data[0] = 7; // Spawn failed
-                oz::sys_channel_send(CAP_PROCMAN_REPLY, &resp);
                 continue;
             }
 
@@ -498,10 +480,14 @@ extern "C" void _start() {
 
             g_session.reset();
 
+            // Copy TCB cap to a temporary slot to transfer it to caller (e.g. Init)
+            constexpr std::uint32_t PROCMAN_COPY_TCB_SLOT = 150;
+            oz::sys_cap_copy(PROCMAN_COPY_TCB_SLOT, proc.tcb_cap, static_cast<std::uint32_t>(oz::CapRights::ALL));
+
             resp.data[0] = 0; // Success
             resp.data[1] = pid;
-            resp.has_cap = false;
-            oz::sys_channel_send(CAP_PROCMAN_REPLY, &resp);
+            resp.has_cap = true;
+            resp.transferred_cap = PROCMAN_COPY_TCB_SLOT;
 
         } else if (cmd == oz::ipc::ProcCmd::WAIT) {
             std::uint32_t pid = static_cast<std::uint32_t>(req.data[1]);
@@ -509,7 +495,6 @@ extern "C" void _start() {
             if (!pe) {
                 resp.data[0] = 1; // PID not found
                 resp.data[1] = 0;
-                oz::sys_channel_send(CAP_PROCMAN_REPLY, &resp);
                 continue;
             }
 
@@ -547,7 +532,6 @@ extern "C" void _start() {
             resp.data[0] = 0; // OK
             resp.data[1] = static_cast<std::uint64_t>(exit_code);
             resp.has_cap = false;
-            oz::sys_channel_send(CAP_PROCMAN_REPLY, &resp);
 
         } else if (cmd == oz::ipc::ProcCmd::CREATE_PIPE) {
             std::uint32_t pipe_w = 0;
@@ -561,12 +545,10 @@ extern "C" void _start() {
                 resp.data[0] = 1; // Failed
                 resp.has_cap = false;
             }
-            oz::sys_channel_send(CAP_PROCMAN_REPLY, &resp);
 
         } else {
             resp.data[0] = 0xFF; // Unknown
             resp.has_cap = false;
-            oz::sys_channel_send(CAP_PROCMAN_REPLY, &resp);
         }
     }
 }

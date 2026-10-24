@@ -1,6 +1,7 @@
 #pragma once
 
 #include "Layout.hpp"
+#include "syscall.hpp"
 #include <cstdint>
 #include <cstddef>
 
@@ -22,6 +23,7 @@ struct WindowInfo {
     std::uint32_t id{0};
     std::uint32_t surface_id{0};
     std::uint32_t input_channel_send{0};
+    std::uint32_t notif_cap{0};
     char title[32]{};
     std::uint8_t workspace_idx{0}; // 0-based index (0..8)
     bool is_minimized{false};
@@ -29,6 +31,36 @@ struct WindowInfo {
     bool is_overlay{false};
     std::uint32_t parent_window_id{0}; // For sheet/dialog overlays
     Rect overlay_rect{};
+    std::uint64_t pending_get_event_reply{0};
+
+    static constexpr std::size_t KEY_QUEUE_CAP = 32;
+    oz::IPCMessage pending_keys[KEY_QUEUE_CAP]{};
+    std::uint32_t key_head{0};
+    std::uint32_t key_tail{0};
+    std::uint32_t key_count{0};
+
+    bool enqueue_key(const oz::IPCMessage& msg) {
+        if (key_count < KEY_QUEUE_CAP) {
+            pending_keys[key_tail] = msg;
+            key_tail = (key_tail + 1) % KEY_QUEUE_CAP;
+            key_count++;
+            return true;
+        }
+        return false;
+    }
+
+    bool peek_key(oz::IPCMessage* out) const {
+        if (key_count == 0) return false;
+        if (out) *out = pending_keys[key_head];
+        return true;
+    }
+
+    void pop_key() {
+        if (key_count > 0) {
+            key_head = (key_head + 1) % KEY_QUEUE_CAP;
+            key_count--;
+        }
+    }
 };
 
 class WindowManager {
@@ -97,6 +129,7 @@ public:
     WindowInfo* alloc_window(std::uint32_t surface_id, std::uint32_t input_channel_send) {
         for (std::size_t i = 0; i < MAX_WINDOWS; ++i) {
             if (windows_[i].id == 0) {
+                windows_[i] = WindowInfo{};
                 windows_[i].id = static_cast<std::uint32_t>(i + 1);
                 windows_[i].surface_id = surface_id;
                 windows_[i].input_channel_send = input_channel_send;
@@ -155,6 +188,15 @@ public:
                 next = next->first;
             }
             focused_win_id_ = next ? next->id : 0;
+        }
+
+        if (win->notif_cap != 0) {
+            oz::sys_cap_delete(win->notif_cap);
+            win->notif_cap = 0;
+        }
+        if (win->input_channel_send != 0) {
+            oz::sys_cap_delete(win->input_channel_send);
+            win->input_channel_send = 0;
         }
 
         win->id = 0;

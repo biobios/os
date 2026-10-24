@@ -110,7 +110,8 @@ static FileSession file_sessions[MAX_FILE_SESSIONS] = {};
 
 static void handle_file_session_request(FileSession& sess) {
     oz::IPCMessage req{};
-    if (!oz::sys_channel_recv(sess.vfs_ep, &req)) {
+    oz::ReplyToken tok = oz::sys_reply_recv(oz::INVALID_REPLY_TOKEN, sess.vfs_ep, nullptr, &req);
+    if (tok == oz::INVALID_REPLY_TOKEN) {
         if (sess.file) {
             sess.file->close();
             delete sess.file;
@@ -181,18 +182,8 @@ static void handle_file_session_request(FileSession& sess) {
             break;
     }
 
-    if (sess.vfs_ep != 0) {
-        if (!oz::sys_channel_send(sess.vfs_ep, &resp)) {
-            if (sess.file) {
-                sess.file->close();
-                delete sess.file;
-                sess.file = nullptr;
-            }
-            oz::sys_channel_bind_notification(sess.vfs_ep, oz::INVALID_CAP_ID, 0);
-            oz::sys_cap_delete(sess.vfs_ep);
-            sess.vfs_ep = 0;
-            sess.in_use = false;
-        }
+    if (sess.vfs_ep != 0 && tok != oz::INVALID_REPLY_TOKEN) {
+        oz::sys_reply_recv(tok, 0, &resp, nullptr);
     }
 }
 
@@ -234,39 +225,20 @@ extern "C" void _start() {
         }
     }
 
-    // Initialize Notification for multi-endpoint event multiplexing
-    std::uint32_t notif_cap = oz::sys_notification_create(oz::CAP_UNTYPED);
-    if (notif_cap != oz::INVALID_CAP_ID) {
-        oz::sys_channel_bind_notification(CAP_CLIENT_RECV, notif_cap, 1ULL << 0);
-        oz::sys_write("VFS: Multi-endpoint Notification initialized.\n\r");
-    }
-
     // Main request loop
     oz::sys_write("VFS: Ready to serve file requests.\n\r");
+
+    oz::ReplyToken cli_tok = oz::INVALID_REPLY_TOKEN;
+    oz::IPCMessage req{};
+    oz::IPCMessage resp{};
+
     while (true) {
-        if (notif_cap != oz::INVALID_CAP_ID) {
-            std::uint64_t badge_mask = 0;
-            if (oz::sys_notification_wait(notif_cap, &badge_mask) != 0) continue;
-
-            // Handle dedicated file sessions (Bits 1..16)
-            for (std::size_t i = 0; i < MAX_FILE_SESSIONS; ++i) {
-                if (file_sessions[i].in_use && (badge_mask & file_sessions[i].badge)) {
-                    handle_file_session_request(file_sessions[i]);
-                }
-            }
-
-            // If bit 0 is not set, no request on CAP_CLIENT_RECV
-            if (!(badge_mask & (1ULL << 0))) {
-                continue;
-            }
-        }
-
-        oz::IPCMessage req{};
-        if (!oz::sys_channel_recv(CAP_CLIENT_RECV, &req)) continue;
+        cli_tok = oz::sys_reply_recv(cli_tok, CAP_CLIENT_RECV, (cli_tok != oz::INVALID_REPLY_TOKEN) ? &resp : nullptr, &req);
+        if (cli_tok == oz::INVALID_REPLY_TOKEN) continue;
 
         std::uint32_t client_id = oz::ipc::vfs_get_client_id(req.data[0]);
         auto cmd = static_cast<oz::ipc::VfsCmd>(oz::ipc::vfs_get_cmd(req.data[0]));
-        oz::IPCMessage resp{};
+        resp = oz::IPCMessage{};
 
         char* client_buf = (client_id < MAX_CLIENTS) ? client_bufs[client_id] : nullptr;
         std::uint32_t reply_cap = (client_id < MAX_CLIENTS) ? (CAP_CLIENT_REPLY_BASE + client_id) : 0;
@@ -337,9 +309,6 @@ extern "C" void _start() {
                                 std::uint32_t vfs_ep = 0, client_ep = 0;
                                 if (oz::sys_channel_create(oz::CAP_UNTYPED, &vfs_ep, &client_ep)) {
                                     std::uint64_t badge = 1ULL << (1 + session_idx);
-                                    if (notif_cap != oz::INVALID_CAP_ID) {
-                                        oz::sys_channel_bind_notification(vfs_ep, notif_cap, badge);
-                                    }
                                     file_sessions[session_idx].file = file.release();
                                     file_sessions[session_idx].vfs_ep = vfs_ep;
                                     file_sessions[session_idx].badge = badge;
@@ -504,10 +473,6 @@ extern "C" void _start() {
             default:
                 resp.data[0] = static_cast<std::uint64_t>(-1);
                 break;
-        }
-
-        if (reply_cap != 0) {
-            oz::sys_channel_send(reply_cap, &resp);
         }
     }
 }

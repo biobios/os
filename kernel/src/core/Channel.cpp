@@ -77,6 +77,37 @@ Thread* ChannelEndpoint::pop_recv_waiter() {
     return t;
 }
 
+namespace {
+
+bool remove_waiter_node(Thread*& head, Thread*& tail, Thread* thread) {
+    if (!head || !thread) return false;
+    if (head == thread) {
+        head = thread->next_waiter;
+        if (!head) tail = nullptr;
+        thread->next_waiter = nullptr;
+        return true;
+    }
+    Thread* curr = head;
+    while (curr->next_waiter && curr->next_waiter != thread) {
+        curr = curr->next_waiter;
+    }
+    if (curr->next_waiter == thread) {
+        curr->next_waiter = thread->next_waiter;
+        if (tail == thread) {
+            tail = curr;
+        }
+        thread->next_waiter = nullptr;
+        return true;
+    }
+    return false;
+}
+
+} // namespace
+
+bool ChannelEndpoint::remove_recv_waiter(Thread* thread) {
+    return remove_waiter_node(recv_waiter_head, recv_waiter_tail, thread);
+}
+
 void ChannelEndpoint::add_send_waiter(Thread* thread) {
     thread->next_waiter = nullptr;
     if (send_waiter_tail) {
@@ -94,6 +125,10 @@ Thread* ChannelEndpoint::pop_send_waiter() {
     if (!send_waiter_head) send_waiter_tail = nullptr;
     t->next_waiter = nullptr;
     return t;
+}
+
+bool ChannelEndpoint::remove_send_waiter(Thread* thread) {
+    return remove_waiter_node(send_waiter_head, send_waiter_tail, thread);
 }
 
 } // namespace oz

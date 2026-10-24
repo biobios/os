@@ -42,6 +42,7 @@ static std::uint32_t g_win_id = 0;
 static std::uint32_t g_cap_display = 0;
 static std::uint32_t g_cap_wm = 0;
 static std::uint32_t g_input_recv = 0;
+static std::uint32_t g_notif_gui_input = 0;
 static Pixel* g_win_buffer = nullptr;
 static std::uint32_t g_cursor_col = 0;
 static std::uint32_t g_cursor_row = 0;
@@ -110,7 +111,10 @@ static void term_commit(std::uint32_t dx = 0, std::uint32_t dy = 0, std::uint32_
     commit_msg.data[1] = g_surf_id;
     commit_msg.data[2] = (static_cast<std::uint64_t>(dx) << 32) | dy;
     commit_msg.data[3] = (static_cast<std::uint64_t>(dw) << 32) | dh;
-    oz::sys_channel_send(g_cap_display, &commit_msg);
+    oz::sys_debug_print("[Shell] term_commit: sending to display...\n\r");
+    oz::IPCMessage commit_resp{};
+    oz::sys_call(g_cap_display, &commit_msg, &commit_resp);
+    oz::sys_debug_print("[Shell] term_commit: sent to display ok\n\r");
 }
 
 static void term_put_char(char c) {
@@ -196,7 +200,7 @@ static int vfs_open(const char* path) {
     dst[i] = '\0';
 
     oz::IPCMessage resp{};
-    if (oz::sys_channel_send(CAP_VFS_SEND, &req) && oz::sys_channel_recv(CAP_VFS_RECV, &resp)) {
+    if (oz::sys_call(CAP_VFS_SEND, &req, &resp)) {
         if (resp.data[0] == 0) return static_cast<int>(resp.data[1]);
     }
     return -1;
@@ -216,10 +220,9 @@ static std::size_t vfs_read(int handle, std::size_t offset, char* buf, std::size
         req.data[3] = static_cast<std::uint64_t>(chunk);
 
         oz::IPCMessage resp{};
-        if (!oz::sys_channel_send(CAP_VFS_SEND, &req) || !oz::sys_channel_recv(CAP_VFS_RECV, &resp)) {
+        if (!oz::sys_call(CAP_VFS_SEND, &req, &resp) || resp.data[0] != 0) {
             break;
         }
-        if (resp.data[0] != 0) break;
         std::size_t bytes_read = static_cast<std::size_t>(resp.data[1]);
         if (bytes_read == 0) break;
 
@@ -250,10 +253,9 @@ static std::size_t vfs_write(int handle, std::size_t offset, const char* buf, st
         req.data[3] = static_cast<std::uint64_t>(chunk);
 
         oz::IPCMessage resp{};
-        if (!oz::sys_channel_send(CAP_VFS_SEND, &req) || !oz::sys_channel_recv(CAP_VFS_RECV, &resp)) {
+        if (!oz::sys_call(CAP_VFS_SEND, &req, &resp) || resp.data[0] != 0) {
             break;
         }
-        if (resp.data[0] != 0) break;
         std::size_t bytes_written = static_cast<std::size_t>(resp.data[1]);
         if (bytes_written == 0) break;
 
@@ -268,7 +270,7 @@ static std::size_t vfs_get_size(int handle) {
     req.data[0] = oz::ipc::vfs_make_command(oz::ipc::VfsCmd::GET_SIZE, 1);
     req.data[1] = static_cast<std::uint64_t>(handle);
     oz::IPCMessage resp{};
-    if (oz::sys_channel_send(CAP_VFS_SEND, &req) && oz::sys_channel_recv(CAP_VFS_RECV, &resp)) {
+    if (oz::sys_call(CAP_VFS_SEND, &req, &resp)) {
         if (resp.data[0] == 0) return static_cast<std::size_t>(resp.data[1]);
     }
     return 0;
@@ -279,9 +281,7 @@ static void vfs_close(int handle) {
     req.data[0] = oz::ipc::vfs_make_command(oz::ipc::VfsCmd::CLOSE, 1);
     req.data[1] = static_cast<std::uint64_t>(handle);
     oz::IPCMessage resp{};
-    if (oz::sys_channel_send(CAP_VFS_SEND, &req)) {
-        oz::sys_channel_recv(CAP_VFS_RECV, &resp);
-    }
+    oz::sys_call(CAP_VFS_SEND, &req, &resp);
 }
 
 static bool vfs_list_dir(const char* path) {
@@ -295,10 +295,10 @@ static bool vfs_list_dir(const char* path) {
     dst[i] = '\0';
 
     oz::IPCMessage resp{};
-    if (!oz::sys_channel_send(CAP_VFS_SEND, &req) || !oz::sys_channel_recv(CAP_VFS_RECV, &resp)) {
+    if (!oz::sys_call(CAP_VFS_SEND, &req, &resp) || resp.data[0] != 0) {
         return false;
     }
-    if (resp.data[0] == 0 && g_shared_buf) {
+    if (g_shared_buf) {
         shell_write(g_shared_buf);
         return true;
     }
@@ -324,10 +324,8 @@ static VfsOpenAtResult vfs_openat(const char* rel_path, oz::ipc::VfsOpenFlags fl
     }
     dst[i] = '\0';
 
-    if (!oz::sys_channel_send(CAP_VFS_SEND, &req)) return res;
-
     oz::IPCMessage resp{};
-    if (!oz::sys_channel_recv(CAP_VFS_RECV, &resp)) return res;
+    if (!oz::sys_call(CAP_VFS_SEND, &req, &resp)) return res;
 
     res.status = static_cast<oz::ipc::VfsStatus>(resp.data[0]);
     if (res.status == oz::ipc::VfsStatus::OK) {
@@ -512,9 +510,8 @@ static bool procman_spawn_init(const char* prog_name, std::uint32_t stdin_cap, s
         req.has_cap = true;
         req.transferred_cap = stdin_cap;
     }
-    if (!oz::sys_channel_send(CAP_PROCMAN_SEND, &req)) return false;
     oz::IPCMessage resp{};
-    if (!oz::sys_channel_recv(CAP_PROCMAN_RECV, &resp) || resp.data[0] != 0) return false;
+    if (!oz::sys_call(CAP_PROCMAN_SEND, &req, &resp) || resp.data[0] != 0) return false;
     if (out_sess) *out_sess = static_cast<std::uint32_t>(resp.data[1]);
     return true;
 }
@@ -524,9 +521,8 @@ static bool procman_spawn_set_stdout(std::uint32_t stdout_cap) {
     req.data[0] = static_cast<std::uint64_t>(oz::ipc::ProcCmd::SPAWN_SET_STDOUT);
     req.has_cap = true;
     req.transferred_cap = stdout_cap;
-    if (!oz::sys_channel_send(CAP_PROCMAN_SEND, &req)) return false;
     oz::IPCMessage resp{};
-    return oz::sys_channel_recv(CAP_PROCMAN_RECV, &resp) && resp.data[0] == 0;
+    return oz::sys_call(CAP_PROCMAN_SEND, &req, &resp) && resp.data[0] == 0;
 }
 
 static bool procman_spawn_add_arg(const char* arg) {
@@ -534,9 +530,8 @@ static bool procman_spawn_add_arg(const char* arg) {
     req.data[0] = static_cast<std::uint64_t>(oz::ipc::ProcCmd::SPAWN_ADD_ARG);
     char* dst = reinterpret_cast<char*>(&req.data[2]);
     for (int i = 0; i < 15 && arg[i] != '\0'; ++i) dst[i] = arg[i];
-    if (!oz::sys_channel_send(CAP_PROCMAN_SEND, &req)) return false;
     oz::IPCMessage resp{};
-    return oz::sys_channel_recv(CAP_PROCMAN_RECV, &resp) && resp.data[0] == 0;
+    return oz::sys_call(CAP_PROCMAN_SEND, &req, &resp) && resp.data[0] == 0;
 }
 
 static bool procman_spawn_add_cap(const char* name, std::uint32_t cap) {
@@ -546,17 +541,15 @@ static bool procman_spawn_add_cap(const char* name, std::uint32_t cap) {
     for (int i = 0; i < 15 && name[i] != '\0'; ++i) dst[i] = name[i];
     req.has_cap = true;
     req.transferred_cap = cap;
-    if (!oz::sys_channel_send(CAP_PROCMAN_SEND, &req)) return false;
     oz::IPCMessage resp{};
-    return oz::sys_channel_recv(CAP_PROCMAN_RECV, &resp) && resp.data[0] == 0;
+    return oz::sys_call(CAP_PROCMAN_SEND, &req, &resp) && resp.data[0] == 0;
 }
 
 static std::uint32_t procman_spawn_commit() {
     oz::IPCMessage req{};
     req.data[0] = static_cast<std::uint64_t>(oz::ipc::ProcCmd::SPAWN_COMMIT);
-    if (!oz::sys_channel_send(CAP_PROCMAN_SEND, &req)) return 0;
     oz::IPCMessage resp{};
-    if (!oz::sys_channel_recv(CAP_PROCMAN_RECV, &resp) || resp.data[0] != 0) return 0;
+    if (!oz::sys_call(CAP_PROCMAN_SEND, &req, &resp) || resp.data[0] != 0) return 0;
     return static_cast<std::uint32_t>(resp.data[1]); // pid
 }
 
@@ -565,18 +558,16 @@ static int procman_wait(std::uint32_t pid) {
     oz::IPCMessage req{};
     req.data[0] = static_cast<std::uint64_t>(oz::ipc::ProcCmd::WAIT);
     req.data[1] = pid;
-    if (!oz::sys_channel_send(CAP_PROCMAN_SEND, &req)) return -1;
     oz::IPCMessage resp{};
-    if (!oz::sys_channel_recv(CAP_PROCMAN_RECV, &resp) || resp.data[0] != 0) return -1;
+    if (!oz::sys_call(CAP_PROCMAN_SEND, &req, &resp) || resp.data[0] != 0) return -1;
     return static_cast<int>(resp.data[1]); // exit_code
 }
 
 static bool procman_create_pipe(std::uint32_t* out_w, std::uint32_t* out_r) {
     oz::IPCMessage req{};
     req.data[0] = static_cast<std::uint64_t>(oz::ipc::ProcCmd::CREATE_PIPE);
-    if (!oz::sys_channel_send(CAP_PROCMAN_SEND, &req)) return false;
     oz::IPCMessage resp{};
-    if (!oz::sys_channel_recv(CAP_PROCMAN_RECV, &resp) || resp.data[0] != 0 || !resp.has_cap) return false;
+    if (!oz::sys_call(CAP_PROCMAN_SEND, &req, &resp) || resp.data[0] != 0 || !resp.has_cap) return false;
     *out_w = static_cast<std::uint32_t>(resp.data[1]);
     *out_r = resp.transferred_cap;
     return true;
@@ -826,28 +817,12 @@ static bool init_gui_terminal(std::uint32_t cap_wm, std::uint32_t cap_display) {
     req.data[1] = 640;
     req.data[2] = 384;
 
-    std::uint32_t reply_send = 0, reply_recv = 0;
-    if (!oz::sys_channel_create(oz::CAP_UNTYPED, &reply_send, &reply_recv)) {
-        oz::sys_debug_print("[Shell] init_gui_terminal: failed to create reply channel!\n\r");
-        return false;
-    }
-    req.transferred_cap = reply_send;
-    req.has_cap = true;
-
-    oz::sys_debug_print("[Shell] init_gui_terminal: Sending CREATE_WINDOW...\n\r");
-    if (!oz::sys_channel_send(cap_wm, &req)) {
-        oz::sys_debug_print("[Shell] init_gui_terminal: sys_channel_send failed!\n\r");
-        oz::sys_cap_delete(reply_recv);
-        return false;
-    }
-
+    oz::sys_debug_print("[Shell] init_gui_terminal: Sending CREATE_WINDOW via sys_call...\n\r");
     oz::IPCMessage resp{};
-    if (!oz::sys_channel_recv(reply_recv, &resp)) {
-        oz::sys_debug_print("[Shell] init_gui_terminal: sys_channel_recv failed!\n\r");
-        oz::sys_cap_delete(reply_recv);
+    if (!oz::sys_call(cap_wm, &req, &resp)) {
+        oz::sys_debug_print("[Shell] init_gui_terminal: sys_call failed!\n\r");
         return false;
     }
-    oz::sys_cap_delete(reply_recv);
 
     if (resp.data[0] != 0 || !resp.has_cap) {
         oz::sys_debug_print("[Shell] init_gui_terminal: CREATE_WINDOW returned error or no cap!\n\r");
@@ -869,20 +844,6 @@ static bool init_gui_terminal(std::uint32_t cap_wm, std::uint32_t cap_display) {
     }
     g_win_buffer = reinterpret_cast<Pixel*>(SHELL_SURF_VADDR);
 
-    // 3. Create input channel and bind to WM
-    std::uint32_t input_send = 0;
-    if (!oz::sys_channel_create(oz::CAP_UNTYPED, &input_send, &g_input_recv)) {
-        oz::sys_debug_print("[Shell] init_gui_terminal: failed to create input channel!\n\r");
-        return false;
-    }
-
-    oz::IPCMessage bind_msg{};
-    bind_msg.data[0] = static_cast<std::uint64_t>(oz::ipc::WMCmd::BIND_INPUT_CHANNEL);
-    bind_msg.data[1] = g_win_id;
-    bind_msg.transferred_cap = input_send;
-    bind_msg.has_cap = true;
-    oz::sys_channel_send(cap_wm, &bind_msg);
-
     // 4. Set Window Title
     oz::IPCMessage title_msg{};
     title_msg.data[0] = static_cast<std::uint64_t>(oz::ipc::WMCmd::SET_TITLE);
@@ -891,7 +852,27 @@ static bool init_gui_terminal(std::uint32_t cap_wm, std::uint32_t cap_display) {
     for (int k = 0; k < 2; ++k) {
         title_msg.data[k + 2] = *reinterpret_cast<std::uint64_t*>(&title_chars[k * 8]);
     }
-    oz::sys_channel_send(cap_wm, &title_msg);
+    oz::IPCMessage title_resp{};
+    oz::sys_call(cap_wm, &title_msg, &title_resp);
+
+    // 5. Create Notification for asynchronous key events and bind to Window
+    g_notif_gui_input = oz::sys_notification_create(oz::CAP_UNTYPED);
+    if (g_notif_gui_input != 0 && g_notif_gui_input != oz::INVALID_CAP_ID) {
+        std::uint32_t notif_send = oz::sys_cap_mint(g_notif_gui_input, static_cast<std::uint32_t>(oz::CapRights::WRITE));
+        if (notif_send != 0 && notif_send != oz::INVALID_CAP_ID) {
+            oz::IPCMessage bind_msg{};
+            bind_msg.data[0] = static_cast<std::uint64_t>(oz::ipc::WMCmd::BIND_NOTIFICATION);
+            bind_msg.data[1] = g_win_id;
+            bind_msg.has_cap = true;
+            bind_msg.transferred_cap = notif_send;
+            oz::IPCMessage bind_resp{};
+            if (oz::sys_call(cap_wm, &bind_msg, &bind_resp) && bind_resp.data[0] == 0) {
+                oz::sys_debug_print("[Shell] Bound Notification to WM Window successfully!\n\r");
+            } else {
+                oz::sys_debug_print("[Shell] WARNING: Failed to bind Notification to WM Window!\n\r");
+            }
+        }
+    }
 
     g_cap_wm = cap_wm;
     g_cap_display = cap_display;
@@ -903,6 +884,30 @@ static bool init_gui_terminal(std::uint32_t cap_wm, std::uint32_t cap_display) {
     term_commit();
     oz::sys_debug_print("[Shell] init_gui_terminal: Terminal GUI successfully initialized!\n\r");
     return true;
+}
+
+static void process_input_char(char c, char* line_buf, std::size_t& line_len, std::size_t max_line_len) {
+    if (c == '\r' || c == '\n') {
+        shell_write("\n\r");
+        line_buf[line_len] = '\0';
+        execute_command(line_buf);
+        line_len = 0;
+        line_buf[0] = '\0';
+        shell_write("oz> ");
+    } else if (c == '\b' || c == 0x7F) {
+        if (line_len > 0) {
+            line_len--;
+            line_buf[line_len] = '\0';
+            shell_write("\b \b");
+        }
+    } else if (c >= 32 && c <= 126) {
+        if (line_len + 1 < max_line_len) {
+            line_buf[line_len++] = c;
+            line_buf[line_len] = '\0';
+            char echo[2] = {c, '\0'};
+            shell_write(echo);
+        }
+    }
 }
 
 OZ_PROCESS_ENTRY() {
@@ -934,38 +939,39 @@ OZ_PROCESS_ENTRY() {
     shell_write("oz> ");
 
     while (true) {
-        oz::IPCMessage msg{};
-        char c = 0;
         if (g_gui_mode) {
-            if (!oz::sys_channel_recv(g_input_recv, &msg)) continue;
-            if (msg.data[0] != static_cast<std::uint64_t>(oz::ipc::WMEventType::KEY_DOWN)) continue;
-            c = static_cast<char>(msg.data[1] & 0xFF);
-        } else {
-            if (!oz::sys_channel_recv(CAP_SHELL_INPUT, &msg)) continue;
-            c = static_cast<char>(msg.data[0] & 0xFF);
-        }
-
-        if (c == 0) continue;
-
-        if (c == '\r' || c == '\n') {
-            shell_write("\n\r");
-            line_buf[line_len] = '\0';
-            execute_command(line_buf);
-            line_len = 0;
-            line_buf[0] = '\0';
-            shell_write("oz> ");
-        } else if (c == '\b' || c == 0x7F) {
-            if (line_len > 0) {
-                line_len--;
-                line_buf[line_len] = '\0';
-                shell_write("\b \b");
+            // Notification-driven asynchronous input
+            if (g_notif_gui_input != 0) {
+                std::uint64_t badge = 0;
+                if (oz::sys_notification_wait(g_notif_gui_input, &badge) != 0) {
+                    continue;
+                }
             }
-        } else if (c >= 32 && c <= 126) {
-            if (line_len + 1 < sizeof(line_buf)) {
-                line_buf[line_len++] = c;
-                line_buf[line_len] = '\0';
-                char echo[2] = {c, '\0'};
-                shell_write(echo);
+
+            // Drain all pending keys from Window Manager
+            while (true) {
+                oz::IPCMessage req{};
+                req.data[0] = static_cast<std::uint64_t>(oz::ipc::WMCmd::GET_EVENT);
+                req.data[1] = g_win_id;
+                oz::IPCMessage msg{};
+                if (!oz::sys_call(g_cap_wm, &req, &msg) || msg.data[0] != 0) {
+                    if (g_notif_gui_input == 0) oz::sys_yield();
+                    break;
+                }
+                char c = static_cast<char>(msg.data[1] & 0xFF);
+                if (c != 0) {
+                    process_input_char(c, line_buf, line_len, sizeof(line_buf));
+                }
+            }
+        } else {
+            // Non-GUI fallback: receive from CAP_SHELL_INPUT
+            oz::IPCMessage msg{};
+            if (!oz::sys_channel_recv(CAP_SHELL_INPUT, &msg)) {
+                continue;
+            }
+            char c = static_cast<char>(msg.data[0] & 0xFF);
+            if (c != 0) {
+                process_input_char(c, line_buf, line_len, sizeof(line_buf));
             }
         }
     }

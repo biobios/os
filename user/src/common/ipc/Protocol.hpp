@@ -165,7 +165,11 @@ enum class WMCmd : std::uint64_t {
     ATTACH_OVERLAY         = 16, // data[1] = parent_win_id, data[2] = overlay_win_id
     BIND_INPUT_CHANNEL     = 17, // Client -> WM: data[1] = win_id, transferred_cap = client_input_send
     GET_WINDOW_INFO        = 18, // Client -> WM: data[1] = win_id -> returns x, y, w, h, is_focused
+    GET_EVENT              = 19, // Client -> WM: data[1] = win_id -> returns data[0] = status, data[1] = ascii, data[2] = scancode, data[3] = modifiers
+    BIND_NOTIFICATION      = 20, // Client -> WM: data[1] = win_id, transferred_cap = notif_cap
 };
+
+static constexpr std::uint64_t BADGE_WM_INPUT_EVENT = 1ULL << 0;
 
 enum class WMModifier : std::uint32_t {
     NONE  = 0,
@@ -213,6 +217,24 @@ enum class ProcCmd : std::uint64_t {
                           // Resp: data[0] = status
     CREATE_PIPE      = 8, // Requests a new Channel pipe (write-end returned in data[1], read-end in transferred_cap)
                           // Resp: data[0] = status, data[1] = pipe_write_cap, transferred_cap = pipe_read_cap
+};
+
+// ===== Scheduler IPC Protocol =====
+enum class SchedCmd : std::uint64_t {
+    REGISTER_THREAD      = 1, // Legacy alias: data[1] = priority, transferred_cap = TCB Cap
+                              // Resp: data[0] = status
+    REGISTER_BATON       = 1, // data[1] = priority, data[2] = budget_us, transferred_cap = Baton Cap
+                              // Resp: data[0] = status
+    UNREGISTER_THREAD    = 2, // Legacy alias: transferred_cap = TCB Cap or Baton Cap
+                              // Resp: data[0] = status
+    UNREGISTER_BATON     = 2, // transferred_cap = Baton Cap
+                              // Resp: data[0] = status
+    YIELD                = 3, // Voluntarily yield execution
+    GET_SCHED_INFO       = 4, // Returns active batons count
+    REGISTER_IRQ_HANDLER = 5, // data[1] = irq_vector, data[2] = budget_us, transferred_cap = TCB Cap
+                              // Resp: data[0] = status
+    CREATE_BATON         = 6, // data[1] = priority, data[2] = budget_us
+                              // Resp: data[0] = status, transferred_cap = Baton Cap
 };
 
 } // namespace ipc

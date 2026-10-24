@@ -26,6 +26,12 @@ inline void writeMSR(std::uint32_t msr, std::uint64_t value) {
     __asm__ volatile("wrmsr" : : "c"(msr), "a"(low), "d"(high));
 }
 
+inline std::uint64_t rdtsc() {
+    std::uint32_t low, high;
+    __asm__ volatile("rdtsc" : "=a"(low), "=d"(high));
+    return (static_cast<std::uint64_t>(high) << 32) | low;
+}
+
 #pragma pack(push, 1)
 struct TaskStateSegment {
     std::uint32_t reserved1;
@@ -73,5 +79,15 @@ void writeIO16(std::uint16_t addr, std::uint16_t value);
 void writeIO32(std::uint16_t addr, std::uint32_t value);
 std::uint8_t getLocalAPICID();
 void initAPICTimer(std::uint8_t interrupt_vector);
+void calibrateTimers();
+void setLAPICOneShot(std::uint64_t time_budget_us, std::uint8_t vector = 32);
+void setLAPICRemainingTicks(std::uint32_t ticks, std::uint8_t vector = 32);
+void stopLAPICTimer();
+std::uint32_t getLAPICCurrentCount();
+void maskExternalInterrupts();
+void unmaskExternalInterrupts();
+bool isExternalInterruptsMasked();
+std::uint64_t getTSCTicksPerUs();
+std::uint64_t getLAPICTicksPerUs();
 }
 }  // namespace oz

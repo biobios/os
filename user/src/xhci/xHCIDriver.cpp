@@ -253,7 +253,7 @@ void Controller::handlePortStatusChange(std::uint8_t port_id) {
     
     std::uint32_t portsc = op_regs_->ports[i].PortStatusAndControl;
     
-    if ((portsc & xHCI::PORTSC::ConnectStatusChange) != 0) {
+    if ((portsc & xHCI::PORTSC::ConnectStatusChange) != 0 || ((portsc & xHCI::PORTSC::CurrentConnectStatus) != 0 && (portsc & xHCI::PORTSC::PortEnabledDisabled) == 0)) {
         op_regs_->ports[i].PortStatusAndControl = portsc | xHCI::PORTSC::ConnectStatusChange;
         
         if ((portsc & xHCI::PORTSC::CurrentConnectStatus) != 0) {

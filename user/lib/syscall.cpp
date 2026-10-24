@@ -26,8 +26,8 @@ void sys_exit(int status) {
     }
 }
 
-bool sys_channel_send(std::uint32_t cap_id, const IPCMessage* msg) {
-    return syscall(1, cap_id, reinterpret_cast<std::uint64_t>(msg), 0, 0, 0, 0) == 0;
+int sys_yield() {
+    return static_cast<int>(syscall(44, 0, 0, 0, 0, 0, 0));
 }
 
 bool sys_channel_recv(std::uint32_t cap_id, IPCMessage* msg) {
@@ -42,30 +42,14 @@ bool sys_call(std::uint32_t cap_id, const IPCMessage* send_msg, IPCMessage* recv
     return syscall(27, cap_id, reinterpret_cast<std::uint64_t>(send_msg), reinterpret_cast<std::uint64_t>(recv_msg), 0, 0, 0) == 0;
 }
 
-bool sys_reply_recv(std::uint32_t cap_id, const IPCMessage* reply_msg, IPCMessage* recv_msg) {
-    return syscall(28, cap_id, reinterpret_cast<std::uint64_t>(reply_msg), reinterpret_cast<std::uint64_t>(recv_msg), 0, 0, 0) == 0;
+ReplyToken sys_reply_recv(ReplyToken reply_token, std::uint32_t ep_cap, const IPCMessage* reply_msg, IPCMessage* recv_msg) {
+    return syscall(28, reply_token, ep_cap, reinterpret_cast<std::uint64_t>(reply_msg), reinterpret_cast<std::uint64_t>(recv_msg), 0, 0);
 }
 
 std::size_t sys_write(const char* str) {
-    IPCMessage msg;
-    msg.has_cap = false;
-    
-    std::size_t i = 0;
-    while (str[i] != '\0') {
-        alignas(8) char buf[32];
-        int j = 0;
-        for (; j < 31 && str[i] != '\0'; ++j, ++i) {
-            buf[j] = str[i];
-        }
-        buf[j] = '\0';
-        
-        for (int k = 0; k < 4; ++k) {
-            msg.data[k] = *reinterpret_cast<std::uint64_t*>(&buf[k * 8]);
-        }
-        
-        sys_channel_send(1, &msg);
-    }
-    return i;
+    if (!str) return 0;
+    sys_debug_print(str);
+    return 0;
 }
 
 
@@ -183,7 +167,7 @@ std::uint32_t sys_irq_handler_create(std::uint32_t untyped_cap, std::uint8_t vec
 }
 
 int sys_irq_ack(std::uint32_t irq_handler_cap) {
-    return static_cast<int>(syscall(19, irq_handler_cap, 0, 0, 0, 0, 0));
+    return static_cast<int>(syscall(47, irq_handler_cap, 0, 0, 0, 0, 0));
 }
 
 std::uint32_t sys_ioport_create(std::uint32_t parent_ioport_cap, std::uint32_t untyped_cap, std::uint16_t base_port, std::uint32_t port_count) {
@@ -240,6 +224,89 @@ int sys_channel_bind_notification(std::uint32_t ep_cap, std::uint32_t notif_cap,
 
 int sys_notification_poll(std::uint32_t notif_cap, std::uint64_t* out_badge) {
     return static_cast<int>(syscall(38, notif_cap, reinterpret_cast<std::uint64_t>(out_badge), 0, 0, 0, 0));
+}
+
+int sys_notification_bind_parent(std::uint32_t child_notif_cap, std::uint32_t parent_notif_cap, std::uint64_t badge) {
+    return static_cast<int>(syscall(51, child_notif_cap, parent_notif_cap, badge, 0, 0, 0));
+}
+
+int sys_notification_unbind_parent(std::uint32_t child_notif_cap) {
+    return static_cast<int>(syscall(52, child_notif_cap, 0, 0, 0, 0, 0));
+}
+
+int sys_tcb_cancel_ipc(std::uint32_t tcb_cap) {
+    return static_cast<int>(syscall(40, tcb_cap, 0, 0, 0, 0, 0));
+}
+
+int sys_tcb_get_cpu_time(std::uint32_t tcb_cap, std::uint64_t* out_cycles) {
+    return static_cast<int>(syscall(41, tcb_cap, reinterpret_cast<std::uint64_t>(out_cycles), 0, 0, 0, 0));
+}
+
+int sys_tcb_set_sched_notification(std::uint32_t tcb_cap, std::uint32_t notif_cap, std::uint64_t badge) {
+    return static_cast<int>(syscall(46, tcb_cap, notif_cap, badge, 0, 0, 0));
+}
+
+int sys_tcb_bind_baton(std::uint32_t tcb_cap, std::uint32_t baton_cap) {
+    return static_cast<int>(syscall(53, tcb_cap, baton_cap, 0, 0, 0, 0));
+}
+
+int sys_baton_bind_notification(std::uint32_t baton_cap, std::uint32_t notif_cap, std::uint64_t badge) {
+    return static_cast<int>(syscall(54, baton_cap, notif_cap, badge, 0, 0, 0));
+}
+
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wreturn-type-c-linkage"
+SchedResult sys_baton_switch(std::uint32_t target_baton_cap) {
+    register std::uint64_t rax __asm__("rax") = 42;
+    register std::uint64_t rdi __asm__("rdi") = target_baton_cap;
+    register std::uint64_t rsi __asm__("rsi") = 0;
+    register std::uint64_t rdx __asm__("rdx") = 0;
+    register std::uint64_t r10 __asm__("r10") = 0;
+    register std::uint64_t r8  __asm__("r8")  = 0;
+    register std::uint64_t r9  __asm__("r9")  = 0;
+
+    __asm__ volatile(
+        "syscall"
+        : "+a"(rax), "+d"(rdx)
+        : "r"(rdi), "r"(rsi), "r"(r10), "r"(r8), "r"(r9)
+        : "rcx", "r11", "memory"
+    );
+
+    SchedResult res;
+    res.reason = static_cast<SchedReason>(rax);
+    res.consumed_cycles = rdx;
+    return res;
+}
+
+SchedResult sys_baton_split(std::uint32_t target_tcb_cap, std::uint64_t budget_us) {
+    (void)target_tcb_cap; (void)budget_us;
+    return SchedResult{};
+}
+
+SchedResult sys_donate_time(std::uint32_t target_tcb_cap, std::uint64_t time_budget_us) {
+    (void)target_tcb_cap; (void)time_budget_us;
+    return SchedResult{};
+}
+#pragma GCC diagnostic pop
+
+int sys_baton_inject(std::uint32_t target_baton_cap, std::uint64_t budget_us) {
+    return static_cast<int>(syscall(43, target_baton_cap, budget_us, 0, 0, 0, 0));
+}
+
+int sys_irq_wait(std::uint32_t irq_handler_cap) {
+    return static_cast<int>(syscall(50, irq_handler_cap, 0, 0, 0, 0, 0));
+}
+
+int sys_irq_handler_set_notification(std::uint32_t irq_handler_cap, std::uint32_t notif_cap, std::uint64_t badge) {
+    return static_cast<int>(syscall(48, irq_handler_cap, notif_cap, badge, 0, 0, 0));
+}
+
+int sys_tcb_get_id(std::uint32_t tcb_cap, std::uint64_t* out_id) {
+    return static_cast<int>(syscall(45, tcb_cap, reinterpret_cast<std::uint64_t>(out_id), 0, 0, 0, 0));
+}
+
+int sys_sched_set_root(std::uint32_t target_tcb_cap) {
+    return static_cast<int>(syscall(49, target_tcb_cap, 0, 0, 0, 0, 0));
 }
 
 } // extern "C"

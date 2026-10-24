@@ -22,6 +22,27 @@ void dprint(const char* str) {
     oz::hardware::Serial::writeString(str);
 }
 
+void dprint_hex(std::uint64_t val) {
+    char buf[19];
+    oz::utils::to_hex(val, buf);
+    dprint(buf);
+}
+
+void dprint_dec(std::uint64_t val) {
+    if (val == 0) {
+        dprint("0");
+        return;
+    }
+    char buf[24];
+    int idx = 22;
+    buf[23] = '\0';
+    while (val > 0) {
+        buf[idx--] = '0' + (val % 10);
+        val /= 10;
+    }
+    dprint(&buf[idx + 1]);
+}
+
 // void write(const char* str) {
 //     kernelPtr->g.clearScreen();
     

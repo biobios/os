@@ -580,15 +580,46 @@ void compose(DisplayDriver& disp) {
 
 } // namespace
 
+static std::uint32_t g_win_x = 0;
+static std::uint32_t g_win_y = 0;
+static std::uint32_t g_win_w = 0;
+static std::uint32_t g_win_h = 0;
+
+static void display_console_worker() {
+    oz::ReplyToken ctok = oz::INVALID_REPLY_TOKEN;
+    oz::IPCMessage req{};
+    oz::IPCMessage cresp{};
+
+    while (true) {
+        ctok = oz::sys_reply_recv(ctok, CAP_DISPLAY_RECV, (ctok != oz::INVALID_REPLY_TOKEN) ? &cresp : nullptr, &req);
+        if (ctok == oz::INVALID_REPLY_TOKEN) {
+            continue;
+        }
+
+        alignas(8) char buf[33];
+        for (int i = 0; i < 4; ++i) {
+            *reinterpret_cast<std::uint64_t*>(&buf[i * 8]) = req.data[i];
+        }
+        buf[32] = '\0';
+        if (!has_active_surfaces()) {
+            g_terminal.write(buf);
+            g_display.flush(g_win_x, g_win_y, g_win_w, g_win_h);
+        }
+        cresp = oz::IPCMessage{};
+    }
+}
+
 extern "C" void _start() {
     oz::sys_debug_print("[Display] Minimal Display Server started (Ring 3)!\n\r");
 
     // Wait for configuration IPC message from init process on Channel 2
     oz::IPCMessage config_msg{};
-    if (!oz::sys_channel_recv(CAP_DISPLAY_RECV, &config_msg)) {
+    oz::ReplyToken init_tok = oz::sys_reply_recv(oz::INVALID_REPLY_TOKEN, CAP_DISPLAY_RECV, nullptr, &config_msg);
+    if (init_tok == oz::INVALID_REPLY_TOKEN) {
         oz::sys_debug_print("[Display] Failed to receive config message!\n\r");
         oz::sys_exit(1);
     }
+    oz::IPCMessage init_ack{};
 
     std::uint32_t width = static_cast<std::uint32_t>(config_msg.data[0]);
     std::uint32_t height = static_cast<std::uint32_t>(config_msg.data[1]);
@@ -600,74 +631,57 @@ extern "C" void _start() {
         oz::sys_exit(1);
     }
 
-    // Notification-driven event loop
-    std::uint32_t notif_cap = oz::sys_notification_create(oz::CAP_UNTYPED);
-    if (notif_cap == oz::INVALID_CAP_ID) {
-        oz::sys_debug_print("[Display] ERROR: Failed to create Notification!\n\r");
-        oz::sys_exit(1);
-    }
-
-    static constexpr std::uint64_t BADGE_CONSOLE = 1ULL << 0;
-    static constexpr std::uint64_t BADGE_COMMAND = 1ULL << 1;
-
-    if (oz::sys_channel_bind_notification(CAP_DISPLAY_RECV, notif_cap, BADGE_CONSOLE) != 0) {
-        oz::sys_debug_print("[Display] ERROR: Failed to bind Console Channel to Notification!\n\r");
-        oz::sys_exit(1);
-    }
-    if (oz::sys_channel_bind_notification(CAP_COMMAND_RECV, notif_cap, BADGE_COMMAND) != 0) {
-        oz::sys_debug_print("[Display] ERROR: Failed to bind Command Channel to Notification!\n\r");
-        oz::sys_exit(1);
-    }
-
     // Setup interactive terminal window in center of screen
-    std::uint32_t win_w = 640;
-    std::uint32_t win_h = 380;
-    if (win_w + 40 > g_display.width()) win_w = g_display.width() - 40;
-    if (win_h + 60 > g_display.height()) win_h = g_display.height() - 60;
+    g_win_w = 640;
+    g_win_h = 380;
+    if (g_win_w + 40 > g_display.width()) g_win_w = g_display.width() - 40;
+    if (g_win_h + 60 > g_display.height()) g_win_h = g_display.height() - 60;
 
-    std::uint32_t win_x = (g_display.width() > win_w) ? (g_display.width() - win_w) / 2 : 20;
-    std::uint32_t win_y = (g_display.height() > win_h) ? (g_display.height() - win_h) / 2 : 40;
+    g_win_x = (g_display.width() > g_win_w) ? (g_display.width() - g_win_w) / 2 : 20;
+    g_win_y = (g_display.height() > g_win_h) ? (g_display.height() - g_win_h) / 2 : 40;
 
-    g_terminal.init(&g_display, win_x, win_y, win_w, win_h);
+    g_terminal.init(&g_display, g_win_x, g_win_y, g_win_w, g_win_h);
     compose(g_display);
     g_display.flushAll();
-    oz::sys_debug_print("[Display] Notification event loop ready (Surface & Blit engine).\n\r");
+
+    // Spawn passive worker thread for CAP_DISPLAY_RECV (Console text stream)
+    std::uint32_t worker_tcb = oz::sys_untyped_retype(oz::CAP_UNTYPED, static_cast<std::uint32_t>(oz::ObjectType::TCB), 0);
+    std::uint32_t worker_stack = oz::sys_frame_alloc(oz::CAP_UNTYPED, 2);
+    static constexpr std::uint64_t WORKER_STACK_TOP = 0x700010000000ULL;
+    oz::sys_vspace_map_with_pagetables(oz::CAP_SELF_VSPACE, oz::CAP_UNTYPED, worker_stack, WORKER_STACK_TOP - 8192, 0x01, 8192);
+    oz::sys_tcb_configure(worker_tcb, oz::CAP_SELF_CSPACE, oz::CAP_SELF_VSPACE,
+                          reinterpret_cast<std::uint64_t>(display_console_worker), WORKER_STACK_TOP - 8);
+    oz::sys_tcb_resume(worker_tcb);
+
+    // Initial hand-off to let worker reach sys_reply_recv(token=0) and unbind
+    std::uint32_t worker_baton = oz::sys_untyped_retype(oz::CAP_UNTYPED, static_cast<std::uint32_t>(oz::ObjectType::Baton), 0);
+    oz::sys_tcb_bind_baton(worker_tcb, worker_baton);
+    oz::sys_baton_inject(worker_baton, 10000);
+    oz::SchedResult w_res = oz::sys_baton_switch(worker_baton);
+    if (w_res.reason == oz::SchedReason::ORPHANED) {
+        oz::sys_debug_print("[Display] Console worker initialized and passive.\n\r");
+    }
+    oz::sys_cap_delete(worker_baton);
+
+    oz::sys_debug_print("[Display] Main command loop ready (Surface & Blit engine).\n\r");
+
+    oz::ReplyToken cmd_tok = init_tok;
+    oz::IPCMessage req{};
+    oz::IPCMessage resp = init_ack;
 
     while (true) {
-        std::uint64_t badge = 0;
-        if (oz::sys_notification_wait(notif_cap, &badge) != 0) {
+        cmd_tok = oz::sys_reply_recv(cmd_tok, CAP_COMMAND_RECV, (cmd_tok != oz::INVALID_REPLY_TOKEN) ? &resp : nullptr, &req);
+        if (cmd_tok == oz::INVALID_REPLY_TOKEN) {
             continue;
         }
 
-        if (badge & BADGE_CONSOLE) {
-            oz::IPCMessage req{};
-            if (oz::sys_channel_recv(CAP_DISPLAY_RECV, &req)) {
-                alignas(8) char buf[33];
-                for (int i = 0; i < 4; ++i) {
-                    *reinterpret_cast<std::uint64_t*>(&buf[i * 8]) = req.data[i];
-                }
-                buf[32] = '\0';
-                if (!has_active_surfaces()) {
-                    g_terminal.write(buf);
-                    g_display.flush(win_x, win_y, win_w, win_h);
-                }
-            }
-        }
+        auto cmd = static_cast<oz::ipc::DisplayCmd>(req.data[0] & 0xFFFFFFFFULL);
+        resp = oz::IPCMessage{};
 
-        if (badge & BADGE_COMMAND) {
-            oz::IPCMessage req{};
-            if (!oz::sys_channel_recv(CAP_COMMAND_RECV, &req)) {
-                continue;
-            }
-
-            auto cmd = static_cast<oz::ipc::DisplayCmd>(req.data[0] & 0xFFFFFFFFULL);
-            oz::IPCMessage resp{};
-            std::uint32_t reply_endpoint = req.has_cap ? req.transferred_cap : 0;
-
-                switch (cmd) {
-                    case oz::ipc::DisplayCmd::CREATE_SURFACE: {
-                        std::uint32_t w = static_cast<std::uint32_t>(req.data[1]);
-                        std::uint32_t h = static_cast<std::uint32_t>(req.data[2]);
+        switch (cmd) {
+            case oz::ipc::DisplayCmd::CREATE_SURFACE: {
+                std::uint32_t w = static_cast<std::uint32_t>(req.data[1]);
+                std::uint32_t h = static_cast<std::uint32_t>(req.data[2]);
                         int slot = -1;
                         for (std::size_t i = 0; i < MAX_SURFACES; ++i) {
                             if (g_surfaces[i].id == 0) {
@@ -887,14 +901,9 @@ extern "C" void _start() {
                         }
                         break;
                     }
-                    default:
-                        resp.data[0] = static_cast<std::uint64_t>(-1);
-                        break;
-                }
-
-                if (reply_endpoint != 0) {
-                    oz::sys_channel_send(reply_endpoint, &resp);
-                }
+            default:
+                resp.data[0] = static_cast<std::uint64_t>(-1);
+                break;
         }
     }
 }

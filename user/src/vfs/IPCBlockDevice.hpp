@@ -104,13 +104,12 @@ public:
         } else {
             IPCMessage req{};
             req.data[0] = static_cast<std::uint64_t>(ipc::BlockCmd::GET_INFO);
-            sys_channel_send(send_cap, &req);
-            
             IPCMessage resp{};
-            sys_channel_recv(recv_cap, &resp);
-            if (resp.data[0] == 0) {
-                sector_sz = static_cast<std::uint32_t>(resp.data[1]);
-                if (sector_sz == 0) sector_sz = 512;
+            if (sys_call(send_cap, &req, &resp)) {
+                if (resp.data[0] == 0) {
+                    sector_sz = static_cast<std::uint32_t>(resp.data[1]);
+                    if (sector_sz == 0) sector_sz = 512;
+                }
             }
         }
         
@@ -150,12 +149,8 @@ public:
         req.data[2] = count;
         req.data[3] = shared_buf_phys;
         
-        sys_channel_send(send_cap, &req);
-        
         IPCMessage resp{};
-        sys_channel_recv(recv_cap, &resp);
-        
-        if (resp.data[0] != 0) return false;
+        if (!sys_call(send_cap, &req, &resp) || resp.data[0] != 0) return false;
         
         utils::memcpy(buffer, shared_buf, total_bytes);
         return true;
@@ -193,10 +188,8 @@ public:
         req.data[2] = count;
         req.data[3] = shared_buf_phys;
         
-        sys_channel_send(send_cap, &req);
-        
         IPCMessage resp{};
-        sys_channel_recv(recv_cap, &resp);
+        if (!sys_call(send_cap, &req, &resp)) return false;
         
         return resp.data[0] == 0;
     }

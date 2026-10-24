@@ -46,6 +46,8 @@ enum class ObjectType : std::uint8_t {
     IOPort,
     PageTable,
     Notification,
+    Baton,
+    InterruptThread,
 };
 
 struct Capability;
@@ -71,7 +73,7 @@ protected:
 public:
     explicit KernelObject(ObjectType t = ObjectType::Unknown, bool untyped = false, CapKind kind = CapKind::Duplicable)
         : obj_type_(t), is_untyped_backed_(untyped), cap_kind_(kind) {
-        if (t == ObjectType::IRQHandler || t == ObjectType::TCB || t == ObjectType::IOPort) {
+        if (t == ObjectType::IRQHandler || t == ObjectType::IOPort) {
             cap_kind_ = CapKind::Linear;
         }
     }
@@ -303,7 +305,7 @@ constexpr CapID INVALID_CAP_ID = 0xFFFFFFFF;
 
 class CSpace {
 private:
-    static constexpr std::size_t MAX_CAPS = 256;
+    static constexpr std::size_t MAX_CAPS = 1024;
     Capability slots[MAX_CAPS];
 public:
     CSpace() = default;

@@ -4,6 +4,7 @@
 namespace oz {
 
 class CSpace;
+class ExecutionContext;
 class Thread;
 class UntypedMemory;
 
@@ -12,6 +13,7 @@ extern CSpace* (*g_get_current_cspace_func)();
 
 // For blocking IPC
 extern Thread* (*g_get_current_thread_func)();
+extern ExecutionContext* (*g_get_current_context_func)();
 extern void (*g_block_thread_func)();           // Block current thread and switch to next
 extern void (*g_unblock_thread_func)(Thread*);   // Wake up a blocked thread
 

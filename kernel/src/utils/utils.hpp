@@ -18,6 +18,8 @@ namespace binary_units{
 
 }
 void dprint(const char* str);
+void dprint_hex(std::uint64_t val);
+void dprint_dec(std::uint64_t val);
 
 void abort();
 

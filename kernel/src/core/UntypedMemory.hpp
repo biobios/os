@@ -8,6 +8,8 @@
 #include "core/Notification.hpp"
 #include "core/PageTableObject.hpp"
 #include "core/IRQHandler.hpp"
+#include "core/Baton.hpp"
+#include "core/InterruptThread.hpp"
 #include "memory/Address.hpp"
 #include <cstdint>
 #include <cstddef>
@@ -15,6 +17,8 @@
 #include <new>
 
 namespace oz {
+
+static inline std::uint64_t s_next_user_thread_id = 1000;
 
 class UntypedMemory : public KernelObject {
 public:
@@ -78,10 +82,18 @@ public:
             irq->unregisterHandler();
         } else if (node->objectType() == ObjectType::Notification) {
             auto* notif = static_cast<Notification*>(node);
+            notif->teardown();
             while (Thread* t = notif->pop_waiter()) {
                 t->state = ThreadState::Ready;
                 if (g_unblock_thread_func) g_unblock_thread_func(t);
             }
+        } else if (node->objectType() == ObjectType::Baton) {
+            auto* baton = static_cast<Baton*>(node);
+            if (baton->thread && baton->thread->baton == baton) {
+                baton->thread->baton = nullptr;
+            }
+            baton->thread = nullptr;
+            baton->bound_notif = nullptr;
         }
 
         // Force invalidate all Capabilities referencing this object
@@ -187,11 +199,11 @@ public:
     TCB* retypeTCB(void (*queue_thread_fn)(Thread*) = nullptr) {
         static constexpr std::size_t TCB_BLOCK_SIZE       = 8192;
         static constexpr std::size_t TCB_OBJECT_OFFSET    = 0;
-        static constexpr std::size_t TCB_MAX_SIZE         = 128;
-        static constexpr std::size_t THREAD_OBJECT_OFFSET = 128;
-        static constexpr std::size_t THREAD_MAX_SIZE      = 512 - 128; // 384 bytes
-        static constexpr std::size_t STACK_OFFSET         = 512;
-        static constexpr std::size_t STACK_SIZE           = TCB_BLOCK_SIZE - STACK_OFFSET; // 7680 bytes
+        static constexpr std::size_t TCB_MAX_SIZE         = 96;
+        static constexpr std::size_t THREAD_OBJECT_OFFSET = 96;
+        static constexpr std::size_t THREAD_MAX_SIZE      = 1024 - 96; // 928 bytes
+        static constexpr std::size_t STACK_OFFSET         = 1024;
+        static constexpr std::size_t STACK_SIZE           = TCB_BLOCK_SIZE - STACK_OFFSET; // 7168 bytes
 
         static_assert(sizeof(TCB) <= TCB_MAX_SIZE, "TCB size exceeds allocation slot");
         static_assert(sizeof(Thread) <= THREAD_MAX_SIZE, "Thread size exceeds allocation slot");
@@ -212,7 +224,7 @@ public:
         std::size_t stack_size = STACK_SIZE;
 
         Thread* thread = new (thread_mem) Thread(
-            0, stack_base, stack_size, PageBlock<>{nullptr}, 0
+            s_next_user_thread_id++, stack_base, stack_size, PageBlock<>{nullptr}, 0
         );
         thread->is_untyped_backed = true;
         thread->state = ThreadState::Blocked;
@@ -220,6 +232,33 @@ public:
         TCB* tcb = new (tcb_mem) TCB(thread, true, queue_thread_fn, true);
         this->addChild(tcb);
         return tcb;
+    }
+
+    // Retype into an InterruptThread with integrated 8KB kernel stack
+    InterruptThread* retypeInterruptThread() {
+        static constexpr std::size_t BLOCK_SIZE    = 8192;
+        static constexpr std::size_t OBJ_OFFSET    = 0;
+        static constexpr std::size_t OBJ_MAX_SIZE  = 512;
+        static constexpr std::size_t STACK_OFFSET  = 512;
+        static constexpr std::size_t STACK_SIZE    = BLOCK_SIZE - STACK_OFFSET;
+
+        static_assert(sizeof(InterruptThread) <= OBJ_MAX_SIZE, "InterruptThread size exceeds allocation slot");
+
+        std::uintptr_t block_phys = 0;
+        void* block_mem = allocateBytes(BLOCK_SIZE, 4096, block_phys);
+        if (!block_mem) return nullptr;
+
+        std::uint8_t* base = reinterpret_cast<std::uint8_t*>(block_mem);
+        void* obj_mem = base + OBJ_OFFSET;
+        void* stack_base = base + STACK_OFFSET;
+
+        auto* ithread = new (obj_mem) InterruptThread(
+            s_next_user_thread_id++, stack_base, STACK_SIZE, PageBlock<>{nullptr}, 0
+        );
+        ithread->is_untyped_backed = true;
+        ithread->state = ThreadState::Blocked;
+        this->addChild(ithread);
+        return ithread;
     }
 
     // Retype into a CSpace (256 capability slots = 4096 bytes)
@@ -278,6 +317,17 @@ public:
         auto* notif = new (notif_mem) Notification(true);
         this->addChild(notif);
         return notif;
+    }
+
+    // Retype into a Baton object
+    Baton* retypeBaton() {
+        std::uintptr_t baton_phys = 0;
+        void* baton_mem = allocateBytes(sizeof(Baton), alignof(Baton), baton_phys);
+        if (!baton_mem) return nullptr;
+
+        auto* baton = new (baton_mem) Baton(true);
+        this->addChild(baton);
+        return baton;
     }
 };
 

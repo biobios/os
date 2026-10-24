@@ -77,9 +77,12 @@ public:
         } else {
             // Stream (Pipe / STDIN)
             IPCMessage msg{};
-            if (!sys_channel_recv(cap_slot_, &msg)) {
+            ReplyToken tok = sys_reply_recv(INVALID_REPLY_TOKEN, cap_slot_, nullptr, &msg);
+            if (tok == INVALID_REPLY_TOKEN) {
                 return 0; // Peer closed or error -> EOF
             }
+            IPCMessage resp{};
+            sys_reply_recv(tok, 0, &resp, nullptr);
 
             std::uint32_t len = ipc::stream_get_len(msg.data[0]);
             if (len > 0 && len <= 24) {
@@ -148,7 +151,8 @@ public:
                     for (int k = 0; k < 4; ++k) {
                         msg.data[k] = *reinterpret_cast<std::uint64_t*>(&cbuf[k * 8]);
                     }
-                    if (!sys_channel_send(cap_slot_, &msg)) break;
+                    IPCMessage resp{};
+                    if (!sys_call(cap_slot_, &msg, &resp)) break;
                     total_written = i;
                 }
             } else {
@@ -161,7 +165,8 @@ public:
                     msg.data[0] = ipc::stream_make_header(static_cast<std::uint32_t>(chunk));
                     utils::memcpy(&msg.data[1], src + total_written, chunk);
 
-                    if (!sys_channel_send(cap_slot_, &msg)) break;
+                    IPCMessage resp{};
+                    if (!sys_call(cap_slot_, &msg, &resp)) break;
                     total_written += chunk;
                 }
             }

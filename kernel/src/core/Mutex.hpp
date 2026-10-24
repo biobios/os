@@ -55,7 +55,11 @@ public:
             }
             
             owner = woke;
-            scheduler.queueThread(woke);
+            woke->is_blocked = false;
+            woke->state = ThreadState::Ready;
+            if (woke->sched_notif && woke->sched_badge != 0) {
+                woke->sched_notif->signal(woke->sched_badge);
+            }
         } else {
             locked = false;
             owner = nullptr;

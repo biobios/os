@@ -68,11 +68,13 @@ public:
     // Recv waiter management
     void add_recv_waiter(Thread* thread);
     Thread* pop_recv_waiter();
+    bool remove_recv_waiter(Thread* thread);
     bool has_recv_waiters() const { return recv_waiter_head != nullptr; }
 
     // Send waiter management
     void add_send_waiter(Thread* thread);
     Thread* pop_send_waiter();
+    bool remove_send_waiter(Thread* thread);
     bool has_send_waiters() const { return send_waiter_head != nullptr; }
 
     // Rendezvous handoff message

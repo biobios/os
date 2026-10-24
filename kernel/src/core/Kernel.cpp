@@ -20,9 +20,13 @@
 #include "utils/ELF.hpp"
 #include "utils/new_delete.hpp"
 #include "utils/utils.hpp"
+#include "core/SavedInterruptFrame.hpp"
+#include "core/Baton.hpp"
 
 namespace oz {
 
+SavedInterruptFrame g_saved_interrupt_frame;
+Scheduler* g_scheduler_ptr = nullptr;
 static Kernel* g_kernel_instance = nullptr;
 
 Kernel& Kernel::instance() {
@@ -37,6 +41,7 @@ Kernel::Kernel(oz_boot::PlatformInfo* platformInfo)
     , platform_info_(platformInfo)
 {
     g_kernel_instance = this;
+    g_scheduler_ptr = &scheduler;
 }
 
 void Kernel::initSyscallAndStubs() {
@@ -46,20 +51,39 @@ void Kernel::initSyscallAndStubs() {
         Kernel::instance().scheduler.exitThread();
     };
     oz::g_get_current_cspace_func = []() -> CSpace* {
-        auto* thread = Kernel::instance().scheduler.getCurrentThread();
-        return thread ? thread->cspace : nullptr;
+        auto* ctx = Kernel::instance().scheduler.getCurrentContext();
+        return ctx ? ctx->cspace : nullptr;
     };
     oz::g_get_current_thread_func = []() -> Thread* {
         return Kernel::instance().scheduler.getCurrentThread();
+    };
+    oz::g_get_current_context_func = []() -> ExecutionContext* {
+        return Kernel::instance().scheduler.getCurrentContext();
     };
     oz::g_block_thread_func = []() {
         Kernel::instance().scheduler.schedule();
     };
     oz::g_unblock_thread_func = [](Thread* t) {
-        Kernel::instance().scheduler.queueThread(t);
+        if (!t) return;
+        t->is_blocked = false;
+        t->state = ThreadState::Ready;
+        if (t->baton) {
+            t->baton->notify_if_runnable();
+        }
+        if (t->sched_notif && t->sched_badge != 0) {
+            t->sched_notif->signal(t->sched_badge);
+        }
     };
     oz::g_queue_thread_func = [](Thread* t) {
-        Kernel::instance().scheduler.queueThread(t);
+        if (!t) return;
+        t->is_blocked = false;
+        t->state = ThreadState::Ready;
+        if (t->baton) {
+            t->baton->notify_if_runnable();
+        }
+        if (t->sched_notif && t->sched_badge != 0) {
+            t->sched_notif->signal(t->sched_badge);
+        }
     };
     oz::g_register_irq_handler_fn = [](std::uint8_t vector, IRQHandler* handler) {
         oz::irq::registerHandler(vector, handler);
@@ -68,7 +92,15 @@ void Kernel::initSyscallAndStubs() {
         oz::irq::unregisterHandler(vector, handler);
     };
     oz::irq::setUnblockFn([](Thread* t) {
-        Kernel::instance().scheduler.queueThread(t);
+        if (!t) return;
+        t->is_blocked = false;
+        t->state = ThreadState::Ready;
+        if (t->baton) {
+            t->baton->notify_if_runnable();
+        }
+        if (t->sched_notif && t->sched_badge != 0) {
+            t->sched_notif->signal(t->sched_badge);
+        }
     });
     oz::irq::setTimerTickFn([]() {
         Kernel::instance().scheduler.tick();
@@ -334,17 +366,20 @@ void Kernel::setupRootServerCaps(Thread* init_thread, UntypedMemory& boot_untype
         root_ioport->release();
         dprint("[Kernel] Root IOPort capability created (Slot 247).\n\r");
     }
-}
 
-void Kernel::setupIdleThread() {
-    alignas(Thread) static std::uint8_t idle_thread_mem[sizeof(Thread)];
-    alignas(16) static std::uint8_t idle_stack[4096];
-    Thread* idle_t = new (idle_thread_mem) Thread(
-        0, idle_stack, sizeof(idle_stack), PageBlock<>{nullptr}, 0
-    );
-    idle_t->is_untyped_backed = true;
-    scheduler.setupThreadContext(idle_t, Scheduler::idle_reaper_task, &scheduler);
-    scheduler.queueThread(idle_t);
+    // 10. Setup Root Baton capability (Slot 248)
+    auto* root_baton = boot_untyped.allocateObject<Baton>(true);
+    if (root_baton) {
+        root_baton->is_infinite = true;
+        root_baton->budget = ~0ULL;
+        root_baton->thread = init_thread;
+        root_baton->is_active = true;
+        init_thread->baton = root_baton;
+        Capability baton_cap(root_baton, CapRights::ALL);
+        init_cspace->insert(248, baton_cap);
+        root_baton->release();
+        dprint("[Kernel] Root Baton capability created (Slot 248).\n\r");
+    }
 }
 
 void Kernel::run() {
@@ -363,17 +398,17 @@ void Kernel::run() {
 
     if (init_thread) {
         setupRootServerCaps(init_thread, boot_untyped, devices, initrd_file);
-        scheduler.queueThread(init_thread);
-        dprint("[Kernel] Init process loaded successfully.\n\r");
+        dprint("[Kernel] Init process loaded successfully (Root Scheduler).\n\r");
     } else {
         dprint("[Kernel] Failed to load init process!\n\r");
     }
 
-    setupIdleThread();
-
     // Start APIC Timer for preemption
     scheduler.initMainThread();
     oz::x86_64::initAPICTimer(oz::x86_64::APIC_TIMER_VECTOR);
+
+    // Initial dispatch to Root Scheduler (Init)
+    scheduler.directSwitchTo(init_thread);
 
     while (1) {
         __asm__ volatile("sti; hlt");

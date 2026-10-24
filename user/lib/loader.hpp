@@ -114,8 +114,20 @@ inline SpawnedProcess spawn_process(
     const std::uint8_t* elf_data,
     std::size_t elf_size,
     std::uint64_t staging_vaddr = 0x550000000000ULL,
-    const ProcessStartupInfo* startup_info = nullptr
+    const ProcessStartupInfo* startup_info = nullptr,
+    bool is_interrupt_thread = false
 );
+
+inline SpawnedProcess spawn_interrupt_process(
+    std::uint32_t untyped_cap,
+    std::uint32_t self_vspace_cap,
+    const std::uint8_t* elf_data,
+    std::size_t elf_size,
+    std::uint64_t staging_vaddr = 0x550000000000ULL,
+    const ProcessStartupInfo* startup_info = nullptr
+) {
+    return spawn_process(untyped_cap, self_vspace_cap, elf_data, elf_size, staging_vaddr, startup_info, true);
+}
 
 inline SpawnedProcess spawn_process(
     std::uint32_t untyped_cap,
@@ -125,7 +137,7 @@ inline SpawnedProcess spawn_process(
     const ProcessStartupInfo* startup_info,
     std::uint64_t staging_vaddr = 0x550000000000ULL
 ) {
-    return spawn_process(untyped_cap, self_vspace_cap, elf_data, elf_size, staging_vaddr, startup_info);
+    return spawn_process(untyped_cap, self_vspace_cap, elf_data, elf_size, staging_vaddr, startup_info, false);
 }
 
 inline SpawnedProcess spawn_process(
@@ -134,7 +146,8 @@ inline SpawnedProcess spawn_process(
     const std::uint8_t* elf_data,
     std::size_t elf_size,
     std::uint64_t staging_vaddr,
-    const ProcessStartupInfo* startup_info
+    const ProcessStartupInfo* startup_info,
+    bool is_interrupt_thread
 ) {
 
     SpawnedProcess result{};
@@ -174,8 +187,13 @@ inline SpawnedProcess spawn_process(
     result.vspace_cap = sys_vspace_create(untyped_cap);
     if (result.vspace_cap == static_cast<std::uint32_t>(-1)) return result;
 
-    // 2. Retype a TCB from UntypedMemory
-    result.tcb_cap = sys_untyped_retype(untyped_cap, static_cast<std::uint32_t>(ObjectType::TCB), 0);
+    // 2. Retype a TCB / InterruptThread from UntypedMemory
+    result.tcb_cap = sys_untyped_retype(
+        untyped_cap,
+        is_interrupt_thread ? static_cast<std::uint32_t>(ObjectType::InterruptThread)
+                            : static_cast<std::uint32_t>(ObjectType::TCB),
+        0
+    );
     if (result.tcb_cap == static_cast<std::uint32_t>(-1)) return result;
 
     // 3. Load PT_LOAD segments via staging buffer
@@ -268,6 +286,9 @@ inline SpawnedProcess spawn_process(
                               static_cast<std::uint32_t>(CapRights::ALL)) != 0) {
         return result;
     }
+    // Insert child's CSpace into its own CSpace at Slot 245 (CAP_SELF_CSPACE)
+    sys_cspace_cap_insert(result.cspace_cap, CAP_SELF_CSPACE, result.cspace_cap,
+                          static_cast<std::uint32_t>(CapRights::ALL));
 
     // 6. Configure TCB
     result.entry_point = ehdr->e_entry;

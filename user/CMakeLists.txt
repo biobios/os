@@ -96,10 +96,15 @@ add_executable(wm src/wm/main.cpp src/display/Font.cpp src/wm/linker.ld)
 target_link_libraries(wm oz_syscall)
 target_link_options(wm PRIVATE "-T${CMAKE_CURRENT_SOURCE_DIR}/src/wm/linker.ld" "-nostdlib" "-static")
 
+# sched process (User-space Scheduler Daemon)
+add_executable(sched src/sched/main.cpp src/sched/linker.ld)
+target_link_libraries(sched oz_syscall)
+target_link_options(sched PRIVATE "-T${CMAKE_CURRENT_SOURCE_DIR}/src/sched/linker.ld" "-nostdlib" "-static")
+
 add_custom_target(initrd ALL
-    COMMAND tar -cvf ${CMAKE_SOURCE_DIR}/assets/initrd.tar -C ${CMAKE_CURRENT_BINARY_DIR} init console vfs ahci xhci display shell manifest_test cat head memman procman wm
+    COMMAND tar -cvf ${CMAKE_SOURCE_DIR}/assets/initrd.tar -C ${CMAKE_CURRENT_BINARY_DIR} init console vfs ahci xhci display shell manifest_test cat head memman procman wm sched
     COMMAND cp ${CMAKE_CURRENT_BINARY_DIR}/shell ${CMAKE_CURRENT_BINARY_DIR}/manifest_test ${CMAKE_CURRENT_BINARY_DIR}/cat ${CMAKE_CURRENT_BINARY_DIR}/head ${CMAKE_SOURCE_DIR}/assets/
-    DEPENDS init console vfs ahci xhci display shell manifest_test cat head memman procman wm
+    DEPENDS init console vfs ahci xhci display shell manifest_test cat head memman procman wm sched
 )
 target_sources(oz_syscall PRIVATE lib/malloc.cpp)
 

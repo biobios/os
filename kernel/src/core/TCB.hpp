@@ -7,6 +7,9 @@
 #include "core/Notification.hpp"
 #include "utils/utils.hpp"
 
+void dprint_hex(std::uint64_t);
+void dprint_dec(std::uint64_t);
+
 namespace oz {
 
 class CSpace;
@@ -23,26 +26,22 @@ private:
     Thread* thread_;
     bool owned_;  // If true, TCB owns the thread and will schedule cleanup on destruction
 
-    // Function pointers for scheduler operations (set by Kernel.hpp)
-    void (*queue_fn_)(void* scheduler, Thread* t);
-    void* scheduler_;
-    void (*queue_thread_fn_)(Thread*){nullptr};
-
 public:
     TCB(Thread* thread, bool owned,
         void (*queue_fn)(void*, Thread*) = nullptr, void* scheduler = nullptr,
         bool untyped = false)
         : KernelObject(ObjectType::TCB, untyped),
-          thread_(thread), owned_(owned),
-          queue_fn_(queue_fn), scheduler_(scheduler) {}
+          thread_(thread), owned_(owned) {
+        (void)queue_fn; (void)scheduler;
+    }
 
     TCB(Thread* thread, bool owned,
         void (*queue_thread_fn)(Thread*),
         bool untyped = false)
         : KernelObject(ObjectType::TCB, untyped),
-          thread_(thread), owned_(owned),
-          queue_fn_(nullptr), scheduler_(nullptr),
-          queue_thread_fn_(queue_thread_fn) {}
+          thread_(thread), owned_(owned) {
+        (void)queue_thread_fn;
+    }
 
     ~TCB() override {
         if (thread_) {
@@ -54,6 +53,7 @@ public:
     }
 
     Thread* getThread() const { return thread_; }
+    std::uint64_t getThreadId() const { return thread_ ? thread_->id : 0; }
 
     void setFaultEndpoint(ChannelEndpoint* ep) {
         if (thread_) {
@@ -80,30 +80,51 @@ public:
         return thread_ ? thread_->exit_badge : 0;
     }
 
-    // Resume: queue thread into scheduler
+    void setSchedNotification(Notification* notif, std::uint64_t badge) {
+        if (thread_) {
+            thread_->sched_notif = notif;
+            thread_->sched_badge = badge;
+        }
+    }
+
+    Notification* getSchedNotification() const {
+        return thread_ ? thread_->sched_notif : nullptr;
+    }
+
+    std::uint64_t getSchedBadge() const {
+        return thread_ ? thread_->sched_badge : 0;
+    }
+
+    // Resume: unblock thread and signal sched notification
     bool resume() {
         if (!thread_) return false;
-        if (thread_->state == ThreadState::Ready || thread_->state == ThreadState::Running) return false;
+        if (!thread_->is_blocked && thread_->state == ThreadState::Running) return false;
+        thread_->is_blocked = false;
         thread_->state = ThreadState::Ready;
-        if (queue_thread_fn_) {
-            queue_thread_fn_(thread_);
-            return true;
+        if (thread_->sched_notif && thread_->sched_badge != 0) {
+            thread_->sched_notif->signal(thread_->sched_badge);
         }
-        if (queue_fn_ && scheduler_) {
-            queue_fn_(scheduler_, thread_);
-            return true;
-        }
-        return false;
+        return true;
     }
 
     // Suspend: mark thread as blocked (will not be re-queued)
     bool suspend() {
         if (!thread_) return false;
-        if (thread_->state == ThreadState::Running || thread_->state == ThreadState::Ready) {
-            thread_->state = ThreadState::Blocked;
-            return true;
-        }
-        return false;
+        thread_->is_blocked = true;
+        thread_->state = ThreadState::Blocked;
+        return true;
+    }
+
+    // Cancel blocked IPC and revoke pending replies
+    bool cancel_ipc() {
+        if (!thread_) return false;
+        return thread_->cancel_ipc();
+    }
+
+    // Get accumulated CPU cycles (O(1))
+    std::uint64_t get_total_cpu_cycles() const {
+        if (!thread_) return 0;
+        return thread_->total_cpu_cycles;
     }
 
     // Set registers for initial execution

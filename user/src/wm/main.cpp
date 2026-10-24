@@ -1,4 +1,5 @@
 #include "syscall.hpp"
+#include "ring_buffer.hpp"
 #include "Layout.hpp"
 #include "WindowManager.hpp"
 #include "../display/Font.hpp"
@@ -15,15 +16,21 @@ struct Pixel {
 };
 
 // Cap slots for Window Manager
-static constexpr std::uint32_t CAP_CONSOLE_SEND = 1;
-static constexpr std::uint32_t CAP_DISPLAY_SEND = 2;
-static constexpr std::uint32_t CAP_DISPLAY_RECV = 3;
-static constexpr std::uint32_t CAP_WM_RECV      = 4;
+static constexpr std::uint32_t CAP_CONSOLE_SEND   = 1;
+static constexpr std::uint32_t CAP_DISPLAY_SEND   = 2;
+static constexpr std::uint32_t CAP_DISPLAY_RECV   = 3;
+static constexpr std::uint32_t CAP_WM_RECV        = 4;
+static constexpr std::uint32_t CAP_KBD_RING_FRAME = 5;
+static constexpr std::uint32_t CAP_NOTIF_WM       = 6;
 
 static constexpr std::uint64_t BAR_SURF_VADDR = 0x750000000000ULL;
 static constexpr std::uint64_t CLIENT_SURF_BASE_VADDR = 0x760000000000ULL;
+static constexpr std::uint64_t KBD_RING_VIRT = 0x770000000000ULL;
+
+static constexpr std::uint64_t BADGE_KEYBOARD = 1ULL << 1;
 
 static oz::wm::WindowManager g_wm;
+static volatile oz::WMInputRing* g_kbd_ring = nullptr;
 static std::uint32_t g_bar_surf_id = 0;
 static Pixel* g_bar_buffer = nullptr;
 static std::uint32_t g_screen_width = 800;
@@ -31,25 +38,16 @@ static std::uint32_t g_screen_height = 600;
 
 // Helper: send IPC to Display Server and wait for response
 bool display_send_sync(oz::IPCMessage* req, oz::IPCMessage* resp) {
-    std::uint32_t reply_send = 0;
-    std::uint32_t reply_recv = 0;
-    if (!oz::sys_channel_create(oz::CAP_UNTYPED, &reply_send, &reply_recv)) {
-        oz::sys_debug_print("[WM] display_send_sync: sys_channel_create FAILED!\n\r");
+    if (!oz::sys_call(CAP_DISPLAY_SEND, req, resp)) {
+        oz::sys_debug_print("[WM] display_send_sync: sys_call FAILED!\n\r");
         return false;
     }
-    req->transferred_cap = reply_send;
-    req->has_cap = true;
-    if (!oz::sys_channel_send(CAP_DISPLAY_SEND, req)) {
-        oz::sys_debug_print("[WM] display_send_sync: sys_channel_send FAILED!\n\r");
-        oz::sys_cap_delete(reply_recv);
-        return false;
-    }
-    bool ok = oz::sys_channel_recv(reply_recv, resp);
-    if (!ok) {
-        oz::sys_debug_print("[WM] display_send_sync: sys_channel_recv FAILED!\n\r");
-    }
-    oz::sys_cap_delete(reply_recv);
-    return ok;
+    return true;
+}
+
+static void display_send_cmd(const oz::IPCMessage* msg) {
+    oz::IPCMessage resp{};
+    oz::sys_call(CAP_DISPLAY_SEND, msg, &resp);
 }
 
 // Draw a single character in the status bar buffer
@@ -167,7 +165,7 @@ void render_status_bar(bool auto_commit = true) {
         oz::IPCMessage commit_msg{};
         commit_msg.data[0] = static_cast<std::uint64_t>(oz::ipc::DisplayCmd::COMMIT);
         commit_msg.data[1] = g_bar_surf_id;
-        oz::sys_channel_send(CAP_DISPLAY_SEND, &commit_msg);
+        display_send_cmd(&commit_msg);
     }
 }
 
@@ -194,7 +192,7 @@ void sync_node_to_display(oz::wm::LayoutNode* node, std::uint32_t focused_id) {
         pos_msg.data[1] = win->surface_id;
         pos_msg.data[2] = (static_cast<std::uint64_t>(surf_x) << 32) | (static_cast<std::uint64_t>(surf_y) & 0xFFFFFFFFULL);
         pos_msg.data[3] = (static_cast<std::uint64_t>(surf_w) << 32) | (static_cast<std::uint64_t>(surf_h) & 0xFFFFFFFFULL);
-        oz::sys_channel_send(CAP_DISPLAY_SEND, &pos_msg);
+        display_send_cmd(&pos_msg);
 
         // Set Border: Focused window = Cyan, Inactive = Dim Slate (0x444444)
         bool is_focused = (win->id == focused_id);
@@ -205,14 +203,14 @@ void sync_node_to_display(oz::wm::LayoutNode* node, std::uint32_t focused_id) {
         border_msg.data[1] = win->surface_id;
         border_msg.data[2] = bw;
         border_msg.data[3] = border_color;
-        oz::sys_channel_send(CAP_DISPLAY_SEND, &border_msg);
+        display_send_cmd(&border_msg);
 
         // Ensure visibility is ON
         oz::IPCMessage vis_msg{};
         vis_msg.data[0] = static_cast<std::uint64_t>(oz::ipc::DisplayCmd::SET_SURFACE_VISIBILITY);
         vis_msg.data[1] = win->surface_id;
         vis_msg.data[2] = 1;
-        oz::sys_channel_send(CAP_DISPLAY_SEND, &vis_msg);
+        display_send_cmd(&vis_msg);
 
         return;
     }
@@ -237,7 +235,7 @@ void sync_state_to_display() {
                 hide_msg.data[0] = static_cast<std::uint64_t>(oz::ipc::DisplayCmd::SET_SURFACE_VISIBILITY);
                 hide_msg.data[1] = win->surface_id;
                 hide_msg.data[2] = 0;
-                oz::sys_channel_send(CAP_DISPLAY_SEND, &hide_msg);
+                display_send_cmd(&hide_msg);
             }
             win->was_visible = is_active;
         }
@@ -253,7 +251,7 @@ void sync_state_to_display() {
     oz::IPCMessage commit_msg{};
     commit_msg.data[0] = static_cast<std::uint64_t>(oz::ipc::DisplayCmd::COMMIT);
     commit_msg.data[1] = 0; // Commit all
-    oz::sys_channel_send(CAP_DISPLAY_SEND, &commit_msg);
+    display_send_cmd(&commit_msg);
     oz::sys_debug_print("[WM] sync_state_to_display: done\n\r");
 }
 
@@ -270,7 +268,7 @@ void update_focus(std::uint32_t old_focused_id, std::uint32_t new_focused_id) {
             border_msg.data[1] = old_win->surface_id;
             border_msg.data[2] = oz::wm::BORDER_THICKNESS;
             border_msg.data[3] = 0x00444444; // Inactive
-            oz::sys_channel_send(CAP_DISPLAY_SEND, &border_msg);
+            display_send_cmd(&border_msg);
         }
     }
 
@@ -283,7 +281,7 @@ void update_focus(std::uint32_t old_focused_id, std::uint32_t new_focused_id) {
             border_msg.data[1] = new_win->surface_id;
             border_msg.data[2] = oz::wm::BORDER_THICKNESS;
             border_msg.data[3] = 0x0000FFFF; // Cyan (Active)
-            oz::sys_channel_send(CAP_DISPLAY_SEND, &border_msg);
+            display_send_cmd(&border_msg);
         }
     }
 
@@ -354,7 +352,7 @@ void handle_key_input(char ascii, std::uint8_t scancode, std::uint32_t modifiers
                     oz::IPCMessage ds_msg{};
                     ds_msg.data[0] = static_cast<std::uint64_t>(oz::ipc::DisplayCmd::DESTROY_SURFACE);
                     ds_msg.data[1] = win->surface_id;
-                    oz::sys_channel_send(CAP_DISPLAY_SEND, &ds_msg);
+                    display_send_cmd(&ds_msg);
                 }
                 g_wm.destroy_window(focused_id);
                 sync_state_to_display();
@@ -396,18 +394,232 @@ void handle_key_input(char ascii, std::uint8_t scancode, std::uint32_t modifiers
         }
     }
 
-    // Pass-through: send key event directly to focused window's input channel
+    // Pass-through: send key event directly to focused window's input channel or queue
     auto* win = g_wm.get_focused_window();
-    if (win && win->input_channel_send != 0) {
+    if (win) {
         oz::IPCMessage event_msg{};
         event_msg.data[0] = static_cast<std::uint64_t>(oz::ipc::WMEventType::KEY_DOWN);
         event_msg.data[1] = static_cast<std::uint64_t>(ascii);
         event_msg.data[2] = static_cast<std::uint64_t>(scancode);
         event_msg.data[3] = static_cast<std::uint64_t>(modifiers);
-        oz::sys_channel_send(win->input_channel_send, &event_msg);
+        win->enqueue_key(event_msg);
+        if (win->notif_cap != 0) {
+            oz::sys_notification_signal(win->notif_cap, oz::ipc::BADGE_WM_INPUT_EVENT);
+        }
     }
 }
 
+static void drain_keyboard() {
+    if (!g_kbd_ring) return;
+    oz::WMInputEvent ev{};
+    while (const_cast<oz::WMInputRing*>(g_kbd_ring)->pop(&ev)) {
+        if (ev.type == static_cast<std::uint32_t>(oz::ipc::WMEventType::KEY_DOWN)) {
+            char ascii = static_cast<char>(ev.code & 0xFF);
+            std::uint8_t scancode = static_cast<std::uint8_t>((ev.code >> 8) & 0xFF);
+            handle_key_input(ascii, scancode, ev.modifiers);
+        }
+    }
+}
+
+static void wm_cmd_worker() {
+    oz::ReplyToken tok = oz::INVALID_REPLY_TOKEN;
+    oz::IPCMessage req{};
+    oz::IPCMessage resp{};
+    while (true) {
+        tok = oz::sys_reply_recv(tok, CAP_WM_RECV, (tok != oz::INVALID_REPLY_TOKEN) ? &resp : nullptr, &req);
+        if (tok == oz::INVALID_REPLY_TOKEN) {
+            continue;
+        }
+
+        // Distinguish between Keyboard Event from xHCI/Init vs WM IPC Command
+        if (req.data[0] == static_cast<std::uint64_t>(oz::ipc::WMEventType::KEY_DOWN)) {
+            char ascii = static_cast<char>(req.data[1]);
+            std::uint8_t scancode = static_cast<std::uint8_t>(req.data[2]);
+            std::uint32_t modifiers = static_cast<std::uint32_t>(req.data[3]);
+            handle_key_input(ascii, scancode, modifiers);
+            resp = oz::IPCMessage{};
+            resp.data[0] = 0;
+            continue;
+        }
+
+        auto cmd = static_cast<oz::ipc::WMCmd>(req.data[0] & 0xFFFFFFFFULL);
+        resp = oz::IPCMessage{};
+
+        switch (cmd) {
+            case oz::ipc::WMCmd::CREATE_WINDOW: {
+                std::uint32_t req_w = static_cast<std::uint32_t>(req.data[1]);
+                std::uint32_t req_h = static_cast<std::uint32_t>(req.data[2]);
+                if (req_w == 0) req_w = 400;
+                if (req_h == 0) req_h = 300;
+
+                oz::IPCMessage surf_req{};
+                surf_req.data[0] = static_cast<std::uint64_t>(oz::ipc::DisplayCmd::CREATE_SURFACE);
+                surf_req.data[1] = req_w;
+                surf_req.data[2] = req_h;
+                oz::IPCMessage surf_resp{};
+
+                bool ds_ok = display_send_sync(&surf_req, &surf_resp);
+                if (ds_ok && surf_resp.data[0] == 0 && surf_resp.has_cap) {
+                    std::uint32_t surf_id = static_cast<std::uint32_t>(surf_resp.data[1]);
+                    std::uint32_t surf_frame_cap = surf_resp.transferred_cap;
+
+                    std::uint32_t input_send = 0;
+                    std::uint32_t input_recv = 0;
+                    oz::sys_channel_create(oz::CAP_UNTYPED, &input_send, &input_recv);
+
+                    auto* win = g_wm.alloc_window(surf_id, input_send);
+                    if (win) {
+                        g_wm.place_window(win->id);
+                        sync_state_to_display();
+
+                        resp.data[0] = 0;
+                        resp.data[1] = win->id;
+                        resp.data[2] = surf_id;
+                        resp.transferred_cap = surf_frame_cap;
+                        resp.has_cap = true;
+                    } else {
+                        resp.data[0] = 2;
+                    }
+                } else {
+                    resp.data[0] = 1;
+                }
+                break;
+            }
+            case oz::ipc::WMCmd::DESTROY_WINDOW: {
+                std::uint32_t win_id = static_cast<std::uint32_t>(req.data[1]);
+                auto* win = g_wm.get_window(win_id);
+                if (win) {
+                    oz::IPCMessage ds_msg{};
+                    ds_msg.data[0] = static_cast<std::uint64_t>(oz::ipc::DisplayCmd::DESTROY_SURFACE);
+                    ds_msg.data[1] = win->surface_id;
+                    display_send_cmd(&ds_msg);
+
+                    g_wm.destroy_window(win_id);
+                    sync_state_to_display();
+                    resp.data[0] = 0;
+                } else {
+                    resp.data[0] = 1;
+                }
+                break;
+            }
+            case oz::ipc::WMCmd::SET_TITLE: {
+                std::uint32_t win_id = static_cast<std::uint32_t>(req.data[1]);
+                auto* win = g_wm.get_window(win_id);
+                if (win) {
+                    char* title_dst = win->title;
+                    const char* src = reinterpret_cast<const char*>(&req.data[2]);
+                    for (int i = 0; i < 16 && src[i] != '\0'; ++i) {
+                        title_dst[i] = src[i];
+                        title_dst[i + 1] = '\0';
+                    }
+                    render_status_bar();
+                    resp.data[0] = 0;
+                } else {
+                    resp.data[0] = 1;
+                }
+                break;
+            }
+            case oz::ipc::WMCmd::FOCUS_WINDOW: {
+                std::uint32_t win_id = static_cast<std::uint32_t>(req.data[1]);
+                auto* win = g_wm.get_window(win_id);
+                if (win) {
+                    std::uint32_t old_id = g_wm.focused_window_id();
+                    if (win->workspace_idx != g_wm.active_workspace()) {
+                        g_wm.switch_workspace(win->workspace_idx);
+                        sync_state_to_display();
+                    } else {
+                        g_wm.set_focused_window_id(win_id);
+                        update_focus(old_id, win_id);
+                    }
+                    resp.data[0] = 0;
+                } else {
+                    resp.data[0] = 1;
+                }
+                break;
+            }
+            case oz::ipc::WMCmd::BIND_INPUT_CHANNEL: {
+                std::uint32_t win_id = static_cast<std::uint32_t>(req.data[1]);
+                auto* win = g_wm.get_window(win_id);
+                if (win && req.has_cap) {
+                    win->input_channel_send = req.transferred_cap;
+                    resp.data[0] = 0;
+                } else {
+                    resp.data[0] = 1;
+                }
+                break;
+            }
+            case oz::ipc::WMCmd::BIND_NOTIFICATION: {
+                std::uint32_t win_id = static_cast<std::uint32_t>(req.data[1]);
+                auto* win = g_wm.get_window(win_id);
+                if (win && req.has_cap) {
+                    if (win->notif_cap != 0) {
+                        oz::sys_cap_delete(win->notif_cap);
+                    }
+                    win->notif_cap = req.transferred_cap;
+                    resp.data[0] = 0;
+                } else {
+                    resp.data[0] = 1;
+                }
+                break;
+            }
+            case oz::ipc::WMCmd::MINIMIZE_WINDOW: {
+                bool ok = g_wm.minimize_focused();
+                if (ok) {
+                    sync_state_to_display();
+                    resp.data[0] = 0;
+                } else {
+                    resp.data[0] = 1;
+                }
+                break;
+            }
+            case oz::ipc::WMCmd::RESTORE_MINIMIZED: {
+                bool ok = g_wm.restore_minimized();
+                if (ok) {
+                    sync_state_to_display();
+                    resp.data[0] = 0;
+                } else {
+                    resp.data[0] = 1;
+                }
+                break;
+            }
+            case oz::ipc::WMCmd::GET_WINDOW_INFO: {
+                std::uint32_t win_id = static_cast<std::uint32_t>(req.data[1]);
+                auto* win = g_wm.get_window(win_id);
+                if (win) {
+                    resp.data[0] = 0;
+                    resp.data[1] = win->workspace_idx;
+                    resp.data[2] = win->is_minimized ? 1 : 0;
+                    resp.data[3] = (g_wm.focused_window_id() == win_id) ? 1 : 0;
+                } else {
+                    resp.data[0] = 1;
+                }
+                break;
+            }
+            case oz::ipc::WMCmd::GET_EVENT: {
+                std::uint32_t win_id = static_cast<std::uint32_t>(req.data[1]);
+                auto* win = g_wm.get_window(win_id);
+                if (win) {
+                    oz::IPCMessage key_msg{};
+                    if (win->peek_key(&key_msg)) {
+                        win->pop_key();
+                        resp.data[0] = 0;
+                        resp.data[1] = key_msg.data[1];
+                        resp.data[2] = key_msg.data[2];
+                        resp.data[3] = key_msg.data[3];
+                    } else {
+                        resp.data[0] = 1;
+                    }
+                } else {
+                    resp.data[0] = static_cast<std::uint64_t>(-1);
+                }
+                break;
+            }
+            default:
+                resp.data[0] = static_cast<std::uint64_t>(-1);
+                break;
+        }
+    }
+}
 } // namespace
 
 extern "C" void _start() {
@@ -473,13 +685,13 @@ extern "C" void _start() {
             pos_bar.data[1] = g_bar_surf_id;
             pos_bar.data[2] = 0; // (x=0, y=0)
             pos_bar.data[3] = (static_cast<std::uint64_t>(g_screen_width) << 32) | oz::wm::STATUS_BAR_HEIGHT;
-            oz::sys_channel_send(CAP_DISPLAY_SEND, &pos_bar);
+            display_send_cmd(&pos_bar);
 
             oz::IPCMessage vis_bar{};
             vis_bar.data[0] = static_cast<std::uint64_t>(oz::ipc::DisplayCmd::SET_SURFACE_VISIBILITY);
             vis_bar.data[1] = g_bar_surf_id;
             vis_bar.data[2] = 1;
-            oz::sys_channel_send(CAP_DISPLAY_SEND, &vis_bar);
+            display_send_cmd(&vis_bar);
 
             render_status_bar();
         } else {
@@ -489,210 +701,42 @@ extern "C" void _start() {
         oz::sys_debug_print("[WM] ERROR: Failed to create status bar surface!\n\r");
     }
 
-    // 4. Create Notification Event Loop
-    std::uint32_t notif_cap = oz::sys_notification_create(oz::CAP_UNTYPED);
-    if (notif_cap == oz::INVALID_CAP_ID) {
-        oz::sys_debug_print("[WM] ERROR: Failed to create Notification!\n\r");
-        oz::sys_exit(1);
+    // 4. Spawn passive command worker thread for CAP_WM_RECV
+    std::uint32_t worker_tcb = oz::sys_untyped_retype(oz::CAP_UNTYPED, static_cast<std::uint32_t>(oz::ObjectType::TCB), 0);
+    std::uint32_t worker_stack = oz::sys_frame_alloc(oz::CAP_UNTYPED, 2);
+    static constexpr std::uint64_t WORKER_STACK_TOP = 0x700010000000ULL;
+    oz::sys_vspace_map_with_pagetables(oz::CAP_SELF_VSPACE, oz::CAP_UNTYPED, worker_stack, WORKER_STACK_TOP - 8192, 0x01, 8192);
+    oz::sys_tcb_configure(worker_tcb, oz::CAP_SELF_CSPACE, oz::CAP_SELF_VSPACE,
+                          reinterpret_cast<std::uint64_t>(wm_cmd_worker), WORKER_STACK_TOP - 8);
+    oz::sys_tcb_resume(worker_tcb);
+
+    // Initial hand-off to let worker reach sys_reply_recv(token=0) and unbind
+    std::uint32_t worker_baton = oz::sys_untyped_retype(oz::CAP_UNTYPED, static_cast<std::uint32_t>(oz::ObjectType::Baton), 0);
+    oz::sys_tcb_bind_baton(worker_tcb, worker_baton);
+    oz::sys_baton_inject(worker_baton, 10000);
+    oz::SchedResult w_res = oz::sys_baton_switch(worker_baton);
+    if (w_res.reason == oz::SchedReason::ORPHANED) {
+        oz::sys_debug_print("[WM] Command worker initialized and passive.\n\r");
+    }
+    oz::sys_cap_delete(worker_baton);
+
+    // 5. Map shared Keyboard Ring Buffer Frame (slot 5) if available
+    if (oz::sys_vspace_map_with_pagetables(oz::CAP_SELF_VSPACE, oz::CAP_UNTYPED, CAP_KBD_RING_FRAME, KBD_RING_VIRT, 0x01, 4096) == 0) {
+        g_kbd_ring = reinterpret_cast<volatile oz::WMInputRing*>(KBD_RING_VIRT);
+        oz::sys_debug_print("[WM] Shared Keyboard Ring Buffer mapped successfully.\n\r");
     }
 
-    static constexpr std::uint64_t BADGE_WM = 1ULL << 0;
-    if (oz::sys_channel_bind_notification(CAP_WM_RECV, notif_cap, BADGE_WM) != 0) {
-        oz::sys_debug_print("[WM] ERROR: Failed to bind WM Channel to Notification!\n\r");
-        oz::sys_exit(1);
-    }
+    oz::sys_debug_print("[WM] Main notification loop ready (Autonomous Manager).\n\r");
 
-    oz::sys_debug_print("[WM] Event loop ready. Tiling Window Manager operational.\n\r");
-
-    // 5. Main Event Loop
+    // 6. Main Notification Loop (Autonomous keyboard event processor)
     while (true) {
         std::uint64_t badge = 0;
-        if (oz::sys_notification_wait(notif_cap, &badge) != 0) {
+        if (oz::sys_notification_wait(CAP_NOTIF_WM, &badge) != 0) {
             continue;
         }
 
-        if (badge & BADGE_WM) {
-            oz::IPCMessage req{};
-            if (!oz::sys_channel_recv(CAP_WM_RECV, &req)) {
-                continue;
-            }
-
-            // Distinguish between Keyboard Event from xHCI vs WM IPC Command
-            if (req.data[0] == static_cast<std::uint64_t>(oz::ipc::WMEventType::KEY_DOWN)) {
-                char ascii = static_cast<char>(req.data[1]);
-                std::uint8_t scancode = static_cast<std::uint8_t>(req.data[2]);
-                std::uint32_t modifiers = static_cast<std::uint32_t>(req.data[3]);
-                handle_key_input(ascii, scancode, modifiers);
-                continue;
-            }
-
-            // Otherwise, it's a WM IPC Command
-            auto cmd = static_cast<oz::ipc::WMCmd>(req.data[0] & 0xFFFFFFFFULL);
-            oz::IPCMessage resp{};
-            std::uint32_t reply_endpoint = (req.has_cap && cmd != oz::ipc::WMCmd::BIND_INPUT_CHANNEL) ? req.transferred_cap : 0;
-
-            switch (cmd) {
-                case oz::ipc::WMCmd::CREATE_WINDOW: {
-                    oz::sys_debug_print("[WM] Handling CREATE_WINDOW command...\n\r");
-                    // Client requests window creation: data[1] = width, data[2] = height
-                    std::uint32_t req_w = static_cast<std::uint32_t>(req.data[1]);
-                    std::uint32_t req_h = static_cast<std::uint32_t>(req.data[2]);
-                    if (req_w == 0) req_w = 400;
-                    if (req_h == 0) req_h = 300;
-
-                    // 1. Create Surface in Display Server
-                    oz::IPCMessage surf_req{};
-                    surf_req.data[0] = static_cast<std::uint64_t>(oz::ipc::DisplayCmd::CREATE_SURFACE);
-                    surf_req.data[1] = req_w;
-                    surf_req.data[2] = req_h;
-                    oz::IPCMessage surf_resp{};
-
-                    bool ds_ok = display_send_sync(&surf_req, &surf_resp);
-                    if (ds_ok && surf_resp.data[0] == 0 && surf_resp.has_cap) {
-                        oz::sys_debug_print("[WM] Surface created for window!\n\r");
-                        std::uint32_t surf_id = static_cast<std::uint32_t>(surf_resp.data[1]);
-                        std::uint32_t surf_frame_cap = surf_resp.transferred_cap;
-
-                        // 2. Create Input Channel for window
-                        std::uint32_t input_send = 0;
-                        std::uint32_t input_recv = 0;
-                        oz::sys_channel_create(oz::CAP_UNTYPED, &input_send, &input_recv);
-
-                        // 3. Register in Window Manager
-                        auto* win = g_wm.alloc_window(surf_id, input_send);
-                        if (win) {
-                            g_wm.place_window(win->id);
-                            oz::sys_debug_print("[WM] Window placed in tiling layout! Syncing to display...\n\r");
-                            sync_state_to_display();
-
-                            resp.data[0] = 0; // Success
-                            resp.data[1] = win->id;
-                            resp.data[2] = surf_id;
-                            resp.transferred_cap = surf_frame_cap; // Grant FrameCap to client
-                            resp.has_cap = true;
-                        } else {
-                            resp.data[0] = 2; // Window table full
-                        }
-                    } else {
-                        oz::sys_debug_print("[WM] ERROR: Surface creation failed in display!\n\r");
-                        resp.data[0] = 1; // Surface creation failed
-                    }
-                    break;
-                }
-                case oz::ipc::WMCmd::DESTROY_WINDOW: {
-                    std::uint32_t win_id = static_cast<std::uint32_t>(req.data[1]);
-                    auto* win = g_wm.get_window(win_id);
-                    if (win) {
-                        // Destroy surface in display
-                        oz::IPCMessage ds_msg{};
-                        ds_msg.data[0] = static_cast<std::uint64_t>(oz::ipc::DisplayCmd::DESTROY_SURFACE);
-                        ds_msg.data[1] = win->surface_id;
-                        oz::sys_channel_send(CAP_DISPLAY_SEND, &ds_msg);
-
-                        g_wm.destroy_window(win_id);
-                        sync_state_to_display();
-                        resp.data[0] = 0;
-                    } else {
-                        resp.data[0] = 1;
-                    }
-                    break;
-                }
-                case oz::ipc::WMCmd::SET_TITLE: {
-                    std::uint32_t win_id = static_cast<std::uint32_t>(req.data[1]);
-                    auto* win = g_wm.get_window(win_id);
-                    if (win) {
-                        char* title_dst = win->title;
-                        const char* src = reinterpret_cast<const char*>(&req.data[2]);
-                        for (int i = 0; i < 16 && src[i] != '\0'; ++i) {
-                            title_dst[i] = src[i];
-                            title_dst[i + 1] = '\0';
-                        }
-                        render_status_bar();
-                        resp.data[0] = 0;
-                    } else {
-                        resp.data[0] = 1;
-                    }
-                    break;
-                }
-                case oz::ipc::WMCmd::FOCUS_WINDOW: {
-                    std::uint32_t win_id = static_cast<std::uint32_t>(req.data[1]);
-                    auto* win = g_wm.get_window(win_id);
-                    if (win) {
-                        std::uint32_t old_id = g_wm.focused_window_id();
-                        if (win->workspace_idx != g_wm.active_workspace()) {
-                            g_wm.switch_workspace(win->workspace_idx);
-                            sync_state_to_display();
-                        } else {
-                            g_wm.set_focused_window_id(win_id);
-                            update_focus(old_id, win_id);
-                        }
-                        resp.data[0] = 0;
-                    } else {
-                        resp.data[0] = 1;
-                    }
-                    break;
-                }
-                case oz::ipc::WMCmd::BIND_INPUT_CHANNEL: {
-                    std::uint32_t win_id = static_cast<std::uint32_t>(req.data[1]);
-                    auto* win = g_wm.get_window(win_id);
-                    if (win && req.has_cap) {
-                        win->input_channel_send = req.transferred_cap;
-                        oz::sys_debug_print("[WM] BIND_INPUT_CHANNEL: successfully bound input channel!\n\r");
-                        resp.data[0] = 0;
-                    } else {
-                        resp.data[0] = 1;
-                    }
-                    break;
-                }
-                case oz::ipc::WMCmd::MINIMIZE_WINDOW: {
-                    bool ok = g_wm.minimize_focused();
-                    if (ok) {
-                        sync_state_to_display();
-                        resp.data[0] = 0;
-                    } else {
-                        resp.data[0] = 1;
-                    }
-                    break;
-                }
-                case oz::ipc::WMCmd::RESTORE_MINIMIZED: {
-                    bool ok = g_wm.restore_minimized();
-                    if (ok) {
-                        sync_state_to_display();
-                        resp.data[0] = 0;
-                    } else {
-                        resp.data[0] = 1;
-                    }
-                    break;
-                }
-                case oz::ipc::WMCmd::GET_WINDOW_INFO: {
-                    std::uint32_t win_id = static_cast<std::uint32_t>(req.data[1]);
-                    auto* win = g_wm.get_window(win_id);
-                    if (win) {
-                        resp.data[0] = 0;
-                        resp.data[1] = win->workspace_idx;
-                        resp.data[2] = win->is_minimized ? 1 : 0;
-                        resp.data[3] = (g_wm.focused_window_id() == win_id) ? 1 : 0;
-                    } else {
-                        resp.data[0] = 1;
-                    }
-                    break;
-                }
-                default:
-                    resp.data[0] = static_cast<std::uint64_t>(-1);
-                    break;
-            }
-
-            oz::sys_debug_print("[WM] Main loop: preparing to reply to client...\n\r");
-            if (reply_endpoint != 0) {
-                bool rep_ok = oz::sys_channel_send(reply_endpoint, &resp);
-                if (!rep_ok) {
-                    oz::sys_debug_print("[WM] ERROR: sys_channel_send to reply_endpoint FAILED!\n\r");
-                } else {
-                    oz::sys_debug_print("[WM] Sent reply to client successfully!\n\r");
-                }
-            } else {
-                oz::sys_debug_print("[WM] reply_endpoint is 0 (no reply requested)\n\r");
-            }
+        if (badge & BADGE_KEYBOARD) {
+            drain_keyboard();
         }
     }
 }

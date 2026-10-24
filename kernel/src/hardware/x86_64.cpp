@@ -8,8 +8,11 @@
 #include "core/IRQDispatch.hpp"
 #include "core/IRQHandler.hpp"
 #include "core/Thread.hpp"
+#include "core/InterruptThread.hpp"
 #include "core/Syscall.hpp"
 #include "core/Channel.hpp"
+#include "core/SavedInterruptFrame.hpp"
+#include "core/Scheduler.hpp"
 #include "utils/utils.hpp"
 
 namespace {
@@ -89,6 +92,7 @@ namespace{
 
     __attribute__((interrupt))
     void defaultHandler(oz::x86_64::ExceptionFrame* frame){
+        (void)frame;
         oz::x86_64::notifyEndOfInterrupt();
     }
 
@@ -140,13 +144,13 @@ namespace{
         std::uint64_t cs  = regs[17];
         std::uint64_t rsp = regs[19];
 
-        // If page fault from user space and thread has a Fault Endpoint
+        // If page fault from user space
         if ((cs & 3) != 0 && oz::g_get_current_thread_func) {
             Thread* current = oz::g_get_current_thread_func();
             if (current && current->fault_ep) {
                 ChannelEndpoint* ep = current->fault_ep;
                 ChannelEndpoint* peer = ep->get_peer();
-                if (peer) {
+                if (peer && !peer->is_peer_closed()) {
                     InternalIPCMessage msg{};
                     msg.user_msg.data[0] = cr2;
                     msg.user_msg.data[1] = error_code;
@@ -156,20 +160,81 @@ namespace{
 
                     Thread* pager = peer->pop_recv_waiter();
                     if (pager) {
-                        peer->set_rendezvous_msg(msg);
+                        if (pager->recv_msg_buf) {
+                            *pager->recv_msg_buf = msg.user_msg;
+                        } else {
+                            peer->set_rendezvous_msg(msg);
+                        }
+                        pager->current_reply_token = current->id;
+
+                        // Hand-off baton from current to pager
+                        Baton* b = current->baton;
+                        current->baton = nullptr;
+                        pager->baton = b;
+                        if (b) {
+                            b->thread = pager;
+                            b->is_active = true;
+                        }
+
+                        current->state = ThreadState::BlockedOnReply;
+                        current->is_blocked = true;
+
                         pager->state = ThreadState::Ready;
+                        pager->is_blocked = false;
                         if (oz::g_unblock_thread_func) {
                             oz::g_unblock_thread_func(pager);
                         }
-                    } else {
-                        ep->set_rendezvous_msg(msg);
-                    }
 
-                    current->state = ThreadState::Blocked;
-                    if (oz::g_block_thread_func) {
-                        oz::g_block_thread_func();
+                        std::uint64_t now = oz::x86_64::rdtsc();
+                        if (oz::g_scheduler_ptr) {
+                            oz::g_scheduler_ptr->performContextSwitch(current, pager, now);
+                        }
+                        return; // Resumed after page was mapped and reply sent!
+                    } else {
+                        // Pager not yet waiting on recv
+                        ep->set_rendezvous_msg(msg);
+                        current->state = ThreadState::BlockedOnCall;
+                        current->is_blocked = true;
+                        ep->add_send_waiter(current);
+
+                        if (peer->get_bound_notification()) {
+                            peer->get_bound_notification()->signal(peer->get_bound_badge());
+                        }
+
+                        if (oz::g_block_thread_func) {
+                            oz::g_block_thread_func();
+                        }
+                        return;
                     }
-                    return; // Resumed after page was mapped!
+                }
+            }
+
+            // fault_ep is unconfigured or pager dead -> terminate thread and switch to root with SchedReason::FAULT
+            if (current) {
+                dprint("[Kernel] Unhandled user #PF without fault_ep: CR2=0x");
+                char hexBuf[17];
+                oz::utils::to_hex(cr2, hexBuf);
+                dprint(hexBuf);
+                dprint(" RIP=0x");
+                oz::utils::to_hex(rip, hexBuf);
+                dprint(hexBuf);
+                dprint("\n\r");
+                current->state = ThreadState::Dead;
+                current->is_dead = true;
+                ExecutionContext* caller = nullptr;
+                if (current->baton) {
+                    caller = current->baton->caller_context;
+                    current->baton->caller_context = nullptr;
+                    current->baton->thread = nullptr;
+                    current->baton->is_active = false;
+                    current->baton = nullptr;
+                }
+                if (caller && oz::g_scheduler_ptr) {
+                    caller->sched_reason = SchedReason::FAULT;
+                    caller->preempted_irq_vector = 14; // Vector 14: #PF
+                    std::uint64_t now = oz::x86_64::rdtsc();
+                    oz::g_scheduler_ptr->performContextSwitch(current, caller, now);
+                    while (1) { __asm__ volatile("cli; hlt"); }
                 }
             }
         }
@@ -269,17 +334,98 @@ void oz::x86_64::initIDTR() {
 }
 
 namespace {
-    __attribute__((no_caller_saved_registers))
     static void handleIRQ(std::uint8_t vector) {
         auto* handler = oz::irq::getHandler(vector);
+
+        // すでにラインが Mask されている場合（ハンドラが現在処理中など）:
+        // MSI / エッジトリガ割り込みの喪失を防ぐため、保留フラグをセットして EOI を発行
+        if (handler && handler->isMasked()) {
+            handler->setPending(true);
+            oz::x86_64::notifyEndOfInterrupt();
+            dprint("[IRQ] Line masked, set pending for vec=0x");
+            char hbuf[17];
+            oz::utils::to_hex(vector, hbuf);
+            dprint(hbuf);
+            dprint("\n\r");
+            return;
+        }
+
+        // 1. 発火時（handleIRQ）:
+        // ハードウェア割り込みが発火した瞬間、カーネルは当該 IRQ ライン（IOAPIC ピンまたは MSI）を
+        // 直ちにハードウェアレベルで Mask（無効化）し、LAPIC EOI を発行してハンドラへ切り替える。
         if (handler) {
-            auto* waiter = handler->onInterrupt();
-            if (waiter) {
-                auto unblock = oz::irq::getUnblockFn();
-                if (unblock) unblock(waiter);
-            }
+            handler->mask();
         }
         oz::x86_64::notifyEndOfInterrupt();
+
+        oz::ExecutionContext* handler_ctx = handler ? handler->getHandlerThread() : nullptr;
+        oz::ExecutionContext* current = oz::g_scheduler_ptr ? oz::g_scheduler_ptr->getCurrentContext() : nullptr;
+
+        if (handler && handler_ctx && handler_ctx->isInterruptThread()) {
+            auto* ithread = static_cast<oz::InterruptThread*>(handler_ctx);
+
+            // ハンドラが現在走行中（未ブロック）の場合:
+            // 処理中に到着した割り込みを保留フラグに記録して return
+            if (!ithread->is_blocked) {
+                handler->setPending(true);
+                dprint("[IRQ] ithread running, set pending for vec=0x");
+                char hbuf[17];
+                oz::utils::to_hex(vector, hbuf);
+                dprint(hbuf);
+                dprint("\n\r");
+                return;
+            }
+
+            // ケース A: budget > 0 の場合: InterruptThread の退避フレームに現在の current を Push し、ハンドラへ切り替え
+            if (ithread->is_blocked && ithread->has_baton() && ithread->baton->budget > 0) {
+                std::uint32_t rem_ticks = oz::x86_64::getLAPICCurrentCount();
+
+                // Intrusive Stack に退避
+                ithread->saved_frame.interrupted_context = current;
+                ithread->saved_frame.lapic_remaining_ticks = rem_ticks;
+                ithread->saved_frame.irq_vector = vector;
+                ithread->next_nested = oz::g_current_interrupt_thread;
+                oz::g_current_interrupt_thread = ithread;
+
+                if (ithread->baton) {
+                    ithread->baton->is_active = true;
+                    oz::x86_64::setLAPICOneShot(ithread->baton->budget, oz::x86_64::APIC_TIMER_VECTOR);
+                }
+
+                ithread->is_waiting_irq = false;
+                ithread->is_interrupted = false;
+                ithread->is_blocked = false;
+                ithread->state = oz::ThreadState::Ready;
+
+                std::uint64_t now = oz::x86_64::rdtsc();
+                if (oz::g_scheduler_ptr) {
+                    oz::g_scheduler_ptr->performContextSwitch(current, ithread, now);
+                }
+                return;
+            }
+
+            // ケース B: budget == 0 の場合（セーフティネット / 遅延充填パス）:
+            // ラインの Mask と LAPIC EOI は既に発行済み。
+            // ハンドラの bound_notif に非同期シグナルを送信した上で、
+            // 現在走行中のスレッド T は中断せずそのまま継続走行（No Time Theft 原則の徹底）。
+            if (!ithread->has_baton() || (ithread->baton && ithread->baton->budget == 0)) {
+                dprint("[IRQ] Case B (budget==0): signaling sched for vec=0x");
+                char hbuf[17];
+                oz::utils::to_hex(vector, hbuf);
+                dprint(hbuf);
+                dprint("\n\r");
+                if (ithread->baton && ithread->baton->bound_notif) {
+                    ithread->baton->bound_notif->signal(ithread->baton->bound_badge);
+                }
+                // スレッド T は何事もなかったかのようにそのまま実行継続！
+                return;
+            }
+        }
+
+        // レガシーハンドラフォールバック
+        if (handler) {
+            handler->onInterrupt();
+        }
     }
 
     extern "C" void timerInterruptHandler() {
@@ -448,18 +594,152 @@ std::uint8_t oz::x86_64::getLocalAPICID() {
     return static_cast<std::uint8_t>(ebx >> 24);
 }
 
+static std::uint64_t s_lapic_ticks_per_us = 100;
+static std::uint64_t s_tsc_ticks_per_us = 1000;
+
+void oz::x86_64::calibrateTimers() {
+    volatile std::uint32_t* divide_config = reinterpret_cast<volatile std::uint32_t*>(oz::DIRECT_MAP_OFFSET + 0xfee003e0ULL);
+    *divide_config = 0x3; // Divide by 16
+
+    volatile std::uint32_t* lvt_timer = reinterpret_cast<volatile std::uint32_t*>(oz::DIRECT_MAP_OFFSET + 0xfee00320ULL);
+    *lvt_timer = (1 << 16) | APIC_TIMER_VECTOR; // Masked, One-shot mode
+
+    volatile std::uint32_t* initial_count = reinterpret_cast<volatile std::uint32_t*>(oz::DIRECT_MAP_OFFSET + 0xfee00380ULL);
+    volatile std::uint32_t* current_count = reinterpret_cast<volatile std::uint32_t*>(oz::DIRECT_MAP_OFFSET + 0xfee00390ULL);
+
+    // Disable speaker, set gate low (Port 0x61 bit 0 & 1 = 0)
+    std::uint8_t p61 = oz::x86_64::readIO8(0x61);
+    oz::x86_64::writeIO8(0x61, static_cast<std::uint8_t>(p61 & 0xFC));
+
+    // PIT Channel 2, mode 0 (interrupt on terminal count), binary, access LSB then MSB
+    oz::x86_64::writeIO8(0x43, 0b10110000);
+    std::uint16_t pit_count = 11932; // ~10ms (1193182 Hz / 100)
+    oz::x86_64::writeIO8(0x42, static_cast<std::uint8_t>(pit_count & 0xFF));
+    oz::x86_64::writeIO8(0x42, static_cast<std::uint8_t>((pit_count >> 8) & 0xFF));
+
+    // Start LAPIC timer with max count
+    *initial_count = 0xFFFFFFFF;
+    std::uint64_t tsc_start = oz::x86_64::rdtsc();
+
+    // Start PIT counter: gate high
+    p61 = oz::x86_64::readIO8(0x61);
+    oz::x86_64::writeIO8(0x61, static_cast<std::uint8_t>((p61 & 0xFC) | 0x01));
+
+    // Wait until PIT counter reaches 0 (Port 0x61 bit 5 goes high)
+    while ((oz::x86_64::readIO8(0x61) & 0x20) == 0) {
+        __asm__ volatile("pause");
+    }
+
+    std::uint64_t tsc_end = oz::x86_64::rdtsc();
+    std::uint32_t lapic_rem = *current_count;
+    *initial_count = 0; // Stop LAPIC timer
+
+    // Reset Port 0x61
+    oz::x86_64::writeIO8(0x61, static_cast<std::uint8_t>(p61 & 0xFC));
+
+    std::uint64_t lapic_ticks_in_10ms = 0xFFFFFFFFULL - lapic_rem;
+    std::uint64_t tsc_ticks_in_10ms = tsc_end - tsc_start;
+
+    s_lapic_ticks_per_us = lapic_ticks_in_10ms / 10000;
+    if (s_lapic_ticks_per_us == 0) s_lapic_ticks_per_us = 1;
+
+    s_tsc_ticks_per_us = tsc_ticks_in_10ms / 10000;
+    if (s_tsc_ticks_per_us == 0) s_tsc_ticks_per_us = 1;
+
+    dprint("[LAPIC] Calibrated lapic_ticks_per_us: ");
+    char b1[20];
+    oz::utils::to_hex(s_lapic_ticks_per_us, b1);
+    dprint(b1);
+    dprint(", tsc_ticks_per_us: ");
+    oz::utils::to_hex(s_tsc_ticks_per_us, b1);
+    dprint(b1);
+    dprint("\n\r");
+}
+
+void oz::x86_64::setLAPICOneShot(std::uint64_t time_budget_us, std::uint8_t vector) {
+    volatile std::uint32_t* lvt_timer = reinterpret_cast<volatile std::uint32_t*>(oz::DIRECT_MAP_OFFSET + 0xfee00320ULL);
+    volatile std::uint32_t* initial_count = reinterpret_cast<volatile std::uint32_t*>(oz::DIRECT_MAP_OFFSET + 0xfee00380ULL);
+
+    if (time_budget_us == 0) {
+        *initial_count = 0;
+        *lvt_timer = (1 << 16) | vector; // Masked
+        return;
+    }
+
+    std::uint64_t ticks = time_budget_us * s_lapic_ticks_per_us;
+    if (ticks > 0xFFFFFFFFULL) ticks = 0xFFFFFFFFULL;
+    if (ticks == 0) ticks = 1;
+
+    // Unmask, One-Shot mode (bits 17-18 = 0)
+    *lvt_timer = vector;
+    *initial_count = static_cast<std::uint32_t>(ticks);
+}
+
+void oz::x86_64::setLAPICRemainingTicks(std::uint32_t ticks, std::uint8_t vector) {
+    volatile std::uint32_t* lvt_timer = reinterpret_cast<volatile std::uint32_t*>(oz::DIRECT_MAP_OFFSET + 0xfee00320ULL);
+    volatile std::uint32_t* initial_count = reinterpret_cast<volatile std::uint32_t*>(oz::DIRECT_MAP_OFFSET + 0xfee00380ULL);
+
+    if (ticks == 0) {
+        *initial_count = 0;
+        *lvt_timer = (1 << 16) | vector; // Masked
+        return;
+    }
+
+    *lvt_timer = vector;
+    *initial_count = ticks;
+}
+
+std::uint32_t oz::x86_64::getLAPICCurrentCount() {
+    volatile std::uint32_t* current_count = reinterpret_cast<volatile std::uint32_t*>(oz::DIRECT_MAP_OFFSET + 0xfee00390ULL);
+    return *current_count;
+}
+
+static bool s_external_irq_masked = false;
+
+void oz::x86_64::maskExternalInterrupts() {
+    s_external_irq_masked = true;
+    // Set LAPIC TPR to mask all interrupts with priority lower than APIC_TIMER_VECTOR (vector 32)
+    // Priority class is vector >> 4. Vector 32 is class 2, external IRQs (33+) are class 2 or higher.
+    // Setting TPR to 0xFF masks all external interrupts except NMI.
+    // However we want vector 32 to fire, so TPR = 0x20 would allow vector 32 (if vector 32 is class 2, APIC TPR allows > TPR)
+    // But TPR suppresses priority <= (TPR >> 4). So TPR = 0x20 suppresses vector 0-31, but allows 32.
+    // To suppress 33-255 while allowing 32, since 32 and 33-47 might share priority class 2,
+    // software gating via s_external_irq_masked is safest and portable.
+}
+
+void oz::x86_64::unmaskExternalInterrupts() {
+    s_external_irq_masked = false;
+}
+
+bool oz::x86_64::isExternalInterruptsMasked() {
+    return s_external_irq_masked;
+}
+
+void oz::x86_64::stopLAPICTimer() {
+    volatile std::uint32_t* lvt_timer = reinterpret_cast<volatile std::uint32_t*>(oz::DIRECT_MAP_OFFSET + 0xfee00320ULL);
+    volatile std::uint32_t* initial_count = reinterpret_cast<volatile std::uint32_t*>(oz::DIRECT_MAP_OFFSET + 0xfee00380ULL);
+    *initial_count = 0;
+    *lvt_timer = (1 << 16) | APIC_TIMER_VECTOR; // Masked
+}
+
+std::uint64_t oz::x86_64::getTSCTicksPerUs() {
+    return s_tsc_ticks_per_us;
+}
+
+std::uint64_t oz::x86_64::getLAPICTicksPerUs() {
+    return s_lapic_ticks_per_us;
+}
+
 void oz::x86_64::initAPICTimer(std::uint8_t interrupt_vector) {
     std::uintptr_t apic_base = oz::DIRECT_MAP_OFFSET + 0xfee00000ULL;
-    volatile std::uint32_t* lvt_timer = reinterpret_cast<volatile std::uint32_t*>(apic_base + 0x320);
-    volatile std::uint32_t* initial_count = reinterpret_cast<volatile std::uint32_t*>(apic_base + 0x380);
     volatile std::uint32_t* divide_config = reinterpret_cast<volatile std::uint32_t*>(apic_base + 0x3e0);
 
     // Set divide config to 16
     *divide_config = 0x3;
 
-    // Set LVT Timer to Periodic Mode (bit 17) and set the interrupt vector
-    *lvt_timer = (1 << 17) | interrupt_vector;
+    // Calibrate timers via PIT
+    calibrateTimers();
 
-    // Set a default count
-    *initial_count = 100000;
+    // Default: stopped / masked until sys_donate_time sets it
+    stopLAPICTimer();
 }

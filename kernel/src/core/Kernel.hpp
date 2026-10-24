@@ -40,7 +40,6 @@ private:
     Thread* loadRootServerFromInitrd(UntypedMemory& boot_untyped, const oz_boot::BootModuleInfo* initrd_file);
     Thread* loadProcessFromElfBuffer(UntypedMemory& boot_untyped, const std::uint8_t* file_buf, std::size_t file_size);
     void setupRootServerCaps(Thread* init_thread, UntypedMemory& boot_untyped, const BootDevices& devices, const oz_boot::BootModuleInfo* initrd_file);
-    void setupIdleThread();
 
     x86_64::FrameManager fm;
     PageTableManager pt_manager;

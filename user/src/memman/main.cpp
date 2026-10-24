@@ -22,14 +22,18 @@ extern "C" void _start() {
     oz::sys_write("[MemMan] Memory Manager server started (Ring 3)!\n\r");
     oz::sys_write("[MemMan] Dedicated UntypedMemory manager active.\n\r");
 
+    oz::ReplyToken token = oz::INVALID_REPLY_TOKEN;
+    oz::IPCMessage resp{};
+    oz::IPCMessage req{};
+
     while (true) {
-        oz::IPCMessage req{};
-        if (!oz::sys_channel_recv(CAP_MEMMAN_RECV, &req)) {
+        token = oz::sys_reply_recv(token, CAP_MEMMAN_RECV, (token != oz::INVALID_REPLY_TOKEN) ? &resp : nullptr, &req);
+        if (token == oz::INVALID_REPLY_TOKEN) {
             continue;
         }
 
         auto cmd = static_cast<oz::ipc::MemCmd>(req.data[0]);
-        oz::IPCMessage resp{};
+        resp = oz::IPCMessage{};
 
         if (cmd == oz::ipc::MemCmd::ALLOC_UNTYPED) {
             std::size_t size = static_cast<std::size_t>(req.data[1]);
@@ -50,7 +54,6 @@ extern "C" void _start() {
                 resp.has_cap = false;
                 oz::sys_write("[MemMan] ERROR: Failed to allocate child UntypedMemory!\n\r");
             }
-            oz::sys_channel_send(CAP_MEMMAN_REPLY, &resp);
 
         } else if (cmd == oz::ipc::MemCmd::REVOKE_UNTYPED) {
             if (req.has_cap && req.transferred_cap != oz::INVALID_CAP_ID) {
@@ -61,19 +64,16 @@ extern "C" void _start() {
                 resp.data[0] = 1; // Error: missing capability
             }
             resp.has_cap = false;
-            oz::sys_channel_send(CAP_MEMMAN_REPLY, &resp);
 
         } else if (cmd == oz::ipc::MemCmd::GET_INFO) {
             resp.data[0] = 0;
             resp.data[1] = 0; // Total
             resp.data[2] = 0; // Free
             resp.has_cap = false;
-            oz::sys_channel_send(CAP_MEMMAN_REPLY, &resp);
 
         } else {
             resp.data[0] = 0xFF; // Unknown command
             resp.has_cap = false;
-            oz::sys_channel_send(CAP_MEMMAN_REPLY, &resp);
         }
     }
 }

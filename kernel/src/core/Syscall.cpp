@@ -13,13 +13,20 @@
 #include "core/IRQDispatch.hpp"
 #include "core/IOPort.hpp"
 #include "core/Notification.hpp"
+#include "core/Baton.hpp"
+#include "core/InterruptThread.hpp"
 
 #include "core/Kernel.hpp"
+#include "core/SavedInterruptFrame.hpp"
 
 namespace oz {
+constexpr int ERR_WOULDBLOCK = -2;
+constexpr int ERR_CANCELLED = -3;
+
 void (*g_exit_thread_func)() = nullptr;
 CSpace* (*g_get_current_cspace_func)() = nullptr;
 Thread* (*g_get_current_thread_func)() = nullptr;
+ExecutionContext* (*g_get_current_context_func)() = nullptr;
 void (*g_block_thread_func)() = nullptr;
 void (*g_unblock_thread_func)(Thread*) = nullptr;
 void (*g_queue_thread_func)(Thread* t) = nullptr;
@@ -38,26 +45,7 @@ SyscallContext g_syscall_context;
 
 extern "C" void syscall_entry();
 
-static void dprint_hex(std::uint64_t val) {
-    char buf[19];
-    oz::utils::to_hex(val, buf);
-    dprint(buf);
-}
 
-static void dprint_dec(std::uint64_t val) {
-    if (val == 0) {
-        dprint("0");
-        return;
-    }
-    char buf[21];
-    int idx = 20;
-    buf[idx--] = '\0';
-    while (val > 0) {
-        buf[idx--] = '0' + (val % 10);
-        val /= 10;
-    }
-    dprint(&buf[idx + 1]);
-}
 
 // ===========================================================================
 // Phase 5: Security helpers
@@ -89,6 +77,47 @@ static T* get_cap_typed(CSpace* cspace, CapID id, ObjectType expected, CapRights
     return static_cast<T*>(cap.object);
 }
 
+// Capability システムにおけるポリモーフィックな型解決ヘルパー (設計書 2.1(5))
+static inline ExecutionContext* get_cap_execution_context(CSpace* cspace, CapID cap_id, CapRights rights) {
+    if (!cspace) return nullptr;
+    Capability cap = cspace->get(cap_id);
+    if (!cap.is_valid() || !cap.object) return nullptr;
+    if ((cap.rights & rights) != rights) return nullptr;
+    if (cap.object->objectType() == ObjectType::TCB) {
+        TCB* tcb = static_cast<TCB*>(cap.object);
+        return tcb->getThread();
+    } else if (cap.object->objectType() == ObjectType::InterruptThread) {
+        return static_cast<InterruptThread*>(cap.object);
+    }
+    return nullptr;
+}
+
+static inline bool configure_execution_context(ExecutionContext* ctx, CSpace* cspace, VSpace* vspace, std::uint64_t rip, std::uint64_t user_rsp) {
+    if (!ctx) return false;
+    ctx->cspace = cspace;
+    if (vspace && vspace->getPhysicalPML4() != 0) {
+        ctx->pml4_phys = VSpace::createPhysicalAddress<PageTable>(vspace->getPhysicalPML4());
+    }
+    ctx->user_rip = rip;
+    ctx->user_rsp = user_rsp;
+    ctx->state = ThreadState::Blocked;
+
+    std::uint64_t rsp = reinterpret_cast<std::uint64_t>(ctx->stack_base) + ctx->stack_size;
+    rsp &= ~15ULL;
+    rsp -= sizeof(ThreadContext);
+    ctx->rsp = reinterpret_cast<void*>(rsp);
+
+    ThreadContext* tctx = reinterpret_cast<ThreadContext*>(rsp);
+    tctx->rip = reinterpret_cast<std::uint64_t>(&thread_stub);
+    tctx->r12 = reinterpret_cast<std::uint64_t>(&user_thread_entry);
+    tctx->rbx = reinterpret_cast<std::uint64_t>(ctx);
+    tctx->r13 = 0;
+    tctx->r14 = 0;
+    tctx->r15 = 0;
+    tctx->rbp = 0;
+    return true;
+}
+
 // Get current CSpace (common pattern)
 static CSpace* get_cspace() {
     if (!g_get_current_cspace_func) return nullptr;
@@ -100,101 +129,14 @@ static CSpace* get_cspace() {
 // Channel IPC helpers
 // ===========================================================================
 
-static int do_channel_send(CSpace* cspace, CapID ep_id, const IPCMessage* msg) {
+
+
+static int do_channel_recv(CSpace* cspace, CapID ep_id, IPCMessage* msg, bool nonblock = false) {
     if (!cspace || !msg) return -1;
-    
-    Capability ep_cap_check = cspace->get(ep_id);
-    if (!ep_cap_check.is_valid()) return -1;
-    bool is_once = ep_cap_check.is_once();
-
-    ChannelEndpoint* ep = get_cap_typed<ChannelEndpoint>(
-        cspace, ep_id, ObjectType::ChannelEndpoint, CapRights::WRITE);
-    if (!ep || ep->is_peer_closed()) return -1;
-    ChannelEndpoint* peer = ep->get_peer();
-    if (!peer) return -1;
-
-    // Build internal message with optional cap attachment
-    InternalIPCMessage internal;
-    internal.user_msg = *msg;
-    
-    if (msg->has_cap) {
-        // Transfer requires GRANT right on the endpoint
-        if ((ep_cap_check.rights & CapRights::GRANT) == CapRights::NONE) return -1;
-        
-        // Extract the capability from sender's CSpace
-        Capability src_cap = cspace->get(msg->transferred_cap);
-        if (!src_cap.is_valid()) return -1;
-        
-        // Attach cap to internal message (copy semantics for refcount)
-        internal.attached_cap = src_cap;
+    ExecutionContext* current_ctx = g_get_current_context_func ? g_get_current_context_func() : nullptr;
+    if (current_ctx && current_ctx->isInterruptThread() && !nonblock) {
+        return -1; // InterruptThread はブロッキング待機禁止 (設計書 2.1(2))
     }
-
-    // Synchronous rendezvous: check if a receiver is already waiting on peer
-    Thread* receiver = peer->pop_recv_waiter();
-    if (receiver) {
-        if (internal.attached_cap.is_valid()) {
-            if (!receiver->cspace) {
-                return -1;
-            }
-            CapID new_id = receiver->cspace->add(internal.attached_cap);
-            if (new_id == INVALID_CAP_ID) {
-                // Receiver's CSpace is full: fail without removing from sender's CSpace
-                return -1;
-            }
-            // Successfully added to receiver: remove from sender's CSpace (move semantics)
-            cspace->remove(msg->transferred_cap);
-            internal.user_msg.transferred_cap = new_id;
-            internal.user_msg.has_cap = true;
-            internal.attached_cap = Capability();
-        }
-        peer->set_rendezvous_msg(internal);
-        receiver->state = ThreadState::Ready;
-        if (g_unblock_thread_func) {
-            g_unblock_thread_func(receiver);
-        }
-        if (is_once) {
-            cspace->remove(ep_id);
-        }
-        return 0;
-    }
-
-    // No receiver is waiting: sender must block until rendezvous
-    if (!g_get_current_thread_func || !g_block_thread_func) return -1;
-    Thread* current = g_get_current_thread_func();
-    if (!current) return -1;
-
-    if (internal.attached_cap.is_valid()) {
-        // Remove from sender's CSpace while blocked, kept in internal.attached_cap
-        cspace->remove(msg->transferred_cap);
-    }
-
-    current->send_msg = internal;
-    current->state = ThreadState::BlockedOnSend;
-    ep->add_send_waiter(current);
-
-    if (peer->get_bound_notification()) {
-        peer->get_bound_notification()->signal(peer->get_bound_badge());
-    }
-
-    g_block_thread_func();
-
-    if (ep->is_peer_closed()) {
-        // Rollback attached capability if peer closed before reception
-        if (current->send_msg.attached_cap.is_valid()) {
-            cspace->insert(msg->transferred_cap, current->send_msg.attached_cap);
-            current->send_msg = InternalIPCMessage{};
-        }
-        return -1;
-    }
-    current->send_msg = InternalIPCMessage{};
-    if (is_once) {
-        cspace->remove(ep_id);
-    }
-    return 0;
-}
-
-static int do_channel_recv(CSpace* cspace, CapID ep_id, IPCMessage* msg) {
-    if (!cspace || !msg) return -1;
 
     ChannelEndpoint* ep = get_cap_typed<ChannelEndpoint>(
         cspace, ep_id, ObjectType::ChannelEndpoint, CapRights::READ);
@@ -232,6 +174,7 @@ static int do_channel_recv(CSpace* cspace, CapID ep_id, IPCMessage* msg) {
             sender->send_msg.attached_cap = Capability();
         }
         sender->state = ThreadState::Ready;
+        sender->is_blocked = false;
         if (g_unblock_thread_func) {
             g_unblock_thread_func(sender);
         }
@@ -244,15 +187,38 @@ static int do_channel_recv(CSpace* cspace, CapID ep_id, IPCMessage* msg) {
         return 0;
     }
 
-    // 3. No sender is waiting: receiver must block
+    // Blocking guard for IRQ handler (Chapter 1.5 F)
+    ExecutionContext* cur_ctx = g_get_current_context_func ? g_get_current_context_func() : nullptr;
+    if (cur_ctx && cur_ctx->isInterruptThread()) {
+        return ERR_WOULDBLOCK;
+    }
+    Thread* current = g_get_current_thread_func ? g_get_current_thread_func() : nullptr;
+
+    // No sender is waiting:
+    if (nonblock) {
+        return ERR_WOULDBLOCK; // Would block
+    }
+
+    // Receiver must block
     if (!g_get_current_thread_func || !g_block_thread_func) return -1;
-    Thread* current = g_get_current_thread_func();
     if (!current) return -1;
 
     current->state = ThreadState::BlockedOnRecv;
+    current->is_blocked = true;
+    current->blocking_ep = ep;
     ep->add_recv_waiter(current);
 
-    g_block_thread_func();
+    while (current->is_blocked) {
+        g_block_thread_func();
+        if (current->ipc_cancelled || ep->is_peer_closed()) break;
+    }
+
+    current->blocking_ep = nullptr;
+    current->is_blocked = false;
+    if (current->ipc_cancelled) {
+        current->ipc_cancelled = false;
+        return ERR_CANCELLED;
+    }
 
     // Woken up by sender or notification
     if (ep->check_and_clear_notification(notif_data)) {
@@ -274,27 +240,37 @@ static int do_channel_recv(CSpace* cspace, CapID ep_id, IPCMessage* msg) {
     return -1;
 }
 
+struct SyscallResult {
+    std::uint64_t rax{0};
+    std::uint64_t rdx{0};
+
+    SyscallResult(std::uint64_t rax = 0, std::uint64_t rdx = 0) : rax(rax), rdx(rdx) {}
+    SyscallResult(std::int64_t rax) : rax(static_cast<std::uint64_t>(rax)), rdx(0) {}
+    SyscallResult(int rax) : rax(static_cast<std::uint64_t>(static_cast<std::int64_t>(rax))), rdx(0) {}
+};
+
 // ===========================================================================
 // Syscall handlers
 // ===========================================================================
 
-extern "C" std::uint64_t handleSyscall(std::uint64_t rdi, std::uint64_t rsi, std::uint64_t rdx,
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wreturn-type-c-linkage"
+extern "C" SyscallResult handleSyscall(std::uint64_t rdi, std::uint64_t rsi, std::uint64_t rdx,
                                        std::uint64_t r10, std::uint64_t r8, std::uint64_t r9,
                                        std::uint64_t syscall_number) {
+#pragma GCC diagnostic pop
+    (void)r9;
     if (syscall_number == 1) {
-        // channel_send
-        CSpace* cspace = get_cspace();
-        if (!cspace) return -1;
-        if (!is_user_buffer(rsi, sizeof(IPCMessage))) return -1;
-        const IPCMessage* msg = reinterpret_cast<const IPCMessage*>(rsi);
-        return do_channel_send(cspace, static_cast<CapID>(rdi), msg);
+        // channel_send is removed in Baton Scheduling v2 (use sys_call / sys_reply_recv)
+        return -1;
     } else if (syscall_number == 2) {
         // channel_recv
         CSpace* cspace = get_cspace();
         if (!cspace) return -1;
         if (!is_user_buffer(rsi, sizeof(IPCMessage))) return -1;
         IPCMessage* msg = reinterpret_cast<IPCMessage*>(rsi);
-        return do_channel_recv(cspace, static_cast<CapID>(rdi), msg);
+        bool nonblock = (rdx & 1) != 0;
+        return do_channel_recv(cspace, static_cast<CapID>(rdi), msg, nonblock);
     } else if (syscall_number == 3) {
         // channel_create(untyped_cap, out0, out1)
         CSpace* cspace = get_cspace();
@@ -443,9 +419,9 @@ extern "C" std::uint64_t handleSyscall(std::uint64_t rdi, std::uint64_t rsi, std
         CSpace* cspace = get_cspace();
         if (!cspace) return -1;
 
-        TCB* tcb = get_cap_typed<TCB>(
-            cspace, static_cast<CapID>(rdi), ObjectType::TCB, CapRights::WRITE);
-        if (!tcb) return -1;
+        ExecutionContext* target = get_cap_execution_context(
+            cspace, static_cast<CapID>(rdi), CapRights::WRITE);
+        if (!target) return -1;
 
         CSpaceCap* target_cspace = get_cap_typed<CSpaceCap>(
             cspace, static_cast<CapID>(rsi), ObjectType::CSpaceCap, CapRights::READ);
@@ -458,7 +434,7 @@ extern "C" std::uint64_t handleSyscall(std::uint64_t rdi, std::uint64_t rsi, std
         if (!is_user_address(r10)) return -1; // rip
         if (!is_user_address(r8)) return -1;  // user_rsp
 
-        if (!tcb->configure(target_cspace->getCSpace(), target_vspace, r10, r8)) {
+        if (!configure_execution_context(target, target_cspace->getCSpace(), target_vspace, r10, r8)) {
             return -1;
         }
         return 0;
@@ -467,22 +443,39 @@ extern "C" std::uint64_t handleSyscall(std::uint64_t rdi, std::uint64_t rsi, std
         CSpace* cspace = get_cspace();
         if (!cspace) return -1;
         
-        TCB* tcb = get_cap_typed<TCB>(
-            cspace, static_cast<CapID>(rdi), ObjectType::TCB, CapRights::WRITE);
-        if (!tcb) return -1;
-        
-        if (!tcb->resume()) return -1;
+        ExecutionContext* target = get_cap_execution_context(
+            cspace, static_cast<CapID>(rdi), CapRights::WRITE);
+        if (!target) return -1;
+
+        target->is_blocked = false;
+        target->state = ThreadState::Ready;
+
+        if (target->isInterruptThread()) {
+            auto* ithread = static_cast<InterruptThread*>(target);
+            ithread->is_waiting_irq = false;
+            ithread->is_interrupted = false;
+        } else {
+            Thread* t = static_cast<Thread*>(target);
+            if (t->sched_notif && t->sched_badge != 0) {
+                t->sched_notif->signal(t->sched_badge);
+                return 0;
+            }
+        }
+
+        if (target->baton) {
+            target->baton->notify_if_runnable();
+        }
         return 0;
     } else if (syscall_number == 14) {
         // tcb_suspend
         CSpace* cspace = get_cspace();
         if (!cspace) return -1;
         
-        TCB* tcb = get_cap_typed<TCB>(
-            cspace, static_cast<CapID>(rdi), ObjectType::TCB, CapRights::WRITE);
-        if (!tcb) return -1;
+        ExecutionContext* target = get_cap_execution_context(
+            cspace, static_cast<CapID>(rdi), CapRights::WRITE);
+        if (!target) return -1;
         
-        if (!tcb->suspend()) return -1;
+        target->is_blocked = true;
         return 0;
     } else if (syscall_number == 15) {
         // cspace_create(untyped_cap)
@@ -707,12 +700,16 @@ extern "C" std::uint64_t handleSyscall(std::uint64_t rdi, std::uint64_t rsi, std
             obj = untyped->retypePageTable();
         } else if (target_type == ObjectType::TCB) {
             obj = untyped->retypeTCB(g_queue_thread_func);
+        } else if (target_type == ObjectType::InterruptThread) {
+            obj = untyped->retypeInterruptThread();
         } else if (target_type == ObjectType::CSpaceCap) {
             obj = untyped->retypeCSpace();
         } else if (target_type == ObjectType::UntypedMemory) {
             obj = untyped->retypeUntyped(rdx); // rdx = size in bytes
         } else if (target_type == ObjectType::Notification) {
             obj = untyped->retypeNotification();
+        } else if (target_type == ObjectType::Baton) {
+            obj = untyped->retypeBaton();
         } else if (target_type == ObjectType::ChannelEndpoint) {
             ChannelEndpoint* end0 = nullptr;
             ChannelEndpoint* end1 = nullptr;
@@ -788,19 +785,293 @@ extern "C" std::uint64_t handleSyscall(std::uint64_t rdi, std::uint64_t rsi, std
         if (!is_user_buffer(rsi, sizeof(IPCMessage))) return -1;
         if (!is_user_buffer(rdx, sizeof(IPCMessage))) return -1;
 
-        int res = do_channel_send(cspace, static_cast<CapID>(rdi), reinterpret_cast<const IPCMessage*>(rsi));
-        if (res != 0) return -1;
-        return do_channel_recv(cspace, static_cast<CapID>(rdi), reinterpret_cast<IPCMessage*>(rdx));
-    } else if (syscall_number == 28) {
-        // sys_reply_recv(ep_cap, reply_msg, recv_msg)
-        CSpace* cspace = get_cspace();
-        if (!cspace) return -1;
-        if (rsi != 0) {
-            if (!is_user_buffer(rsi, sizeof(IPCMessage))) return -1;
-            do_channel_send(cspace, static_cast<CapID>(rdi), reinterpret_cast<const IPCMessage*>(rsi));
+        Capability ep_cap_check = cspace->get(static_cast<CapID>(rdi));
+        if (!ep_cap_check.is_valid()) return -1;
+        bool is_once = ep_cap_check.is_once();
+
+        ChannelEndpoint* ep = get_cap_typed<ChannelEndpoint>(
+            cspace, static_cast<CapID>(rdi), ObjectType::ChannelEndpoint, CapRights::WRITE);
+        if (!ep || ep->is_peer_closed()) return -1;
+        ChannelEndpoint* peer = ep->get_peer();
+        if (!peer) return -1;
+
+        Thread* current = g_get_current_thread_func ? g_get_current_thread_func() : nullptr;
+        if (!current || !current->has_baton()) return SYS_ERR_INVALID;
+
+        const IPCMessage* msg = reinterpret_cast<const IPCMessage*>(rsi);
+        InternalIPCMessage internal;
+        internal.user_msg = *msg;
+        if (msg->has_cap) {
+            if ((ep_cap_check.rights & CapRights::GRANT) == CapRights::NONE) return -1;
+            Capability src_cap = cspace->get(msg->transferred_cap);
+            if (!src_cap.is_valid()) return -1;
+            internal.attached_cap = src_cap;
+            cspace->remove(msg->transferred_cap);
         }
-        if (!is_user_buffer(rdx, sizeof(IPCMessage))) return -1;
-        return do_channel_recv(cspace, static_cast<CapID>(rdi), reinterpret_cast<IPCMessage*>(rdx));
+
+        current->recv_msg_buf = reinterpret_cast<IPCMessage*>(rdx);
+        current->blocking_ep = ep;
+
+        // Check if receiver is already waiting on peer (Recv 先行 -> Call 到着)
+        Thread* receiver = peer->pop_recv_waiter();
+        if (receiver) {
+            if (internal.attached_cap.is_valid()) {
+                if (receiver->cspace) {
+                    CapID new_id = receiver->cspace->add(internal.attached_cap);
+                    if (new_id != INVALID_CAP_ID) {
+                        internal.user_msg.transferred_cap = new_id;
+                        internal.user_msg.has_cap = true;
+                    }
+                }
+                internal.attached_cap = Capability();
+            }
+            receiver->kernel_ipc_msg = internal.user_msg;
+            receiver->has_kernel_ipc_msg = true;
+            receiver->current_reply_token = current->id;
+
+            // Hand-off baton from client to server
+            Baton* b = current->baton;
+            current->baton = nullptr;
+            receiver->baton = b;
+            if (b) {
+                b->thread = receiver;
+                b->is_active = true;
+            }
+
+            current->state = ThreadState::BlockedOnReply;
+            current->is_blocked = true;
+
+            receiver->state = ThreadState::Ready;
+            receiver->is_blocked = false;
+            if (g_unblock_thread_func) g_unblock_thread_func(receiver);
+
+            std::uint64_t now = oz::x86_64::rdtsc();
+            Kernel::instance().getScheduler().performContextSwitch(current, receiver, now);
+
+            if (current->has_kernel_ipc_msg) {
+                if (current->recv_msg_buf) {
+                    *current->recv_msg_buf = current->kernel_ipc_msg;
+                }
+                current->has_kernel_ipc_msg = false;
+            }
+
+            current->blocking_ep = nullptr;
+            if (is_once) {
+                cspace->remove(static_cast<CapID>(rdi));
+            }
+            if (current->ipc_cancelled) {
+                current->ipc_cancelled = false;
+                return SYS_ERR_CANCELLED;
+            }
+            return 0;
+        }
+
+        // Server not waiting (Call 先行 -> Recv 到着)
+        ExecutionContext* caller = current->baton ? current->baton->caller_context : nullptr;
+        if (!caller || caller == current) {
+            // Cannot block: Root Baton / no caller context to yield to
+            if (internal.attached_cap.is_valid()) {
+                cspace->insert(msg->transferred_cap, internal.attached_cap);
+            }
+            current->blocking_ep = nullptr;
+            return SYS_ERR_WOULDBLOCK;
+        }
+
+        current->send_msg = internal;
+        current->state = ThreadState::BlockedOnCall;
+        current->is_blocked = true;
+        ep->add_send_waiter(current);
+
+        // Notify peer if bound
+        if (peer->get_bound_notification()) {
+            peer->get_bound_notification()->signal(peer->get_bound_badge());
+        }
+
+        // Time freezing & yield to scheduler
+        std::uint64_t now = oz::x86_64::rdtsc();
+        if (current->baton && !current->baton->is_infinite) {
+            std::uint64_t slice = (now >= current->last_switched_in) ? (now - current->last_switched_in) : 0;
+            std::uint64_t tsc_per_us = oz::x86_64::getTSCTicksPerUs();
+            std::uint64_t consumed_us = slice / (tsc_per_us ? tsc_per_us : 1);
+            if (current->baton->budget > consumed_us) {
+                current->baton->budget -= consumed_us;
+            } else {
+                current->baton->budget = 0;
+            }
+        }
+        current->sched_reason = SchedReason::BLOCKED;
+
+        current->baton->caller_context = nullptr;
+        current->baton->is_active = false;
+        caller->sched_reason = SchedReason::BLOCKED;
+        Kernel::instance().getScheduler().performContextSwitch(current, caller, now);
+
+        if (current->has_kernel_ipc_msg) {
+            if (current->recv_msg_buf) {
+                *current->recv_msg_buf = current->kernel_ipc_msg;
+            }
+            current->has_kernel_ipc_msg = false;
+        }
+
+        current->blocking_ep = nullptr;
+        if (is_once) {
+            cspace->remove(static_cast<CapID>(rdi));
+        }
+        if (current->ipc_cancelled) {
+            current->ipc_cancelled = false;
+            return SYS_ERR_CANCELLED;
+        }
+        return 0;
+    } else if (syscall_number == 28) {
+        // sys_reply_recv(reply_token, ep_cap, reply_msg, recv_msg)
+        // rdi: reply_token, rsi: ep_cap, rdx: reply_msg, r10: recv_msg
+        CSpace* cspace = get_cspace();
+        if (!cspace) return 0;
+        if (r10 != 0 && !is_user_buffer(r10, sizeof(IPCMessage))) return 0;
+
+        Thread* current = g_get_current_thread_func ? g_get_current_thread_func() : nullptr;
+        if (!current) return 0;
+
+        std::uint64_t reply_token = rdi;
+        Baton* current_baton = current->baton;
+        bool orphaned_baton = false;
+        Thread* client_to_switch = nullptr;
+
+        // Phase 1: Reply
+        if (reply_token != 0) {
+            Thread* client = get_thread_by_id(reply_token);
+            if (client && (client->state == ThreadState::BlockedOnReply || client->state == ThreadState::BlockedOnCall)) {
+                // Deliver reply
+                if (rdx != 0 && is_user_buffer(rdx, sizeof(IPCMessage))) {
+                    const IPCMessage* rep = reinterpret_cast<const IPCMessage*>(rdx);
+                    IPCMessage reply_to_send = *rep;
+                    if (rep->has_cap && client->cspace) {
+                        Capability cap = cspace->get(rep->transferred_cap);
+                        if (cap.is_valid()) {
+                            CapID new_id = client->cspace->add(cap);
+                            reply_to_send.transferred_cap = new_id;
+                            reply_to_send.has_cap = (new_id != INVALID_CAP_ID);
+                            cspace->remove(rep->transferred_cap);
+                        }
+                    }
+                    client->kernel_ipc_msg = reply_to_send;
+                    client->has_kernel_ipc_msg = true;
+                }
+                // Return baton to client
+                current->baton = nullptr;
+                client->baton = current_baton;
+                if (current_baton) {
+                    current_baton->thread = client;
+                    current_baton->is_active = true;
+                    current_baton->notify_if_runnable();
+                }
+                client->state = ThreadState::Ready;
+                client->is_blocked = false;
+                if (g_unblock_thread_func) g_unblock_thread_func(client);
+                client_to_switch = client;
+            } else {
+                // Client is dead / invalid: Silent Drop & Unbind
+                current->baton = nullptr;
+                if (current_baton) {
+                    current_baton->thread = nullptr; // Orphaned!
+                    current_baton->is_active = false;
+                }
+                orphaned_baton = true;
+            }
+        } else {
+            // reply_token == 0: Explicit Unbind / Transition to passive worker
+            if (current_baton) {
+                current->baton = nullptr;
+                current_baton->thread = nullptr;
+                current_baton->is_active = false;
+                orphaned_baton = true;
+            }
+        }
+
+        // Phase 2: Recv
+        ChannelEndpoint* ep = get_cap_typed<ChannelEndpoint>(
+            cspace, static_cast<CapID>(rsi), ObjectType::ChannelEndpoint, CapRights::READ);
+        if (!ep) {
+            if (client_to_switch) {
+                Kernel::instance().getScheduler().performContextSwitch(current, client_to_switch, oz::x86_64::rdtsc());
+            }
+            return 0;
+        }
+        ChannelEndpoint* peer = ep->get_peer();
+
+        // Check if a client is already waiting on peer
+        Thread* sender = peer ? peer->pop_send_waiter() : nullptr;
+        if (sender) {
+            IPCMessage* recv_buf = reinterpret_cast<IPCMessage*>(r10);
+            if (recv_buf) {
+                *recv_buf = sender->send_msg.user_msg;
+                if (sender->send_msg.attached_cap.is_valid()) {
+                    CapID new_id = cspace->add(sender->send_msg.attached_cap);
+                    recv_buf->transferred_cap = new_id;
+                    recv_buf->has_cap = (new_id != INVALID_CAP_ID);
+                    sender->send_msg.attached_cap = Capability();
+                }
+            }
+            // Take sender's baton
+            if (sender->baton && !current->baton) {
+                current->baton = sender->baton;
+                sender->baton = nullptr;
+                current->baton->thread = current;
+                current->baton->is_active = true;
+            }
+            sender->state = ThreadState::BlockedOnReply;
+            sender->is_blocked = true;
+
+            current->state = ThreadState::Ready;
+            current->is_blocked = false;
+
+            if (current->baton) {
+                current->baton->notify_if_runnable();
+            }
+
+            return sender->id;
+        }
+
+        // No sender waiting: Server must block in BlockedOnRecv
+        current->state = ThreadState::BlockedOnRecv;
+        current->is_blocked = true;
+        current->blocking_ep = ep;
+        current->recv_msg_buf = reinterpret_cast<IPCMessage*>(r10);
+        ep->add_recv_waiter(current);
+
+        std::uint64_t now = oz::x86_64::rdtsc();
+        if (orphaned_baton) {
+            // SchedReason::ORPHANED back to caller
+            ExecutionContext* caller = current_baton ? current_baton->caller_context : nullptr;
+            if (current_baton) {
+                current_baton->caller_context = nullptr;
+            }
+            if (caller && caller != current) {
+                caller->sched_reason = SchedReason::ORPHANED;
+                Kernel::instance().getScheduler().performContextSwitch(current, caller, now);
+            } else if (g_block_thread_func) {
+                g_block_thread_func();
+            }
+        } else if (client_to_switch) {
+            Kernel::instance().getScheduler().performContextSwitch(current, client_to_switch, now);
+        } else if (g_block_thread_func) {
+            g_block_thread_func();
+        }
+
+        if (current->has_kernel_ipc_msg) {
+            if (current->recv_msg_buf) {
+                *current->recv_msg_buf = current->kernel_ipc_msg;
+            }
+            current->has_kernel_ipc_msg = false;
+        }
+
+        current->blocking_ep = nullptr;
+        if (current->ipc_cancelled) {
+            current->ipc_cancelled = false;
+            return 0;
+        }
+
+        return current->current_reply_token;
     } else if (syscall_number == 29) {
         // sys_tcb_set_fault_endpoint(tcb_cap, ep_cap)
         CSpace* cspace = get_cspace();
@@ -889,23 +1160,41 @@ extern "C" std::uint64_t handleSyscall(std::uint64_t rdi, std::uint64_t rsi, std
             cspace, static_cast<CapID>(rdi), ObjectType::Notification, CapRights::READ);
         if (!notif) return -1;
 
-        if (notif->has_signals()) {
-            *reinterpret_cast<std::uint64_t*>(rsi) = notif->get_and_clear_value();
-            return 0;
+        ExecutionContext* cur_ctx = g_get_current_context_func ? g_get_current_context_func() : nullptr;
+        // Blocking guard for IRQ handler (Chapter 1.5 F / Design 2.3)
+        if (cur_ctx && cur_ctx->isInterruptThread()) {
+            return static_cast<std::uint64_t>(SYS_ERR_WOULDBLOCK);
         }
-
-        if (!g_get_current_thread_func || !g_block_thread_func) return -1;
-        Thread* current = g_get_current_thread_func();
+        Thread* current = g_get_current_thread_func ? g_get_current_thread_func() : nullptr;
         if (!current) return -1;
 
-        current->state = ThreadState::Blocked;
-        notif->add_waiter(current);
+        while (true) {
+            __asm__ volatile("cli");
+            if (notif->has_signals()) {
+                __asm__ volatile("sti");
+                current->is_blocked = false;
+                *reinterpret_cast<std::uint64_t*>(rsi) = notif->get_and_clear_value();
+                return 0;
+            }
 
-        g_block_thread_func();
+            current->state = ThreadState::Blocked;
+            current->is_blocked = true;
+            notif->add_waiter(current);
 
-        // Woken up by signal
-        *reinterpret_cast<std::uint64_t*>(rsi) = notif->get_and_clear_value();
-        return 0;
+            Baton* baton = current->baton;
+            if (baton && baton->caller_context) {
+                __asm__ volatile("sti");
+                ExecutionContext* caller = baton->caller_context;
+                baton->caller_context = nullptr;
+                baton->is_active = false;
+                caller->sched_reason = SchedReason::BLOCKED;
+                Kernel::instance().getScheduler().performContextSwitch(current, caller, oz::x86_64::rdtsc());
+            } else {
+                // 最底辺バトン (Root Baton / sched) の休眠: 自コンテキスト内でインライン HLT 待機
+                Kernel::instance().getScheduler().reapZombies();
+                __asm__ volatile("sti; hlt");
+            }
+        }
     } else if (syscall_number == 37) {
         // channel_bind_notification(ep_cap, notif_cap, badge)
         CSpace* cspace = get_cspace();
@@ -962,9 +1251,548 @@ extern "C" std::uint64_t handleSyscall(std::uint64_t rdi, std::uint64_t rsi, std
 
         tcb->setExitNotification(notif, rdx);
         return 0;
+    } else if (syscall_number == 40) {
+        // sys_tcb_cancel_ipc(tcb_cap)
+        CSpace* cspace = get_cspace();
+        if (!cspace) return -1;
+
+        TCB* tcb = get_cap_typed<TCB>(
+            cspace, static_cast<CapID>(rdi), ObjectType::TCB, CapRights::WRITE);
+        if (!tcb) return -1;
+
+        if (!tcb->cancel_ipc()) return -1;
+        return 0;
+    } else if (syscall_number == 41) {
+        // sys_tcb_get_cpu_time(tcb_cap, out_cycles_ptr)
+        CSpace* cspace = get_cspace();
+        if (!cspace) return -1;
+        if (!is_user_buffer(rsi, sizeof(std::uint64_t))) return -1;
+        if (rsi % alignof(std::uint64_t) != 0) return -1;
+
+        ExecutionContext* target = get_cap_execution_context(
+            cspace, static_cast<CapID>(rdi), CapRights::READ);
+        if (!target) return -1;
+
+        std::uint64_t cycles = target->total_cpu_cycles;
+        if (target == g_get_current_context_func() && target->last_switched_in != 0) {
+            cycles += (oz::x86_64::rdtsc() - target->last_switched_in);
+        }
+        *reinterpret_cast<std::uint64_t*>(rsi) = cycles;
+        return 0;
+    } else if (syscall_number == 42) {
+        // sys_baton_switch(target_baton_cap)
+        // rdi: target_baton_cap
+        CSpace* cspace = get_cspace();
+        if (!cspace) return SyscallResult(static_cast<std::uint64_t>(SYS_ERR_INVALID), 0);
+
+        ExecutionContext* current = g_get_current_context_func ? g_get_current_context_func() : nullptr;
+        if (!current) return SyscallResult(static_cast<std::uint64_t>(SYS_ERR_INVALID), 0);
+
+        // InterruptThread からのブロッキング操作を禁止 (設計書 2.1(2))
+        if (current->isInterruptThread()) {
+            return SyscallResult(static_cast<std::uint64_t>(SYS_ERR_INVALID_TYPE), 0);
+        }
+
+        Baton* baton = get_cap_typed<Baton>(
+            cspace, static_cast<CapID>(rdi), ObjectType::Baton, CapRights::WRITE);
+        if (!baton || !baton->thread) {
+            return SyscallResult(static_cast<std::uint64_t>(SchedReason::ORPHANED), 0);
+        }
+
+        ExecutionContext* target = baton->thread;
+        if (target->is_dead) {
+            baton->thread = nullptr;
+            return SyscallResult(static_cast<std::uint64_t>(SchedReason::EXIT), 0);
+        }
+
+        if (!baton->has_budget()) {
+            return SyscallResult(static_cast<std::uint64_t>(SchedReason::TIMEOUT), 0);
+        }
+
+        // 1.3 【禁止規則】 ② 走行中コンテキスト自身へのスイッチ禁止
+        if (target == current) {
+            return SyscallResult(static_cast<std::uint64_t>(SYS_ERR_DEADLK), 0);
+        }
+
+        if (target->is_blocked || target->state != ThreadState::Ready) {
+            return SyscallResult(static_cast<std::uint64_t>(SchedReason::BLOCKED), 0);
+        }
+
+        // ターゲットが InterruptThread の場合、親呼出元（スケジューラ）を caller_context に設定 (設計書 4.2 C(2,3))
+        if (target->isInterruptThread()) {
+            auto* ithread = static_cast<InterruptThread*>(target);
+            if (ithread->is_waiting_irq && !ithread->is_interrupted) {
+                return SyscallResult(static_cast<std::uint64_t>(SchedReason::BLOCKED), 0);
+            }
+            if (ithread->is_interrupted) {
+                // タイムアウト中断からの再開時のみ、呼出元（スケジューラ）を caller_context に設定
+                ithread->caller_context = current;
+                ithread->is_interrupted = false;
+            } else {
+                ithread->caller_context = nullptr;
+            }
+        }
+
+        // Set one-shot LAPIC timer if finite
+        if (!baton->is_infinite) {
+            oz::x86_64::setLAPICOneShot(baton->budget, oz::x86_64::APIC_TIMER_VECTOR);
+        }
+
+        baton->caller_context = current;
+        baton->is_active = true;
+
+        current->sched_reason = SchedReason::NONE;
+        std::uint64_t now = oz::x86_64::rdtsc();
+        Kernel::instance().getScheduler().performContextSwitch(current, target, now);
+
+        // ===== 復帰処理 (親スレッドのコンテキストで再開) =====
+        oz::x86_64::stopLAPICTimer();
+        baton->is_active = false;
+        baton->caller_context = nullptr;
+
+        std::uint64_t slice = target->last_consumed_cycles;
+        std::uint64_t tsc_per_us = oz::x86_64::getTSCTicksPerUs();
+        std::uint64_t consumed_us = slice / (tsc_per_us ? tsc_per_us : 1);
+        if (!baton->is_infinite && !target->isInterruptThread()) {
+            if (baton->budget > consumed_us) baton->budget -= consumed_us;
+            else baton->budget = 0;
+        }
+
+        SchedReason reason = current->sched_reason;
+        current->sched_reason = SchedReason::NONE;
+
+        if (baton->thread == nullptr || target->is_dead) {
+            if (reason == SchedReason::NONE) {
+                reason = (baton->thread == nullptr) ? SchedReason::ORPHANED : SchedReason::EXIT;
+            }
+        } else if (reason == SchedReason::NONE) {
+            reason = target->is_blocked ? SchedReason::BLOCKED : SchedReason::YIELD;
+        }
+
+        std::uint64_t rdx_val = 0;
+        if (reason == SchedReason::PREEMPTED) {
+            rdx_val = current->preempted_irq_vector;
+        } else {
+            rdx_val = target->last_consumed_cycles;
+        }
+
+        return SyscallResult(static_cast<std::uint64_t>(reason), rdx_val);
+    } else if (syscall_number == 43) {
+        // sys_baton_inject(target_baton_cap, budget_us)
+        // rdi: target_baton_cap, rsi: budget_us
+        CSpace* cspace = get_cspace();
+        if (!cspace) return SyscallResult(static_cast<std::uint64_t>(SYS_ERR_INVALID), 0);
+
+        Baton* baton = get_cap_typed<Baton>(
+            cspace, static_cast<CapID>(rdi), ObjectType::Baton, CapRights::WRITE);
+        if (!baton) {
+            return SyscallResult(static_cast<std::uint64_t>(SYS_ERR_INVALID), 0);
+        }
+
+        // 1.3 【禁止規則】 ① チェーンに含まれるバトンへの注入禁止
+        if (baton->is_active) {
+            return SyscallResult(static_cast<std::uint64_t>(SYS_ERR_INVALID), 0);
+        }
+
+        baton->budget = rsi;
+        if (baton->thread && baton->thread->isInterruptThread()) {
+            auto* ithread = static_cast<InterruptThread*>(baton->thread);
+            dprint("[sys_baton_inject] InterruptThread injected budget=");
+            dprint_dec(rsi);
+            dprint(" is_interrupted=");
+            dprint(ithread->is_interrupted ? "1" : "0");
+            dprint(" is_waiting_irq=");
+            dprint(ithread->is_waiting_irq ? "1" : "0");
+            dprint("\n\r");
+            if (ithread->is_interrupted) {
+                // タイムアウト中断されたハンドラへの再充填: 再開可能にする
+                ithread->is_blocked = false;
+                ithread->state = ThreadState::Ready;
+            } else if (ithread->is_waiting_irq && ithread->irq_handler && baton->budget > 0) {
+                // 累計枯渇で保留されていた IRQ ラインを Unmask (設計書 3.3)
+                ithread->irq_handler->acknowledge();
+            }
+        } else if (baton->is_runnable()) {
+            baton->notify_if_runnable();
+        }
+
+        return SyscallResult(0, 0);
+    } else if (syscall_number == 44) {
+        // sys_yield()
+        Thread* current = g_get_current_thread_func ? g_get_current_thread_func() : nullptr;
+        if (!current) return SyscallResult(static_cast<std::uint64_t>(SYS_ERR_INVALID), 0);
+
+        std::uint64_t now = oz::x86_64::rdtsc();
+        std::uint64_t slice = (now >= current->last_switched_in) ? (now - current->last_switched_in) : 0;
+        std::uint64_t tsc_per_us = oz::x86_64::getTSCTicksPerUs();
+        std::uint64_t consumed_us = slice / (tsc_per_us ? tsc_per_us : 1);
+        if (current->baton && !current->baton->is_infinite) {
+            if (current->baton->budget > consumed_us) {
+                current->baton->budget -= consumed_us;
+            } else {
+                current->baton->budget = 0;
+            }
+            current->baton->is_active = false;
+        }
+
+        current->last_consumed_cycles = slice;
+        current->total_cpu_cycles += slice;
+        current->last_switched_in = 0;
+        current->sched_reason = SchedReason::YIELD;
+
+        ExecutionContext* caller = current->baton ? current->baton->caller_context : nullptr;
+        if (caller && caller != current) {
+            current->baton->caller_context = nullptr;
+            caller->sched_reason = SchedReason::YIELD;
+            Kernel::instance().getScheduler().performContextSwitch(current, caller, now);
+        }
+        return SyscallResult(0, 0);
+    } else if (syscall_number == 45) {
+        // sys_tcb_get_id(tcb_cap, out_id_ptr)
+        CSpace* cspace = get_cspace();
+        if (!cspace) return SyscallResult(-1, 0);
+        if (!is_user_buffer(rsi, sizeof(std::uint64_t))) return SyscallResult(-1, 0);
+        if (rsi % alignof(std::uint64_t) != 0) return SyscallResult(-1, 0);
+
+        ExecutionContext* target = get_cap_execution_context(
+            cspace, static_cast<CapID>(rdi), CapRights::READ);
+        if (!target) return SyscallResult(-1, 0);
+
+        *reinterpret_cast<std::uint64_t*>(rsi) = target->id;
+        return SyscallResult(0, 0);
+    } else if (syscall_number == 46 || syscall_number == 54) {
+        // sys_baton_bind_notification(baton_cap, notif_cap, badge)
+        CSpace* cspace = get_cspace();
+        if (!cspace) return SyscallResult(-1, 0);
+
+        Notification* notif = nullptr;
+        if (static_cast<CapID>(rsi) != INVALID_CAP_ID && rsi != 0) {
+            notif = get_cap_typed<Notification>(
+                cspace, static_cast<CapID>(rsi), ObjectType::Notification, CapRights::WRITE);
+            if (!notif) return SyscallResult(-1, 0);
+        }
+
+        Baton* baton = get_cap_typed<Baton>(
+            cspace, static_cast<CapID>(rdi), ObjectType::Baton, CapRights::WRITE);
+        if (baton) {
+            baton->bound_notif = notif;
+            baton->bound_badge = rdx;
+            if (baton->thread && baton->thread->isInterruptThread()) {
+                baton->is_irq_baton = true;
+            }
+            if (baton->is_runnable()) {
+                baton->notify_if_runnable();
+            }
+            return SyscallResult(0, 0);
+        }
+
+        TCB* tcb = get_cap_typed<TCB>(
+            cspace, static_cast<CapID>(rdi), ObjectType::TCB, CapRights::WRITE);
+        if (tcb && tcb->getThread()) {
+            tcb->setSchedNotification(notif, rdx);
+            return SyscallResult(0, 0);
+        }
+
+        return SyscallResult(-1, 0);
+    } else if (syscall_number == 47) {
+        // sys_irq_ack(irq_handler_cap)
+        CSpace* cspace = get_cspace();
+        if (!cspace) return SyscallResult(-1, 0);
+
+        IRQHandler* handler = get_cap_typed<IRQHandler>(
+            cspace, static_cast<CapID>(rdi), ObjectType::IRQHandler, CapRights::WRITE);
+        if (!handler) return SyscallResult(-1, 0);
+
+        handler->acknowledge();
+        return SyscallResult(0, 0);
+    } else if (syscall_number == 48) {
+        // sys_irq_handler_set_notification(irq_handler_cap, notif_cap, badge)
+        CSpace* cspace = get_cspace();
+        if (!cspace) return SyscallResult(-1, 0);
+
+        IRQHandler* handler = get_cap_typed<IRQHandler>(
+            cspace, static_cast<CapID>(rdi), ObjectType::IRQHandler, CapRights::WRITE);
+        if (!handler) return SyscallResult(-1, 0);
+
+        Notification* notif = nullptr;
+        if (static_cast<CapID>(rsi) != INVALID_CAP_ID && rsi != 0) {
+            notif = get_cap_typed<Notification>(
+                cspace, static_cast<CapID>(rsi), ObjectType::Notification, CapRights::WRITE);
+            if (!notif) return SyscallResult(-1, 0);
+        }
+
+        handler->setNotification(notif, rdx);
+        return SyscallResult(0, 0);
+    } else if (syscall_number == 49) {
+        // sys_sched_set_root: Abolished in v2!
+        return SyscallResult(static_cast<std::uint64_t>(SYS_ERR_INVALID), 0);
+    } else if (syscall_number == 50) {
+        // sys_irq_wait(irq_handler_cap)
+        CSpace* cspace = get_cspace();
+        if (!cspace) return SyscallResult(static_cast<std::uint64_t>(SYS_ERR_INVALID), 0);
+
+        ExecutionContext* current_ctx = g_get_current_context_func ? g_get_current_context_func() : nullptr;
+        if (!current_ctx) return SyscallResult(static_cast<std::uint64_t>(SYS_ERR_INVALID), 0);
+
+        // 呼び出し元が InterruptThread であることを厳格に検査 (設計書 2.1(2))
+        if (!current_ctx->isInterruptThread()) {
+            return SyscallResult(static_cast<std::uint64_t>(SYS_ERR_INVALID_TYPE), 0);
+        }
+        auto* current = static_cast<InterruptThread*>(current_ctx);
+
+        IRQHandler* handler = get_cap_typed<IRQHandler>(
+            cspace, static_cast<CapID>(rdi), ObjectType::IRQHandler, CapRights::WRITE);
+        if (!handler) return SyscallResult(static_cast<std::uint64_t>(SYS_ERR_INVALID), 0);
+
+        current->irq_handler = handler;
+        current->irq_vector = handler->vector();
+        handler->setHandlerThread(current);
+
+        std::uint64_t now = oz::x86_64::rdtsc();
+
+        // 初期待機（リザーブ）かどうかの判定：
+        // saved_frame にも caller_context にも戻り先がない場合が初期待機
+        if (!current->saved_frame.interrupted_context && !current->caller_context) {
+            current->is_waiting_irq = true;
+            current->is_interrupted = false;
+            current->is_blocked = true;
+            current->state = ThreadState::Blocked;
+            if (current->baton) {
+                current->baton->is_irq_baton = true;
+                current->baton->is_active = false;
+                if (current->baton->budget == 0) {
+                    current->baton->budget = 10000;
+                }
+            }
+            handler->acknowledge(); // ハードウェア IRQ ラインを Unmask (有効化)
+
+            ExecutionContext* caller = current->baton ? current->baton->caller_context : nullptr;
+            if (current->baton) current->baton->caller_context = nullptr;
+            if (!caller) {
+                return SyscallResult(static_cast<std::uint64_t>(SYS_ERR_INVALID), 0);
+            }
+
+            current->sched_reason = SchedReason::BLOCKED;
+            caller->sched_reason = SchedReason::BLOCKED;
+            Kernel::instance().getScheduler().performContextSwitch(current, caller, now);
+            return SyscallResult(0, 0);
+        }
+
+        // 割り込み処理の完了（Ack & 次回待機）
+        // 1. タイマ停止
+        oz::x86_64::stopLAPICTimer();
+
+        // 2. 正常完了時の消費時間計算
+        std::uint64_t slice = (now >= current->last_switched_in) ? (now - current->last_switched_in) : 0;
+        std::uint64_t tsc_per_us = oz::x86_64::getTSCTicksPerUs();
+        std::uint64_t consumed_us = slice / (tsc_per_us ? tsc_per_us : 1);
+        if (current->baton && !current->baton->is_infinite) {
+            if (current->baton->budget > consumed_us) {
+                current->baton->budget -= consumed_us;
+            } else {
+                current->baton->budget = 0;
+            }
+            current->baton->is_active = false;
+        }
+
+        // 3. budget の検査と IRQ ラインの Unmask/Mask 維持（Mask Invariant）
+        bool has_budget = (current->baton && current->baton->budget > 0);
+        dprint("[sys_irq_wait] budget_rem=");
+        dprint_dec(current->baton ? current->baton->budget : 0);
+        dprint(" has_pending=");
+        dprint(handler->hasPending() ? "1" : "0");
+        dprint(" saved_ctx=");
+        dprint(current->saved_frame.interrupted_context ? "1" : "0");
+        dprint("\n\r");
+
+        if (has_budget) {
+            handler->acknowledge(); // Unmask IRQ line
+        } else {
+            // budget == 0 の場合（累計枯渇）: Unmask は保留（Mask 維持）し、枯渇通知を発行
+            dprint("[sys_irq_wait] budget == 0 (exhausted), signaling sched\n\r");
+            if (current->baton && current->baton->bound_notif) {
+                current->baton->bound_notif->signal(current->baton->bound_badge);
+            }
+        }
+
+        // ★★★ エッジケース対応: 処理中に次の割り込みが到着していた場合 (Pending) ★★★
+        if (has_budget && handler->hasPending()) {
+            dprint("[sys_irq_wait] Immediate loop on pending IRQ\n\r");
+            handler->clearPending();
+            handler->mask(); // 次の割り込み処理のために再度 Mask
+
+            // ハンドラを待機させず、直ちにリターンして次のイベントを即時処理させる
+            current->is_waiting_irq = false;
+            current->is_interrupted = false;
+            current->is_blocked = false;
+            current->state = ThreadState::Running;
+            current->last_switched_in = now;
+            return SyscallResult(0, 0);
+        }
+
+        current->is_waiting_irq = true;
+        current->is_interrupted = false;
+        current->is_blocked = true;
+        current->state = ThreadState::Blocked;
+        if (current->baton) {
+            current->baton->is_irq_baton = true;
+            current->baton->is_active = false;
+        }
+
+        // 4. 復帰先の動的判定
+        if (current->saved_frame.interrupted_context) {
+            // [ケース1: 割り込み直後の完了] -> 元スレッド T（または下位ハンドラ）へ復帰
+            ExecutionContext* T = current->saved_frame.interrupted_context;
+            std::uint32_t rem = current->saved_frame.lapic_remaining_ticks;
+            current->saved_frame.clear();
+
+            if (g_current_interrupt_thread == current) {
+                g_current_interrupt_thread = current->next_nested;
+                current->next_nested = nullptr;
+            }
+
+            if (rem > 0) {
+                oz::x86_64::setLAPICRemainingTicks(rem, oz::x86_64::APIC_TIMER_VECTOR);
+            }
+
+            if (T) {
+                T->last_switched_in = now;
+                Kernel::instance().getScheduler().performContextSwitch(current, T, now);
+            }
+            return SyscallResult(0, 0);
+        } else {
+            // [ケース2: スケジューラからの再開後の完了] -> 呼び出し元（スケジューラ）へ通常復帰
+            ExecutionContext* caller = current->caller_context;
+            current->caller_context = nullptr;
+
+            // 処理完了に伴い保留されていた IRQ ラインを Unmask
+            handler->acknowledge();
+
+            if (caller) {
+                caller->sched_reason = SchedReason::NONE;
+                caller->last_switched_in = now;
+                Kernel::instance().getScheduler().performContextSwitch(current, caller, now);
+            }
+            return SyscallResult(0, 0);
+        }
+    } else if (syscall_number == 53) {
+        // sys_tcb_bind_baton(tcb_cap, baton_cap)
+        // rdi: tcb_cap, rsi: baton_cap
+        CSpace* cspace = get_cspace();
+        if (!cspace) return SyscallResult(static_cast<std::uint64_t>(SYS_ERR_INVALID), 0);
+
+        ExecutionContext* target = get_cap_execution_context(
+            cspace, static_cast<CapID>(rdi), CapRights::WRITE);
+        if (!target) return SyscallResult(static_cast<std::uint64_t>(SYS_ERR_INVALID), 0);
+
+        ExecutionContext* current = g_get_current_context_func ? g_get_current_context_func() : nullptr;
+
+        // Unbind case
+        if (static_cast<CapID>(rsi) == INVALID_CAP_ID || rsi == 0) {
+            Baton* old_b = target->baton;
+            if (old_b) {
+                old_b->thread = nullptr;
+                old_b->is_active = false;
+                target->baton = nullptr;
+            }
+            if (!target->isInterruptThread()) {
+                Thread* t = static_cast<Thread*>(target);
+                if (t->state == ThreadState::BlockedOnRecv || t->state == ThreadState::BlockedOnSend ||
+                    t->state == ThreadState::BlockedOnCall || t->state == ThreadState::BlockedOnReply) {
+                    t->cancel_ipc();
+                    t->state = ThreadState::Blocked;
+                    t->is_blocked = true;
+                }
+            }
+            if (target == current) {
+                current->state = ThreadState::Blocked;
+                current->is_blocked = true;
+                std::uint64_t now = oz::x86_64::rdtsc();
+                ExecutionContext* caller = old_b ? old_b->caller_context : nullptr;
+                if (old_b) old_b->caller_context = nullptr;
+                if (caller && caller != current) {
+                    caller->sched_reason = SchedReason::ORPHANED;
+                    Kernel::instance().getScheduler().performContextSwitch(current, caller, now);
+                }
+            }
+            return SyscallResult(0, 0);
+        }
+
+        // Bind case
+        Baton* new_baton = get_cap_typed<Baton>(
+            cspace, static_cast<CapID>(rsi), ObjectType::Baton, CapRights::WRITE);
+        if (!new_baton) return SyscallResult(static_cast<std::uint64_t>(SYS_ERR_INVALID), 0);
+
+        bool current_held_baton = (current && (current->baton == new_baton || new_baton->thread == current));
+
+        if (new_baton->thread && new_baton->thread != target) {
+            new_baton->thread->baton = nullptr;
+        }
+        if (target->baton && target->baton != new_baton) {
+            target->baton->thread = nullptr;
+            target->baton->is_active = false;
+        }
+
+        target->baton = new_baton;
+        new_baton->thread = target;
+
+        new_baton->is_irq_baton = target->isInterruptThread();
+        if (target->isInterruptThread()) {
+            auto* ithread = static_cast<InterruptThread*>(target);
+            if (!ithread->is_waiting_irq) {
+                target->state = ThreadState::Ready;
+                target->is_blocked = false;
+            }
+        } else {
+            Thread* t = static_cast<Thread*>(target);
+            if (t->state == ThreadState::BlockedOnRecv || t->state == ThreadState::BlockedOnSend ||
+                t->state == ThreadState::BlockedOnCall || t->state == ThreadState::BlockedOnReply) {
+                t->cancel_ipc();
+            }
+            target->state = ThreadState::Ready;
+            target->is_blocked = false;
+        }
+        new_baton->notify_if_runnable();
+
+        // Rebind-and-Switch: current held this baton and rebound it to another context
+        if (current_held_baton && current != target) {
+            current->baton = nullptr;
+            current->is_blocked = true;
+            current->state = ThreadState::Blocked;
+            std::uint64_t now = oz::x86_64::rdtsc();
+            Kernel::instance().getScheduler().performContextSwitch(current, target, now);
+        }
+
+        return SyscallResult(0, 0);
+    } else if (syscall_number == 51) {
+        // sys_notification_bind_parent(child_notif_cap, parent_notif_cap, badge)
+        CSpace* cspace = get_cspace();
+        if (!cspace) return SyscallResult(static_cast<std::uint64_t>(SYS_ERR_INVALID), 0);
+
+        Notification* child = get_cap_typed<Notification>(
+            cspace, static_cast<CapID>(rdi), ObjectType::Notification, CapRights::WRITE);
+        if (!child) return SyscallResult(static_cast<std::uint64_t>(SYS_ERR_INVALID), 0);
+
+        Notification* parent = get_cap_typed<Notification>(
+            cspace, static_cast<CapID>(rsi), ObjectType::Notification, CapRights::WRITE);
+        if (!parent) return SyscallResult(static_cast<std::uint64_t>(SYS_ERR_INVALID), 0);
+
+        int res = child->bind_parent(parent, rdx);
+        return SyscallResult(static_cast<std::uint64_t>(res), 0);
+    } else if (syscall_number == 52) {
+        // sys_notification_unbind_parent(child_notif_cap)
+        CSpace* cspace = get_cspace();
+        if (!cspace) return SyscallResult(static_cast<std::uint64_t>(SYS_ERR_INVALID), 0);
+
+        Notification* child = get_cap_typed<Notification>(
+            cspace, static_cast<CapID>(rdi), ObjectType::Notification, CapRights::WRITE);
+        if (!child) return SyscallResult(static_cast<std::uint64_t>(SYS_ERR_INVALID), 0);
+
+        int res = child->unbind_parent();
+        return SyscallResult(static_cast<std::uint64_t>(res), 0);
     }
     
-    return static_cast<std::uint64_t>(-1);
+    return SyscallResult(static_cast<std::uint64_t>(-1), 0);
 }
 
 void initSyscall() {
@@ -1011,6 +1839,9 @@ __attribute__((naked)) void syscall_entry() {
         "pushq %rax\n"
 
         "call handleSyscall\n"
+
+        // Update saved RDX slot with the 2nd return value from handleSyscall (System V ABI)
+        "movq %rdx, 16(%rbp)\n"
 
         "movq %rbp, %rsp\n"
         

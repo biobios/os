@@ -1,4 +1,119 @@
 #include "core/Thread.hpp"
+#include "core/Capability.hpp"
+#include "core/Channel.hpp"
+#include "core/Baton.hpp"
+#include "utils/utils.hpp"
+
+namespace oz {
+
+extern void (*g_unblock_thread_func)(Thread*);
+
+static constexpr std::size_t MAX_GLOBAL_THREADS = 512;
+static Thread* s_thread_registry[MAX_GLOBAL_THREADS]{};
+
+void register_thread(Thread* t) {
+    if (!t) return;
+    for (std::size_t i = 0; i < MAX_GLOBAL_THREADS; ++i) {
+        if (!s_thread_registry[i] || s_thread_registry[i] == t) {
+            s_thread_registry[i] = t;
+            return;
+        }
+    }
+}
+
+void unregister_thread(Thread* t) {
+    if (!t) return;
+    for (std::size_t i = 0; i < MAX_GLOBAL_THREADS; ++i) {
+        if (s_thread_registry[i] == t) {
+            s_thread_registry[i] = nullptr;
+            return;
+        }
+    }
+}
+
+Thread* get_thread_by_id(std::uint64_t id) {
+    if (id == 0) return nullptr;
+    for (std::size_t i = 0; i < MAX_GLOBAL_THREADS; ++i) {
+        Thread* t = s_thread_registry[i];
+        if (t && t->id == id && !t->is_dead && t->state != ThreadState::Dead) {
+            return t;
+        }
+    }
+    return nullptr;
+}
+
+void dump_threads() {
+    dprint("[Sched Dump] Registered threads:\n\r");
+    for (std::size_t i = 0; i < MAX_GLOBAL_THREADS; ++i) {
+        Thread* t = s_thread_registry[i];
+        if (t && t->id != 0 && !t->is_dead) {
+            dprint("  [TID ");
+            // Print decimal TID
+            char buf[16];
+            int pos = 0;
+            std::uint64_t val = t->id;
+            if (val == 0) buf[pos++] = '0';
+            else {
+                char tmp[16];
+                int tpos = 0;
+                while (val > 0) { tmp[tpos++] = '0' + (val % 10); val /= 10; }
+                while (tpos > 0) buf[pos++] = tmp[--tpos];
+            }
+            buf[pos] = '\0';
+            dprint(buf);
+            dprint("] state=");
+            switch (t->state) {
+                case ThreadState::Ready: dprint("Ready"); break;
+                case ThreadState::Running: dprint("Running"); break;
+                case ThreadState::Blocked: dprint("Blocked"); break;
+                case ThreadState::BlockedOnSend: dprint("BlockedOnSend"); break;
+                case ThreadState::BlockedOnRecv: dprint("BlockedOnRecv"); break;
+                case ThreadState::BlockedOnReply: dprint("BlockedOnReply"); break;
+                case ThreadState::Dead: dprint("Dead"); break;
+                default: dprint("Unknown"); break;
+            }
+            dprint(" is_blocked=");
+            dprint(t->is_blocked ? "1" : "0");
+            dprint("\n\r");
+        }
+    }
+}
+
+Thread::Thread(std::uint64_t id, void* stack, std::uint64_t size, PageBlock<> block, std::uint8_t level, PhysicalAddress<PageTable> pml4_phys)
+    : ExecutionContext(id, stack, size, block, level, pml4_phys) {
+    register_thread(this);
+}
+
+Thread::~Thread() {
+    unregister_thread(this);
+}
+
+bool Thread::cancel_ipc() {
+    if (state != ThreadState::BlockedOnRecv && state != ThreadState::BlockedOnSend &&
+        state != ThreadState::BlockedOnCall && state != ThreadState::BlockedOnReply) {
+        return false;
+    }
+    if (blocking_ep) {
+        if (state == ThreadState::BlockedOnRecv) {
+            blocking_ep->remove_recv_waiter(this);
+        } else if (state == ThreadState::BlockedOnSend || state == ThreadState::BlockedOnCall) {
+            blocking_ep->remove_send_waiter(this);
+            if (send_msg.attached_cap.is_valid() && cspace) {
+                cspace->insert(send_msg.user_msg.transferred_cap, send_msg.attached_cap);
+                send_msg = InternalIPCMessage{};
+            }
+        }
+        blocking_ep = nullptr;
+    }
+    ipc_cancelled = true;
+    state = ThreadState::Ready;
+    if (g_unblock_thread_func) {
+        g_unblock_thread_func(this);
+    }
+    return true;
+}
+
+} // namespace oz
 
 extern "C" __attribute__((naked)) void oz::switch_context(void** old_rsp, void* new_rsp) {
     __asm__ volatile(

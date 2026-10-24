@@ -6,19 +6,28 @@ static constexpr std::uint32_t CAP_DISPLAY_SEND = 2;
 extern "C" void _start() {
     oz::sys_debug_print("Console Server started!\n\r");
     
-    oz::IPCMessage msg;
-    while (true) {
-        if (oz::sys_channel_recv(CAP_CONSOLE_RECV, &msg)) {
-            alignas(8) char buf[33];
-            for (int i = 0; i < 4; ++i) {
-                *reinterpret_cast<std::uint64_t*>(&buf[i * 8]) = msg.data[i];
-            }
-            buf[32] = '\0';
-            // Output to serial log
-            oz::sys_debug_print(buf);
+    oz::ReplyToken token = oz::INVALID_REPLY_TOKEN;
+    oz::IPCMessage reply{};
+    oz::IPCMessage msg{};
 
-            // Forward to Display Server for GUI rendering
-            oz::sys_channel_send(CAP_DISPLAY_SEND, &msg);
+    while (true) {
+        token = oz::sys_reply_recv(token, CAP_CONSOLE_RECV, (token != oz::INVALID_REPLY_TOKEN) ? &reply : nullptr, &msg);
+        if (token == oz::INVALID_REPLY_TOKEN) {
+            continue;
         }
+
+        alignas(8) char buf[33];
+        for (int i = 0; i < 4; ++i) {
+            *reinterpret_cast<std::uint64_t*>(&buf[i * 8]) = msg.data[i];
+        }
+        buf[32] = '\0';
+        // Output to serial log
+        oz::sys_debug_print(buf);
+
+        // Forward to Display Server for GUI rendering
+        oz::IPCMessage disp_resp{};
+        oz::sys_call(CAP_DISPLAY_SEND, &msg, &disp_resp);
+
+        reply.data[0] = 0; // Success ACK
     }
 }
