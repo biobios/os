@@ -17,12 +17,7 @@ include_directories(lib)
 add_library(oz_syscall STATIC lib/syscall.cpp)
 
 # init process
-option(ENABLE_BOOT_TESTS "Run self tests on boot" OFF)
 set(INIT_SRCS src/init/main.cpp src/init/linker.ld)
-if(ENABLE_BOOT_TESTS)
-    list(APPEND INIT_SRCS src/init/tests.cpp)
-    add_compile_definitions(ENABLE_BOOT_TESTS)
-endif()
 
 add_executable(init ${INIT_SRCS})
 target_link_libraries(init oz_syscall)
@@ -179,6 +174,38 @@ add_custom_target(initrd_xhcitest
     COMMAND tar -cvf ${CMAKE_BINARY_DIR}/initrd_xhcitest.tar -C ${CMAKE_CURRENT_BINARY_DIR}/pack_xhcitest init xhci
     DEPENDS xhcitest xhci
     COMMENT "Building test initrd for xhcitest"
+    VERBATIM
+)
+
+# 6. sandboxtest (Manifest & Sandboxing Tests)
+add_executable(sandboxtest tests/sandboxtest/main.cpp tests/common/linker.ld)
+target_link_libraries(sandboxtest oz_syscall)
+target_link_options(sandboxtest PRIVATE "-T${TEST_LINKER_SCRIPT}" "-nostdlib" "-static")
+
+add_custom_target(initrd_sandboxtest
+    COMMAND ${CMAKE_COMMAND} -E make_directory ${CMAKE_CURRENT_BINARY_DIR}/pack_sandboxtest
+    COMMAND ${CMAKE_COMMAND} -E copy $<TARGET_FILE:sandboxtest> ${CMAKE_CURRENT_BINARY_DIR}/pack_sandboxtest/init
+    COMMAND ${CMAKE_COMMAND} -E copy $<TARGET_FILE:manifest_test> ${CMAKE_CURRENT_BINARY_DIR}/pack_sandboxtest/manifest_test
+    COMMAND ${CMAKE_COMMAND} -E copy $<TARGET_FILE:cat> ${CMAKE_CURRENT_BINARY_DIR}/pack_sandboxtest/cat
+    COMMAND tar -cvf ${CMAKE_BINARY_DIR}/initrd_sandboxtest.tar -C ${CMAKE_CURRENT_BINARY_DIR}/pack_sandboxtest init manifest_test cat
+    DEPENDS sandboxtest manifest_test cat
+    COMMENT "Building test initrd for sandboxtest"
+    VERBATIM
+)
+
+# 7. ptest (Process & Memory Manager Tests)
+add_executable(ptest tests/ptest/main.cpp tests/common/linker.ld)
+target_link_libraries(ptest oz_syscall)
+target_link_options(ptest PRIVATE "-T${TEST_LINKER_SCRIPT}" "-nostdlib" "-static")
+
+add_custom_target(initrd_ptest
+    COMMAND ${CMAKE_COMMAND} -E make_directory ${CMAKE_CURRENT_BINARY_DIR}/pack_ptest
+    COMMAND ${CMAKE_COMMAND} -E copy $<TARGET_FILE:ptest> ${CMAKE_CURRENT_BINARY_DIR}/pack_ptest/init
+    COMMAND ${CMAKE_COMMAND} -E copy $<TARGET_FILE:memman> ${CMAKE_CURRENT_BINARY_DIR}/pack_ptest/memman
+    COMMAND ${CMAKE_COMMAND} -E copy $<TARGET_FILE:procman> ${CMAKE_CURRENT_BINARY_DIR}/pack_ptest/procman
+    COMMAND tar -cvf ${CMAKE_BINARY_DIR}/initrd_ptest.tar -C ${CMAKE_CURRENT_BINARY_DIR}/pack_ptest init memman procman
+    DEPENDS ptest memman procman
+    COMMENT "Building test initrd for ptest"
     VERBATIM
 )
 

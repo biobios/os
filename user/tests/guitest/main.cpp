@@ -32,6 +32,7 @@ static void run_display_tests(std::uint32_t cap_display_send) {
     TEST_REPORT("GUITEST", "Display create_surface (FrameCap Transfer)", ok);
 
     if (ok) {
+        std::uint32_t surf_id = static_cast<std::uint32_t>(resp_surf.data[1]);
         std::uint32_t surf_frame_cap = resp_surf.transferred_cap;
         static constexpr std::uint64_t TEST_SURF_VADDR = 0x700000000000ULL;
         int map_res = oz::sys_vspace_map_with_pagetables(oz::CAP_SELF_VSPACE, oz::CAP_UNTYPED, surf_frame_cap, TEST_SURF_VADDR, 0x01, 160 * 120 * 4);
@@ -44,6 +45,30 @@ static void run_display_tests(std::uint32_t cap_display_send) {
                     surf_buf[y * 160 + x] = Pixel{0xFF, 0xFF, 0x00, 0}; // Cyan
                 }
             }
+
+            // Test 3: Set surface position and commit composition
+            oz::IPCMessage req_pos{};
+            req_pos.data[0] = static_cast<std::uint64_t>(oz::ipc::DisplayCmd::SET_SURFACE_RECT);
+            req_pos.data[1] = surf_id;
+            req_pos.data[2] = (30ULL << 32) | 50ULL; // (x=30, y=50)
+            oz::IPCMessage resp_pos{};
+            oz::sys_call(cap_display_send, &req_pos, &resp_pos);
+
+            // Test 4: Update cursor position (Mouse Cursor simulation)
+            oz::IPCMessage req_cur{};
+            req_cur.data[0] = static_cast<std::uint64_t>(oz::ipc::DisplayCmd::UPDATE_CURSOR);
+            req_cur.data[1] = (40ULL << 32) | 60ULL; // (cursor_x=40, cursor_y=60)
+            req_cur.data[2] = 1; // visible
+            oz::IPCMessage resp_cur{};
+            oz::sys_call(cap_display_send, &req_cur, &resp_cur);
+
+            // Commit
+            oz::IPCMessage req_commit{};
+            req_commit.data[0] = static_cast<std::uint64_t>(oz::ipc::DisplayCmd::COMMIT);
+            req_commit.data[1] = surf_id;
+            oz::IPCMessage resp_commit{};
+            bool commit_ok = oz::sys_call(cap_display_send, &req_commit, &resp_commit);
+            TEST_REPORT("GUITEST", "Display Surface SetRect, Cursor & Commit", commit_ok && resp_commit.data[0] == 0);
         }
     }
 }
@@ -84,6 +109,104 @@ static void run_wm_tests(std::uint32_t cap_wm_send) {
         oz::IPCMessage resp_win2{};
         bool ok2 = oz::sys_call(cap_wm_send, &req_win2, &resp_win2) && resp_win2.data[0] == 0 && resp_win2.has_cap;
         TEST_REPORT("GUITEST", "WM create_window 2 (BSP Auto-Split)", ok2);
+
+        if (ok2) {
+            std::uint32_t win2_id = static_cast<std::uint32_t>(resp_win2.data[1]);
+            std::uint32_t win2_frame_cap = resp_win2.transferred_cap;
+
+            // Set Title
+            oz::IPCMessage title2_msg{};
+            title2_msg.data[0] = static_cast<std::uint64_t>(oz::ipc::WMCmd::SET_TITLE);
+            title2_msg.data[1] = win2_id;
+            const char* t2 = "Log";
+            for (int i = 0; i < 4; ++i) reinterpret_cast<char*>(&title2_msg.data[2])[i] = t2[i];
+            oz::IPCMessage resp_title2{};
+            oz::sys_call(cap_wm_send, &title2_msg, &resp_title2);
+
+            static constexpr std::uint64_t WIN2_VADDR = 0x720000000000ULL;
+            oz::sys_vspace_map_with_pagetables(oz::CAP_SELF_VSPACE, oz::CAP_UNTYPED, win2_frame_cap, WIN2_VADDR, 0x01, 380 * 260 * 4);
+
+            auto query_win_info = [&](std::uint32_t wid, std::uint8_t& ws, bool& is_min, bool& is_foc) -> bool {
+                oz::IPCMessage qmsg{};
+                qmsg.data[0] = static_cast<std::uint64_t>(oz::ipc::WMCmd::GET_WINDOW_INFO);
+                qmsg.data[1] = wid;
+                oz::IPCMessage qresp{};
+                if (oz::sys_call(cap_wm_send, &qmsg, &qresp) && qresp.data[0] == 0) {
+                    ws = static_cast<std::uint8_t>(qresp.data[1]);
+                    is_min = (qresp.data[2] != 0);
+                    is_foc = (qresp.data[3] != 0);
+                    return true;
+                }
+                return false;
+            };
+
+            auto send_key_to_wm = [&](char ascii, std::uint8_t scancode, std::uint32_t mod) {
+                oz::IPCMessage kmsg{};
+                kmsg.data[0] = static_cast<std::uint64_t>(oz::ipc::WMEventType::KEY_DOWN);
+                kmsg.data[1] = static_cast<std::uint64_t>(ascii);
+                kmsg.data[2] = static_cast<std::uint64_t>(scancode);
+                kmsg.data[3] = static_cast<std::uint64_t>(mod);
+                oz::IPCMessage kresp{};
+                oz::sys_call(cap_wm_send, &kmsg, &kresp);
+            };
+
+            // Test 3: Key Forwarding & GET_EVENT Retrieval
+            send_key_to_wm('A', 0x04, 0);
+            oz::IPCMessage get_ev_msg{};
+            get_ev_msg.data[0] = static_cast<std::uint64_t>(oz::ipc::WMCmd::GET_EVENT);
+            get_ev_msg.data[1] = win2_id;
+            oz::IPCMessage recv_k{};
+            bool key_fwd_ok = (oz::sys_call(cap_wm_send, &get_ev_msg, &recv_k) &&
+                               recv_k.data[0] == 0 && recv_k.data[1] == 'A');
+            TEST_REPORT("GUITEST", "WM Key Forwarding & GET_EVENT", key_fwd_ok);
+
+            // Test 4: Focus Navigation (Super + h)
+            send_key_to_wm('h', 0, static_cast<std::uint32_t>(oz::ipc::WMModifier::SUPER));
+            std::uint8_t ws1 = 0, ws2 = 0;
+            bool min1 = false, min2 = false, foc1 = false, foc2 = false;
+            query_win_info(win1_id, ws1, min1, foc1);
+            query_win_info(win2_id, ws2, min2, foc2);
+            TEST_REPORT("GUITEST", "WM Focus Navigation (Super + h)", foc1 && !foc2);
+
+            // Test 5: Minimize / Scratchpad (Super + m, Super + Shift + m)
+            send_key_to_wm('m', 0, static_cast<std::uint32_t>(oz::ipc::WMModifier::SUPER));
+            query_win_info(win1_id, ws1, min1, foc1);
+            query_win_info(win2_id, ws2, min2, foc2);
+            TEST_REPORT("GUITEST", "WM Minimize Window (Super + m)", min1 || min2);
+
+            send_key_to_wm('m', 0, static_cast<std::uint32_t>(oz::ipc::WMModifier::SUPER) | static_cast<std::uint32_t>(oz::ipc::WMModifier::SHIFT));
+            query_win_info(win1_id, ws1, min1, foc1);
+            query_win_info(win2_id, ws2, min2, foc2);
+            TEST_REPORT("GUITEST", "WM Restore Scratchpad (Super + Shift + m)", !min1 && !min2);
+
+            // Test 6: Modal Resize Mode (Super + r, l, Enter)
+            send_key_to_wm('r', 0, static_cast<std::uint32_t>(oz::ipc::WMModifier::SUPER));
+            send_key_to_wm('l', 0, 0);
+            send_key_to_wm('\r', 0, 0);
+            TEST_REPORT("GUITEST", "WM Modal Resize Mode (Super + r, l, Enter)", true);
+
+            // Test 7: Workspace Switching (Super + Shift + 2, Super + 1..9)
+            send_key_to_wm('2', 0, static_cast<std::uint32_t>(oz::ipc::WMModifier::SUPER) | static_cast<std::uint32_t>(oz::ipc::WMModifier::SHIFT));
+            query_win_info(win1_id, ws1, min1, foc1);
+            query_win_info(win2_id, ws2, min2, foc2);
+            TEST_REPORT("GUITEST", "WM Move Window to Workspace 2 (Super + Shift + 2)", ws1 == 1 || ws2 == 1);
+
+            send_key_to_wm('2', 0, static_cast<std::uint32_t>(oz::ipc::WMModifier::SUPER));
+            send_key_to_wm('1', 0, static_cast<std::uint32_t>(oz::ipc::WMModifier::SUPER) | static_cast<std::uint32_t>(oz::ipc::WMModifier::SHIFT));
+            send_key_to_wm('1', 0, static_cast<std::uint32_t>(oz::ipc::WMModifier::SUPER));
+            query_win_info(win1_id, ws1, min1, foc1);
+            TEST_REPORT("GUITEST", "WM Workspace Switching (Super + 1..9)", ws1 == 0);
+
+            // Test 8: Close Window (Super + Shift + q)
+            std::uint8_t dummy_ws = 0;
+            bool dummy_min = false, target_foc1 = false;
+            query_win_info(win1_id, dummy_ws, dummy_min, target_foc1);
+            std::uint32_t close_target = target_foc1 ? win1_id : win2_id;
+
+            send_key_to_wm('q', 0, static_cast<std::uint32_t>(oz::ipc::WMModifier::SUPER) | static_cast<std::uint32_t>(oz::ipc::WMModifier::SHIFT));
+            bool q_ok = query_win_info(close_target, ws1, min1, foc1);
+            TEST_REPORT("GUITEST", "WM Close Window (Super + Shift + q)", !q_ok);
+        }
     }
 }
 

@@ -3,10 +3,6 @@
 #include "../common/utils/BootInfo.hpp"
 #include "../common/ipc/Protocol.hpp"
 
-#ifdef ENABLE_BOOT_TESTS
-#include "tests.hpp"
-#endif
-
 // Cap slot assignments for init:
 //   0: CAP_SELF_VSPACE
 //   1: write to console (sys_write uses this)
@@ -649,13 +645,6 @@ extern "C" void _start() {
     oz::sys_write("test.txt not found (this is OK if disk has no test.txt).\n\r");
     }
     
-    #ifdef ENABLE_BOOT_TESTS
-    oz::init_tests::run_vfs_tests(CAP_VFS_SEND, CAP_VFS_RECV);
-    oz::init_tests::run_display_tests(CAP_DISPLAY_SEND);
-    oz::init_tests::run_wm_tests(CAP_WM_SEND);
-    oz::init_tests::run_manifest_tests(initrd_ptr, initrd_size, cons_send);
-    oz::init_tests::run_cat_tests(initrd_ptr, initrd_size, cons_send, CAP_VFS_SEND, CAP_VFS_RECV);
-    #endif
     
     // ========================================================================
     // Step 5: Launch Interactive Shell via Process Manager (ProcMan)

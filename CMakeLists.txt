@@ -27,7 +27,6 @@ find_package(Python3 COMPONENTS Interpreter REQUIRED)
 find_program(QEMU_EXECUTABLE qemu-system-x86_64)
 
 # Configuration options
-option(ENABLE_BOOT_TESTS "Run self tests on boot" OFF)
 set(OVMF_PATH "/usr/share/ovmf/OVMF.fd" CACHE FILEPATH "Path to OVMF bios file")
 set(HDD_IMAGE "${CMAKE_BINARY_DIR}/hdd.img" CACHE FILEPATH "Path to output HDD image")
 set(HDD_SIZE_MB 200 CACHE STRING "Disk image size in MB")
@@ -127,11 +126,13 @@ function(add_os_test_target NAME INITRD_TARGET)
     endif()
 endfunction()
 
-add_os_test_target(ktest    initrd_ktest)
-add_os_test_target(stest    initrd_stest)
-add_os_test_target(vtest    initrd_vtest)
-add_os_test_target(guitest  initrd_guitest)
-add_os_test_target(xhcitest initrd_xhcitest -device qemu-xhci,id=xhci -device usb-kbd,bus=xhci.0)
+add_os_test_target(ktest       initrd_ktest)
+add_os_test_target(stest       initrd_stest)
+add_os_test_target(vtest       initrd_vtest)
+add_os_test_target(guitest     initrd_guitest)
+add_os_test_target(xhcitest    initrd_xhcitest -device qemu-xhci,id=xhci -device usb-kbd,bus=xhci.0)
+add_os_test_target(sandboxtest initrd_sandboxtest)
+add_os_test_target(ptest       initrd_ptest)
 
 if(QEMU_EXECUTABLE)
     add_custom_target(test-all
@@ -140,6 +141,8 @@ if(QEMU_EXECUTABLE)
         COMMAND ${CMAKE_COMMAND} --build "${CMAKE_BINARY_DIR}" --target run-vtest
         COMMAND ${CMAKE_COMMAND} --build "${CMAKE_BINARY_DIR}" --target run-guitest
         COMMAND ${CMAKE_COMMAND} --build "${CMAKE_BINARY_DIR}" --target run-xhcitest
+        COMMAND ${CMAKE_COMMAND} --build "${CMAKE_BINARY_DIR}" --target run-sandboxtest
+        COMMAND ${CMAKE_COMMAND} --build "${CMAKE_BINARY_DIR}" --target run-ptest
         COMMENT "Running all subsystem test suites"
         VERBATIM
     )

@@ -11,6 +11,8 @@ static constexpr std::uint64_t INITRD_VADDR   = 0x500000000000ULL;
 static constexpr std::uint32_t CAP_AHCI_SEND   = 2;
 static constexpr std::uint32_t CAP_VFS_SEND    = 3;
 static constexpr std::uint32_t CAP_VFS_RECV    = 4;
+static constexpr std::uint64_t CLIENT_SHARED_BUF_VIRT = 0x300000000000ULL;
+static char* g_shared_buf = nullptr;
 
 struct VfsOpenAtResult {
     oz::ipc::VfsStatus status{oz::ipc::VfsStatus::NOT_FOUND};
@@ -77,6 +79,46 @@ static void run_tests() {
     } else {
         TEST_REPORT("VTEST", "VFS openat Directory Capability", false);
     }
+
+    // Test 7: Get file size
+    oz::IPCMessage sz_req{};
+    sz_req.data[0] = oz::ipc::vfs_make_command(oz::ipc::VfsCmd::GET_SIZE, 0);
+    sz_req.data[1] = static_cast<std::uint64_t>(res_file.handle);
+    oz::IPCMessage sz_resp{};
+    bool sz_ok = oz::sys_call(CAP_VFS_SEND, &sz_req, &sz_resp) && sz_resp.data[0] == 0 && sz_resp.data[1] >= 50;
+    TEST_REPORT("VTEST", "VFS get_size for test.txt", sz_ok);
+
+    // Test 8: Read file content (using shared buffer)
+    oz::IPCMessage rd_req{};
+    rd_req.data[0] = oz::ipc::vfs_make_command(oz::ipc::VfsCmd::READ, 0);
+    rd_req.data[1] = static_cast<std::uint64_t>(res_file.handle);
+    rd_req.data[2] = 0; // offset 0
+    rd_req.data[3] = 16; // read 16 bytes
+    oz::IPCMessage rd_resp{};
+    bool rd_ok = oz::sys_call(CAP_VFS_SEND, &rd_req, &rd_resp) && rd_resp.data[0] == 0 && rd_resp.data[1] == 16;
+    if (rd_ok && g_shared_buf) {
+        bool content_match = true;
+        const char* expected = "This is a test f";
+        for (int i = 0; i < 16; ++i) {
+            if (g_shared_buf[i] != expected[i]) { content_match = false; break; }
+        }
+        TEST_REPORT("VTEST", "VFS read file content match", content_match);
+    } else {
+        TEST_REPORT("VTEST", "VFS read file content match", false);
+    }
+
+    // Test 9: Close file handle
+    oz::IPCMessage cl_req{};
+    cl_req.data[0] = oz::ipc::vfs_make_command(oz::ipc::VfsCmd::CLOSE, 0);
+    cl_req.data[1] = static_cast<std::uint64_t>(res_file.handle);
+    oz::IPCMessage cl_resp{};
+    bool cl_ok = oz::sys_call(CAP_VFS_SEND, &cl_req, &cl_resp) && cl_resp.data[0] == 0;
+    TEST_REPORT("VTEST", "VFS close file handle", cl_ok);
+
+    // Test 10: Read after close must fail
+    oz::IPCMessage rd_after_close_resp{};
+    bool rd_after_fail = oz::sys_call(CAP_VFS_SEND, &rd_req, &rd_after_close_resp) && rd_after_close_resp.data[0] != 0;
+    TEST_REPORT("VTEST", "VFS read after close rejected", rd_after_fail);
 }
 
 } // namespace oz::vtest
@@ -192,6 +234,10 @@ extern "C" void _start() {
 
     std::uint32_t init_client_frame = oz::sys_frame_alloc(oz::CAP_UNTYPED, 16);
     oz::sys_cspace_cap_insert(vfs_proc.cspace_cap, 243, init_client_frame, static_cast<std::uint32_t>(oz::CapRights::ALL));
+
+    oz::sys_vspace_map_with_pagetables(oz::CAP_SELF_VSPACE, oz::CAP_UNTYPED, init_client_frame,
+                                       oz::vtest::CLIENT_SHARED_BUF_VIRT, 0x03, 64 * 1024);
+    oz::vtest::g_shared_buf = reinterpret_cast<char*>(oz::vtest::CLIENT_SHARED_BUF_VIRT);
 
     oz::sys_tcb_resume(vfs_proc.tcb_cap);
     init_coroutine(vfs_proc.tcb_cap);

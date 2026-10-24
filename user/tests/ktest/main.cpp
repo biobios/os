@@ -3,6 +3,18 @@
 
 namespace oz::ktest {
 
+static volatile bool g_once_server_received = false;
+static std::uint32_t g_once_server_ep = 0;
+static void test_once_server_thread() {
+    oz::IPCMessage req{};
+    oz::IPCMessage rep{};
+    rep.data[0] = 0x5555;
+    oz::ReplyToken tok = oz::sys_reply_recv(oz::INVALID_REPLY_TOKEN, g_once_server_ep, nullptr, &req);
+    g_once_server_received = (tok != oz::INVALID_REPLY_TOKEN);
+    oz::sys_reply_recv(tok, g_once_server_ep, &rep, &req);
+    oz::sys_exit(0);
+}
+
 // =============================================================================
 // 1. Capability Semantics Tests
 // =============================================================================
@@ -79,6 +91,66 @@ static void run_capability_semantics_tests() {
         oz::sys_cap_delete(notif_cap);
     } else {
         TEST_REPORT("KTEST", "Notification creation", false);
+    }
+
+    // Test Once Capability Auto-consumption
+    std::uint32_t o_ep0 = 0, o_ep1 = 0;
+    if (oz::sys_channel_create(oz::CAP_UNTYPED, &o_ep0, &o_ep1)) {
+        g_once_server_ep = o_ep1;
+
+        std::uint32_t s_tcb = oz::sys_untyped_retype(oz::CAP_UNTYPED, static_cast<std::uint32_t>(oz::ObjectType::TCB), 0);
+        std::uint32_t s_stack = oz::sys_frame_alloc(oz::CAP_UNTYPED, 4);
+        std::uint64_t s_stack_top = 0x700060000000ULL + 16384;
+        oz::sys_vspace_map_with_pagetables(oz::CAP_SELF_VSPACE, oz::CAP_UNTYPED, s_stack, 0x700060000000ULL, 0x03, 16384);
+        oz::sys_tcb_configure(s_tcb, oz::CAP_SELF_CSPACE, oz::CAP_SELF_VSPACE,
+                              reinterpret_cast<std::uint64_t>(test_once_server_thread), s_stack_top);
+
+        std::uint32_t s_baton = oz::sys_untyped_retype(oz::CAP_UNTYPED, static_cast<std::uint32_t>(oz::ObjectType::Baton), 0);
+        oz::sys_baton_inject(s_baton, 50000);
+        oz::sys_tcb_bind_baton(s_tcb, s_baton);
+        oz::sys_baton_switch(s_baton);
+
+        std::uint32_t once_cap = oz::sys_cap_mint(o_ep0, static_cast<std::uint32_t>(oz::CapRights::WRITE | oz::CapRights::ONCE));
+        if (once_cap != oz::INVALID_CAP_ID) {
+            oz::IPCMessage req{};
+            oz::IPCMessage rep{};
+            req.data[0] = 0x1234;
+            bool call_ok = oz::sys_call(once_cap, &req, &rep);
+            bool slot_deleted = (oz::sys_cap_delete(once_cap) != 0);
+            TEST_REPORT("KTEST", "Once Capability auto-consumption on sys_call", call_ok && slot_deleted && rep.data[0] == 0x5555);
+        } else {
+            TEST_REPORT("KTEST", "Once Capability auto-consumption on sys_call", false);
+        }
+        oz::sys_cap_delete(o_ep0);
+        oz::sys_cap_delete(o_ep1);
+    }
+
+    // Test Rights and Boundary Checks
+    {
+        // 1. Delete on invalid slot must fail
+        bool del_inv = (oz::sys_cap_delete(99999) != 0);
+        TEST_REPORT("KTEST", "sys_cap_delete on non-existent slot rejected", del_inv);
+
+        // 2. Privilege escalation prevention on mint
+        std::uint32_t ro_ep0 = 0, ro_ep1 = 0;
+        if (oz::sys_channel_create(oz::CAP_UNTYPED, &ro_ep0, &ro_ep1)) {
+            std::uint32_t ro_cap = oz::sys_cap_mint(ro_ep0, static_cast<std::uint32_t>(oz::CapRights::READ));
+            if (ro_cap != oz::INVALID_CAP_ID) {
+                std::uint32_t escalated = oz::sys_cap_mint(ro_cap, static_cast<std::uint32_t>(oz::CapRights::ALL));
+                TEST_REPORT("KTEST", "Cap privilege escalation rejected on mint", escalated == oz::INVALID_CAP_ID);
+                if (escalated != oz::INVALID_CAP_ID) {
+                    oz::sys_cap_delete(escalated);
+                }
+                oz::IPCMessage bad_msg{};
+                oz::IPCMessage bad_rep{};
+                bool call_fail = !oz::sys_call(ro_cap, &bad_msg, &bad_rep);
+                TEST_REPORT("KTEST", "sys_call rejected on READ-only cap", call_fail);
+
+                oz::sys_cap_delete(ro_cap);
+            }
+            oz::sys_cap_delete(ro_ep0);
+            oz::sys_cap_delete(ro_ep1);
+        }
     }
 }
 
