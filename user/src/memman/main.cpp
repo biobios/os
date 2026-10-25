@@ -6,10 +6,9 @@
 OZ_MANIFEST((oz::ProcessManifest{
     .magic = oz::ProcessManifest::MAGIC,
     .version = 1,
-    .needs_console = true,
-    .needs_vfs_root = false,
-    .needs_display = false,
-    .needs_wm = false,
+    .provides = 0,
+    .required = static_cast<std::uint32_t>(oz::ServiceId::CONSOLE),
+    .device_needed = oz::DeviceRequirement::NONE,
     .needs_untyped = true,
     .default_data_dir = {}
 }));
@@ -44,6 +43,17 @@ extern "C" void _start() {
                 static_cast<std::uint32_t>(oz::ObjectType::UntypedMemory),
                 size
             );
+
+            if (child_untyped == oz::INVALID_CAP_ID) {
+                for (std::uint32_t pool = 200; pool < 240; ++pool) {
+                    child_untyped = oz::sys_untyped_retype(
+                        pool,
+                        static_cast<std::uint32_t>(oz::ObjectType::UntypedMemory),
+                        size
+                    );
+                    if (child_untyped != oz::INVALID_CAP_ID) break;
+                }
+            }
 
             if (child_untyped != oz::INVALID_CAP_ID) {
                 resp.data[0] = 0; // Success

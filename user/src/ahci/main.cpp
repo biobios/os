@@ -2,25 +2,58 @@
 #include "syscall.hpp"
 #include "ring_buffer.hpp"
 #include "../common/ipc/Protocol.hpp"
+#include "../common/ipc/StartupInfo.hpp"
 #include "../common/utils/utils.hpp"
 
-extern "C" void _start() {
+OZ_MANIFEST((oz::ProcessManifest{
+    .magic = oz::ProcessManifest::MAGIC,
+    .version = 1,
+    .provides = static_cast<std::uint32_t>(oz::ServiceId::BLOCK_DEV),
+    .required = static_cast<std::uint32_t>(oz::ServiceId::VFS_ROOT),
+    .device_needed = oz::DeviceRequirement::AHCI,
+    .needs_untyped = true,
+    .default_data_dir = {}
+}));
+
+OZ_PROCESS_ENTRY() {
+    oz::LocalNamespace::init(info);
     oz::sys_write("AHCI Server started!\n\r");
-    
-    oz::IPCMessage msg{};
+
+    std::uint32_t drivman_cap = oz::LocalNamespace::get_cap(oz::CapRole::DRIVMAN);
+    std::uint32_t vfs_cap = oz::LocalNamespace::get_cap(oz::CapRole::ROOT_DIR);
+    std::uint32_t mmio_cap = 241;
+
+    oz::ReplyToken init_tok = oz::INVALID_REPLY_TOKEN;
     oz::IPCMessage init_ack{};
-    // Block until init sends start signal
-    oz::ReplyToken init_tok = oz::sys_reply_recv(oz::INVALID_REPLY_TOKEN, 2, nullptr, &msg);
-    if (init_tok == oz::INVALID_REPLY_TOKEN) {
-        oz::sys_write("AHCI: Failed to receive start signal from init!\n\r");
-        oz::sys_exit(1);
+
+    if (drivman_cap != 0) {
+        // Broker model: request AHCI MMIO from DrivMan
+        oz::IPCMessage req{};
+        req.data[0] = static_cast<std::uint64_t>(oz::ipc::DrivCmd::GET_DEVICE_CAP);
+        const char* dname = "ahci";
+        for (int i = 0; i < 4; ++i) reinterpret_cast<char*>(&req.data[1])[i] = dname[i];
+        oz::IPCMessage resp{};
+        if (oz::sys_call(drivman_cap, &req, &resp) && resp.data[0] == 0 && resp.has_cap) {
+            mmio_cap = resp.transferred_cap;
+            oz::sys_write("[AHCI] Obtained MMIO frame from DrivMan.\n\r");
+        } else {
+            oz::sys_write("[AHCI] Failed to obtain MMIO from DrivMan!\n\r");
+            oz::sys_exit(1);
+        }
+    } else {
+        // Standalone test fallback: wait for start signal from init
+        oz::IPCMessage msg{};
+        init_tok = oz::sys_reply_recv(oz::INVALID_REPLY_TOKEN, 2, nullptr, &msg);
+        if (init_tok == oz::INVALID_REPLY_TOKEN) {
+            oz::sys_write("AHCI: Failed to receive start signal from init!\n\r");
+            oz::sys_exit(1);
+        }
+        oz::sys_write("Received start signal!\n\r");
     }
     
-    oz::sys_write("Received start signal!\n\r");
-    
-    // Map ABAR MMIO from device Frame cap (slot 241)
+    // Map ABAR MMIO from device Frame cap
     static constexpr std::uint64_t ABAR_VIRT = 0x200000000000; // Fixed virtual address for MMIO
-    if (oz::sys_vspace_map_with_pagetables(oz::CAP_SELF_VSPACE, oz::CAP_UNTYPED, 241, ABAR_VIRT, 0x10 | 0x01, 4096) != 0) {
+    if (oz::sys_vspace_map_with_pagetables(oz::CAP_SELF_VSPACE, oz::CAP_UNTYPED, mmio_cap, ABAR_VIRT, 0x10 | 0x01, 4096) != 0) {
         // 0x10 = cache disable, 0x01 = writable
         oz::sys_write("Failed to map AHCI ABAR!\n\r");
         oz::sys_exit(1);
@@ -48,9 +81,38 @@ extern "C" void _start() {
     
     // Map shared buffer for block I/O
     static constexpr std::uint64_t SHARED_BUF_VIRT = 0x210000000000;
-    if (oz::sys_vspace_map_with_pagetables(oz::CAP_SELF_VSPACE, oz::CAP_UNTYPED, 242, SHARED_BUF_VIRT, 0x01, 16 * 4096) != 0) {
-        oz::sys_write("Failed to map shared buffer!\n\r");
-        oz::sys_exit(1);
+    std::uint32_t shared_buf_frame = oz::INVALID_CAP_ID;
+
+    // Check if slot 242 is already present (e.g. in vtest)
+    if (oz::sys_vspace_map_with_pagetables(oz::CAP_SELF_VSPACE, oz::CAP_UNTYPED, 242, SHARED_BUF_VIRT, 0x01, 16 * 4096) == 0) {
+        shared_buf_frame = 242;
+    } else {
+        // Allocate 16 pages for shared block buffer
+        shared_buf_frame = oz::sys_frame_alloc(oz::CAP_UNTYPED, 16);
+        if (shared_buf_frame != oz::INVALID_CAP_ID) {
+            oz::sys_vspace_map_with_pagetables(oz::CAP_SELF_VSPACE, oz::CAP_UNTYPED, shared_buf_frame, SHARED_BUF_VIRT, 0x01, 16 * 4096);
+        }
+    }
+
+    // Dynamic registration with VFS if VFS channel is provided
+    std::uint32_t block_recv_cap = 3;
+    if (vfs_cap != 0) {
+        std::uint32_t blk_send = 0, blk_recv = 0;
+        if (oz::sys_channel_create(oz::CAP_UNTYPED, &blk_send, &blk_recv)) {
+            block_recv_cap = blk_recv;
+            oz::IPCMessage reg_req{};
+            reg_req.data[0] = static_cast<std::uint64_t>(oz::ipc::VfsCmd::REGISTER_BLOCK_DEV);
+            const char* sname = "sata0";
+            for (int i = 0; i < 5; ++i) reinterpret_cast<char*>(&reg_req.data[1])[i] = sname[i];
+            reg_req.has_cap = true;
+            reg_req.transferred_cap = blk_send;
+            oz::IPCMessage reg_resp{};
+            if (oz::sys_call(vfs_cap, &reg_req, &reg_resp) && reg_resp.data[0] == 0) {
+                oz::sys_write("[AHCI] Registered block device 'sata0' with VFS.\n\r");
+            } else {
+                oz::sys_write("[AHCI] WARNING: REGISTER_BLOCK_DEV returned non-zero.\n\r");
+            }
+        }
     }
 
     // Map shared Ring Buffer Frame (slot 244) if available
@@ -104,6 +166,13 @@ extern "C" void _start() {
                             } else if (cmd == oz::ipc::BlockCmd::GET_INFO) {
                                 legacy_resp.data[0] = 0;
                                 legacy_resp.data[1] = dev->getSectorSize();
+                                if (shared_buf_frame != oz::INVALID_CAP_ID) {
+                                    constexpr std::uint32_t BUF_XFER_SLOT = 60;
+                                    if (oz::sys_cap_copy(BUF_XFER_SLOT, shared_buf_frame, static_cast<std::uint32_t>(oz::CapRights::ALL)) == 0) {
+                                        legacy_resp.has_cap = true;
+                                        legacy_resp.transferred_cap = BUF_XFER_SLOT;
+                                    }
+                                }
                             } else {
                                 legacy_resp.data[0] = static_cast<std::uint64_t>(-1);
                             }
@@ -152,7 +221,7 @@ extern "C" void _start() {
             oz::IPCMessage req{};
             oz::IPCMessage resp = init_ack;
             while (true) {
-                l_tok = oz::sys_reply_recv(l_tok, 3, (l_tok != oz::INVALID_REPLY_TOKEN) ? &resp : nullptr, &req);
+                l_tok = oz::sys_reply_recv(l_tok, block_recv_cap, (l_tok != oz::INVALID_REPLY_TOKEN) ? &resp : nullptr, &req);
                 if (l_tok == oz::INVALID_REPLY_TOKEN) continue;
                 
                 auto cmd = static_cast<oz::ipc::BlockCmd>(req.data[0]);
@@ -175,6 +244,13 @@ extern "C" void _start() {
                     case oz::ipc::BlockCmd::GET_INFO: {
                         resp.data[0] = 0;
                         resp.data[1] = dev->getSectorSize();
+                        if (shared_buf_frame != oz::INVALID_CAP_ID) {
+                            constexpr std::uint32_t BUF_XFER_SLOT = 60;
+                            if (oz::sys_cap_copy(BUF_XFER_SLOT, shared_buf_frame, static_cast<std::uint32_t>(oz::CapRights::ALL)) == 0) {
+                                resp.has_cap = true;
+                                resp.transferred_cap = BUF_XFER_SLOT;
+                            }
+                        }
                         break;
                     }
                     default:

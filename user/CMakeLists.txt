@@ -81,6 +81,11 @@ add_executable(memman src/memman/main.cpp src/memman/linker.ld)
 target_link_libraries(memman oz_syscall)
 target_link_options(memman PRIVATE "-T${CMAKE_CURRENT_SOURCE_DIR}/src/memman/linker.ld" "-nostdlib" "-static")
 
+# drivman process (Device Manager)
+add_executable(drivman src/drivman/main.cpp src/drivman/linker.ld)
+target_link_libraries(drivman oz_syscall)
+target_link_options(drivman PRIVATE "-T${CMAKE_CURRENT_SOURCE_DIR}/src/drivman/linker.ld" "-nostdlib" "-static")
+
 # procman process (Process Manager)
 add_executable(procman src/procman/main.cpp src/procman/linker.ld)
 target_link_libraries(procman oz_syscall)
@@ -210,9 +215,9 @@ add_custom_target(initrd_ptest
 )
 
 add_custom_target(initrd ALL
-    COMMAND tar -cvf ${CMAKE_SOURCE_DIR}/assets/initrd.tar -C ${CMAKE_CURRENT_BINARY_DIR} init console vfs ahci xhci display shell manifest_test cat head memman procman wm sched
+    COMMAND tar -cvf ${CMAKE_SOURCE_DIR}/assets/initrd.tar -C ${CMAKE_CURRENT_BINARY_DIR} init console vfs ahci xhci display shell manifest_test cat head memman drivman procman wm sched
     COMMAND cp ${CMAKE_CURRENT_BINARY_DIR}/shell ${CMAKE_CURRENT_BINARY_DIR}/manifest_test ${CMAKE_CURRENT_BINARY_DIR}/cat ${CMAKE_CURRENT_BINARY_DIR}/head ${CMAKE_SOURCE_DIR}/assets/
-    DEPENDS init console vfs ahci xhci display shell manifest_test cat head memman procman wm sched
+    DEPENDS init console vfs ahci xhci display shell manifest_test cat head memman drivman procman wm sched
 )
 target_sources(oz_syscall PRIVATE lib/malloc.cpp)
 

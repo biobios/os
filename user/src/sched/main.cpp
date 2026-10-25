@@ -1,5 +1,6 @@
 #include "syscall.hpp"
 #include "../common/ipc/Protocol.hpp"
+#include "../common/ipc/StartupInfo.hpp"
 #include "../common/utils/utils.hpp"
 
 // User-space Scheduler Daemon (Ring 3)
@@ -62,7 +63,7 @@ struct BatonControlBlock {
 static BatonControlBlock g_batons[MAX_BATONS]{};
 static std::uint32_t g_group_notifs[MAX_GROUPS]{};
 static std::uint64_t g_ready_bitmaps[MAX_GROUPS]{};
-static std::size_t g_current_index = 0;
+static std::size_t g_current_index = MAX_BATONS - 1;
 static std::size_t g_active_count = 0;
 
 static void print_dec(std::uint64_t val) {
@@ -330,13 +331,33 @@ static void process_woken_mask(std::uint64_t woken_mask) {
     }
 }
 
-extern "C" void _start() {
+OZ_PROCESS_ENTRY() {
+    oz::LocalNamespace::init(info);
     oz::sys_debug_print("[Sched] User-space Scheduler Daemon started (Pure Baton Scheduling Context Model)!\n\r");
 
     // Initialize Radix-64 Child Notifications for groups
     for (std::size_t g = 0; g < MAX_GROUPS; ++g) {
         g_group_notifs[g] = oz::sys_notification_create(oz::CAP_UNTYPED);
         oz::sys_notification_bind_parent(g_group_notifs[g], CAP_SCHED_NOTIF, 1ULL << g);
+    }
+
+    // Pre-wire Core 5 TCBs from StartupInfo (MemMan, VFS, DrivMan, ProcMan)
+    if (info && info->magic == oz::ProcessStartupInfo::MAGIC) {
+        for (std::size_t i = 0; i < info->num_caps; ++i) {
+            const auto& cap = info->caps[i];
+            if (cap.role == oz::CapRole::CUSTOM &&
+                cap.name[0] == 't' && cap.name[1] == 'c' && cap.name[2] == 'b' && cap.name[3] == ':') {
+                std::uint32_t baton = alloc_baton();
+                if (baton != oz::INVALID_CAP_ID) {
+                    oz::sys_tcb_bind_baton(cap.slot, baton);
+                    add_baton(baton, 1, 10000, cap.slot);
+                    oz::sys_tcb_resume(cap.slot);
+                    oz::sys_debug_print("[Sched] Pre-wired Core 5 TCB registered: ");
+                    oz::sys_debug_print(cap.name);
+                    oz::sys_debug_print("\n\r");
+                }
+            }
+        }
     }
 
     // Spawn passive worker thread for CAP_SCHED_RECV (Thread-per-Endpoint model)

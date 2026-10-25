@@ -65,14 +65,12 @@ public:
           ring_buf_cap(ring_cap) {}
 
     bool initialize() {
-        // 1. Map shared data buffer Frame (slot 242) into our VSpace
+        // 1. Map shared data buffer Frame (slot 242) into our VSpace if already present
         static constexpr std::uint64_t SHARED_BUF_VIRT = 0x200000000000;
-        if (sys_vspace_map_with_pagetables(oz::CAP_SELF_VSPACE, oz::CAP_UNTYPED, 242, SHARED_BUF_VIRT, 0x01, 16 * 4096) != 0) {
-            return false; // 0x01 = writable
+        if (sys_vspace_map_with_pagetables(oz::CAP_SELF_VSPACE, oz::CAP_UNTYPED, 242, SHARED_BUF_VIRT, 0x01, 16 * 4096) == 0) {
+            shared_buf = reinterpret_cast<void*>(SHARED_BUF_VIRT);
+            shared_buf_phys = sys_frame_phys_addr(242);
         }
-        shared_buf = reinterpret_cast<void*>(SHARED_BUF_VIRT);
-        shared_buf_phys = sys_frame_phys_addr(242);
-        if (!shared_buf_phys) return false;
 
         // 2. Map shared Ring Buffer Frame (slot 250) if available
         static constexpr std::uint64_t RING_BUF_VIRT = 0x205000000000;
@@ -109,6 +107,12 @@ public:
                 if (resp.data[0] == 0) {
                     sector_sz = static_cast<std::uint32_t>(resp.data[1]);
                     if (sector_sz == 0) sector_sz = 512;
+                }
+                if (!shared_buf && resp.has_cap && resp.transferred_cap != oz::INVALID_CAP_ID) {
+                    if (sys_vspace_map_with_pagetables(oz::CAP_SELF_VSPACE, oz::CAP_UNTYPED, resp.transferred_cap, SHARED_BUF_VIRT, 0x01, 16 * 4096) == 0) {
+                        shared_buf = reinterpret_cast<void*>(SHARED_BUF_VIRT);
+                        shared_buf_phys = sys_frame_phys_addr(resp.transferred_cap);
+                    }
                 }
             }
         }

@@ -1,4 +1,15 @@
 #include "syscall.hpp"
+#include "../common/ipc/StartupInfo.hpp"
+
+OZ_MANIFEST((oz::ProcessManifest{
+    .magic = oz::ProcessManifest::MAGIC,
+    .version = 1,
+    .provides = static_cast<std::uint32_t>(oz::ServiceId::CONSOLE),
+    .required = static_cast<std::uint32_t>(oz::ServiceId::DISPLAY),
+    .device_needed = oz::DeviceRequirement::NONE,
+    .needs_untyped = false,
+    .default_data_dir = {}
+}));
 
 static constexpr std::uint32_t CAP_CONSOLE_RECV = 1;
 static constexpr std::uint32_t CAP_DISPLAY_SEND = 2;

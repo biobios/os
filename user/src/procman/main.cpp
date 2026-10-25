@@ -9,10 +9,9 @@
 OZ_MANIFEST((oz::ProcessManifest{
     .magic = oz::ProcessManifest::MAGIC,
     .version = 1,
-    .needs_console = true,
-    .needs_vfs_root = true,
-    .needs_display = false,
-    .needs_wm = false,
+    .provides = 0,
+    .required = oz::ServiceId::CONSOLE | oz::ServiceId::VFS_ROOT,
+    .device_needed = oz::DeviceRequirement::NONE,
     .needs_untyped = false,
     .default_data_dir = {}
 }));
@@ -27,6 +26,9 @@ static constexpr std::uint32_t CAP_VFS_RECV        = 7;
 static constexpr std::uint32_t CAP_VFS_SHARED_BUF  = 8;
 static constexpr std::uint32_t CAP_WM_SEND         = 9;
 static constexpr std::uint32_t CAP_DISPLAY_SEND    = 10;
+static constexpr std::uint32_t CAP_DRIVMAN_SEND    = 11;
+static constexpr std::uint32_t CAP_SCHED_SEND      = 12;
+static constexpr std::uint32_t CAP_SHELL_SHARED_BUF = 13;
 
 static constexpr std::uint64_t VFS_SHARED_BUF_VIRT = 0x300000000000ULL;
 static constexpr std::uint64_t STAGING_ADDR        = 0x400000000000ULL;
@@ -179,7 +181,293 @@ static ProcessEntry* find_proc(std::uint32_t pid) {
     return nullptr;
 }
 
-extern "C" void _start() {
+static bool streq(const char* a, const char* b) {
+    if (!a || !b) return false;
+    while (*a && *b) {
+        if (*a++ != *b++) return false;
+    }
+    return *a == *b;
+}
+
+static void run_dag_orchestration(std::uint32_t sched_cap, std::uint32_t drivman_cap) {
+    oz::sys_write("[ProcMan] Starting Phase 2: DAG Component Orchestration...\n\r");
+
+    std::uint32_t active_services = static_cast<std::uint32_t>(oz::ServiceId::VFS_ROOT);
+
+    std::uint32_t disp_cmd_send = 0;
+    std::uint32_t disp_cmd_recv = 0;
+    std::uint32_t disp_txt_send = 0;
+    std::uint32_t disp_txt_recv = 0;
+    std::uint32_t cons_send = 0;
+    std::uint32_t cons_recv = 0;
+    std::uint32_t wm_req_send = 0;
+    std::uint32_t wm_req_recv = 0;
+
+    std::uint32_t kbd_ring_frame = oz::sys_frame_alloc(g_procman_work_untyped, 1);
+    std::uint32_t notif_wm_kbd = oz::sys_notification_create(g_procman_work_untyped);
+
+    const char* dag_components[] = {"display", "console", "wm", "ahci", "xhci", "shell"};
+    constexpr std::size_t NUM_COMPS = 6;
+    bool spawned[NUM_COMPS] = {false};
+    std::size_t spawned_count = 0;
+
+    while (spawned_count < NUM_COMPS) {
+        bool progress = false;
+        for (std::size_t i = 0; i < NUM_COMPS; ++i) {
+            if (spawned[i]) continue;
+            const char* name = dag_components[i];
+
+            int fd = vfs_open(name);
+            if (fd < 0) {
+                spawned[i] = true;
+                spawned_count++;
+                progress = true;
+                continue;
+            }
+
+            std::size_t sz = vfs_get_size(fd);
+            if (sz == 0 || sz > 4 * 1024 * 1024) {
+                vfs_close(fd);
+                spawned[i] = true;
+                spawned_count++;
+                progress = true;
+                continue;
+            }
+
+            std::size_t pages = (sz + 4095) / 4096;
+            std::uint32_t buf_frame = oz::sys_frame_alloc(g_procman_work_untyped, pages);
+            if (buf_frame == oz::INVALID_CAP_ID) {
+                vfs_close(fd);
+                break;
+            }
+
+            if (oz::sys_vspace_map_with_pagetables(oz::CAP_SELF_VSPACE, g_procman_work_untyped, buf_frame, STAGING_ADDR, 0x01, pages * 4096) != 0) {
+                oz::sys_cap_delete(buf_frame);
+                vfs_close(fd);
+                break;
+            }
+
+            char* staging = reinterpret_cast<char*>(STAGING_ADDR);
+            vfs_read(fd, 0, staging, sz);
+            vfs_close(fd);
+
+            oz::ProcessManifest manifest{};
+            bool has_manifest = oz::loader::get_elf_manifest(reinterpret_cast<const std::uint8_t*>(staging), sz, manifest);
+
+            if (has_manifest && (manifest.required & ~active_services) != 0) {
+                for (std::size_t p = 0; p < pages; ++p) {
+                    oz::sys_vspace_unmap(oz::CAP_SELF_VSPACE, STAGING_ADDR + p * 4096);
+                }
+                oz::sys_cap_delete(buf_frame);
+                continue;
+            }
+
+            oz::sys_write("[ProcMan] Spawning component from DAG: ");
+            oz::sys_write(name);
+            oz::sys_write("\n\r");
+
+            std::size_t child_ut_size = 2 * 1024 * 1024;
+            while (child_ut_size < sz + 512 * 1024) {
+                child_ut_size <<= 1;
+            }
+            std::uint32_t child_untyped = memman_alloc_untyped(child_ut_size);
+
+            oz::ProcessStartupInfo startup_info{};
+            std::uint32_t next_slot = 10;
+
+            if (has_manifest && manifest.requires_service(oz::ServiceId::CONSOLE)) {
+                startup_info.add_cap(next_slot++, oz::CapRole::STDOUT, "stdout", oz::CapType::STREAM);
+            }
+            if (has_manifest && manifest.requires_service(oz::ServiceId::DISPLAY)) {
+                startup_info.add_cap(next_slot++, oz::CapRole::DISPLAY, "display", oz::CapType::STREAM);
+            }
+            if (has_manifest && manifest.requires_service(oz::ServiceId::WM)) {
+                startup_info.add_cap(next_slot++, oz::CapRole::WM, "wm", oz::CapType::STREAM);
+            }
+            if (has_manifest && manifest.requires_service(oz::ServiceId::VFS_ROOT)) {
+                startup_info.add_cap(next_slot++, oz::CapRole::ROOT_DIR, "/", oz::CapType::DIR);
+            }
+            if (has_manifest && manifest.device_needed != oz::DeviceRequirement::NONE) {
+                startup_info.add_cap(next_slot++, oz::CapRole::DRIVMAN, "drivman", oz::CapType::STREAM);
+            }
+
+            bool is_interrupt = (has_manifest && manifest.device_needed == oz::DeviceRequirement::XHCI);
+
+            auto proc = is_interrupt ?
+                oz::loader::spawn_interrupt_process(
+                    child_untyped, oz::CAP_SELF_VSPACE,
+                    reinterpret_cast<const std::uint8_t*>(staging), sz,
+                    0x550000000000ULL, &startup_info
+                ) :
+                oz::loader::spawn_process(
+                    child_untyped, oz::CAP_SELF_VSPACE,
+                    reinterpret_cast<const std::uint8_t*>(staging), sz,
+                    0x550000000000ULL, &startup_info, false
+                );
+
+            for (std::size_t p = 0; p < pages; ++p) {
+                oz::sys_vspace_unmap(oz::CAP_SELF_VSPACE, STAGING_ADDR + p * 4096);
+            }
+            oz::sys_cap_delete(buf_frame);
+
+            if (!proc.success) {
+                oz::sys_write("[ProcMan] ERROR: Failed to spawn component!\n\r");
+                memman_revoke_untyped(child_untyped);
+                spawned[i] = true;
+                spawned_count++;
+                progress = true;
+                continue;
+            }
+
+            // Specific wiring for each component
+            if (has_manifest && manifest.provides_service(oz::ServiceId::DISPLAY)) {
+                oz::sys_channel_create(g_procman_work_untyped, &disp_cmd_send, &disp_cmd_recv);
+                oz::sys_channel_create(g_procman_work_untyped, &disp_txt_send, &disp_txt_recv);
+                oz::sys_cspace_cap_insert(proc.cspace_cap, 1, CAP_CONSOLE_WRITE, static_cast<std::uint32_t>(oz::CapRights::WRITE | oz::CapRights::GRANT));
+                oz::sys_cspace_cap_insert(proc.cspace_cap, 2, disp_txt_recv, static_cast<std::uint32_t>(oz::CapRights::READ));
+                oz::sys_cspace_cap_insert(proc.cspace_cap, 3, disp_cmd_recv, static_cast<std::uint32_t>(oz::CapRights::READ));
+                if (drivman_cap != 0) {
+                    oz::sys_cspace_cap_insert(proc.cspace_cap, startup_info.find_slot(oz::CapRole::DRIVMAN), drivman_cap, static_cast<std::uint32_t>(oz::CapRights::WRITE | oz::CapRights::GRANT | oz::CapRights::DUPLICATE));
+                }
+                active_services |= static_cast<std::uint32_t>(oz::ServiceId::DISPLAY);
+            } else if (has_manifest && manifest.provides_service(oz::ServiceId::CONSOLE)) {
+                oz::sys_channel_create(g_procman_work_untyped, &cons_send, &cons_recv);
+                oz::sys_cspace_cap_insert(proc.cspace_cap, 1, cons_recv, static_cast<std::uint32_t>(oz::CapRights::READ));
+                if (disp_txt_send != 0) {
+                    oz::sys_cspace_cap_insert(proc.cspace_cap, 2, disp_txt_send, static_cast<std::uint32_t>(oz::CapRights::WRITE | oz::CapRights::GRANT));
+                }
+                active_services |= static_cast<std::uint32_t>(oz::ServiceId::CONSOLE);
+            } else if (has_manifest && manifest.provides_service(oz::ServiceId::WM)) {
+                oz::sys_channel_create(g_procman_work_untyped, &wm_req_send, &wm_req_recv);
+                oz::sys_cspace_cap_insert(proc.cspace_cap, 0, proc.vspace_cap, static_cast<std::uint32_t>(oz::CapRights::ALL));
+                oz::sys_cspace_cap_insert(proc.cspace_cap, 1, cons_send, static_cast<std::uint32_t>(oz::CapRights::WRITE | oz::CapRights::GRANT));
+                oz::sys_cspace_cap_insert(proc.cspace_cap, 2, disp_cmd_send, static_cast<std::uint32_t>(oz::CapRights::WRITE | oz::CapRights::GRANT));
+                oz::sys_cspace_cap_insert(proc.cspace_cap, startup_info.find_slot(oz::CapRole::DISPLAY), disp_cmd_send, static_cast<std::uint32_t>(oz::CapRights::WRITE | oz::CapRights::GRANT));
+                oz::sys_cspace_cap_insert(proc.cspace_cap, 4, wm_req_recv, static_cast<std::uint32_t>(oz::CapRights::READ));
+                oz::sys_cspace_cap_insert(proc.cspace_cap, 5, kbd_ring_frame, static_cast<std::uint32_t>(oz::CapRights::ALL));
+                oz::sys_cspace_cap_insert(proc.cspace_cap, 6, notif_wm_kbd, static_cast<std::uint32_t>(oz::CapRights::ALL));
+                active_services |= static_cast<std::uint32_t>(oz::ServiceId::WM);
+            } else if (has_manifest && manifest.provides_service(oz::ServiceId::BLOCK_DEV)) {
+                if (cons_send != 0) oz::sys_cspace_cap_insert(proc.cspace_cap, 1, cons_send, static_cast<std::uint32_t>(oz::CapRights::WRITE | oz::CapRights::GRANT));
+                if (drivman_cap != 0) oz::sys_cspace_cap_insert(proc.cspace_cap, startup_info.find_slot(oz::CapRole::DRIVMAN), drivman_cap, static_cast<std::uint32_t>(oz::CapRights::WRITE | oz::CapRights::GRANT | oz::CapRights::DUPLICATE));
+                oz::sys_cspace_cap_insert(proc.cspace_cap, startup_info.find_slot(oz::CapRole::ROOT_DIR), CAP_VFS_SEND, static_cast<std::uint32_t>(oz::CapRights::ALL));
+                active_services |= static_cast<std::uint32_t>(oz::ServiceId::BLOCK_DEV);
+            } else if (is_interrupt) { // xHCI
+                if (wm_req_send != 0) {
+                    oz::sys_cspace_cap_insert(proc.cspace_cap, 1, wm_req_send, static_cast<std::uint32_t>(oz::CapRights::WRITE | oz::CapRights::GRANT));
+                    oz::sys_cspace_cap_insert(proc.cspace_cap, startup_info.find_slot(oz::CapRole::WM), wm_req_send, static_cast<std::uint32_t>(oz::CapRights::WRITE | oz::CapRights::GRANT));
+                }
+                oz::sys_cspace_cap_insert(proc.cspace_cap, 4, kbd_ring_frame, static_cast<std::uint32_t>(oz::CapRights::ALL));
+                oz::sys_cspace_cap_insert(proc.cspace_cap, 5, notif_wm_kbd, static_cast<std::uint32_t>(oz::CapRights::WRITE | oz::CapRights::GRANT));
+                
+                // Broker xHCI MMIO & IRQ from DrivMan into xHCI's CSpace
+                if (drivman_cap != 0) {
+                    // 1. Get MMIO Frame from DrivMan
+                    oz::IPCMessage req{};
+                    req.data[0] = static_cast<std::uint64_t>(oz::ipc::DrivCmd::GET_DEVICE_CAP);
+                    const char* dname = "xhci";
+                    for (int k = 0; k < 4; ++k) reinterpret_cast<char*>(&req.data[1])[k] = dname[k];
+                    oz::IPCMessage resp{};
+                    if (oz::sys_call(drivman_cap, &req, &resp) && resp.data[0] == 0 && resp.has_cap) {
+                        oz::sys_cspace_cap_move(proc.cspace_cap, 241, resp.transferred_cap);
+                    }
+
+                    // 2. Create IRQ channel and get IRQ Handler from DrivMan
+                    std::uint32_t irq_send = 0, irq_recv = 0;
+                    oz::sys_channel_create(g_procman_work_untyped, &irq_send, &irq_recv);
+                    oz::sys_cspace_cap_move(proc.cspace_cap, 2, irq_recv);
+
+                    oz::IPCMessage irq_req{};
+                    irq_req.data[0] = static_cast<std::uint64_t>(oz::ipc::DrivCmd::GET_DEVICE_CAP);
+                    const char* iname = "xhci_irq";
+                    for (int k = 0; k < 8; ++k) reinterpret_cast<char*>(&irq_req.data[1])[k] = iname[k];
+                    irq_req.has_cap = true;
+                    irq_req.transferred_cap = irq_send;
+                    oz::IPCMessage irq_resp{};
+                    if (oz::sys_call(drivman_cap, &irq_req, &irq_resp) && irq_resp.data[0] == 0 && irq_resp.has_cap) {
+                        oz::sys_cspace_cap_move(proc.cspace_cap, 3, irq_resp.transferred_cap);
+                    }
+                }
+            } else { // Shell
+                if (cons_send != 0) {
+                    oz::sys_cspace_cap_insert(proc.cspace_cap, 1, cons_send, static_cast<std::uint32_t>(oz::CapRights::WRITE | oz::CapRights::GRANT));
+                    oz::sys_cspace_cap_insert(proc.cspace_cap, startup_info.find_slot(oz::CapRole::STDOUT), cons_send, static_cast<std::uint32_t>(oz::CapRights::WRITE | oz::CapRights::GRANT));
+                }
+                oz::sys_cspace_cap_insert(proc.cspace_cap, 3, CAP_VFS_SEND, static_cast<std::uint32_t>(oz::CapRights::WRITE | oz::CapRights::GRANT));
+                oz::sys_cspace_cap_insert(proc.cspace_cap, startup_info.find_slot(oz::CapRole::ROOT_DIR), CAP_VFS_SEND, static_cast<std::uint32_t>(oz::CapRights::WRITE | oz::CapRights::GRANT));
+                if (disp_cmd_send != 0) {
+                    oz::sys_cspace_cap_insert(proc.cspace_cap, startup_info.find_slot(oz::CapRole::DISPLAY), disp_cmd_send, static_cast<std::uint32_t>(oz::CapRights::WRITE | oz::CapRights::GRANT));
+                }
+                if (wm_req_send != 0) {
+                    oz::sys_cspace_cap_insert(proc.cspace_cap, startup_info.find_slot(oz::CapRole::WM), wm_req_send, static_cast<std::uint32_t>(oz::CapRights::WRITE | oz::CapRights::GRANT));
+                }
+                // ProcMan channels for Shell to spawn commands
+                std::uint32_t sh_p_send = 0, sh_p_recv = 0;
+                oz::sys_channel_create(g_procman_work_untyped, &sh_p_send, &sh_p_recv);
+                oz::sys_cspace_cap_insert(proc.cspace_cap, 6, sh_p_send, static_cast<std::uint32_t>(oz::CapRights::WRITE | oz::CapRights::GRANT));
+                oz::sys_cspace_cap_insert(proc.cspace_cap, 7, sh_p_recv, static_cast<std::uint32_t>(oz::CapRights::READ));
+                // VFS client buffer for Shell
+                oz::sys_cspace_cap_insert(proc.cspace_cap, 5, CAP_SHELL_SHARED_BUF, static_cast<std::uint32_t>(oz::CapRights::ALL));
+                oz::sys_vspace_map_with_pagetables(proc.vspace_cap, child_untyped, CAP_SHELL_SHARED_BUF, 0x300000000000ULL, 0x01, 16 * 4096);
+            }
+
+            // Untyped for child
+            if (has_manifest && manifest.needs_untyped) {
+                std::size_t ut_size = 4 * 1024 * 1024;
+                if (streq(name, "display")) {
+                    ut_size = 16 * 1024 * 1024;
+                } else if (streq(name, "wm")) {
+                    ut_size = 8 * 1024 * 1024;
+                }
+                std::uint32_t app_untyped = memman_alloc_untyped(ut_size);
+                if (app_untyped != oz::INVALID_CAP_ID) {
+                    oz::sys_cspace_cap_insert(proc.cspace_cap, oz::CAP_UNTYPED, app_untyped, static_cast<std::uint32_t>(oz::CapRights::ALL));
+                }
+            }
+
+            // Register with Sched daemon
+            oz::IPCMessage reg_msg{};
+            if (is_interrupt) {
+                reg_msg.data[0] = static_cast<uint64_t>(oz::ipc::SchedCmd::REGISTER_IRQ_HANDLER);
+                reg_msg.data[1] = 0;
+                reg_msg.data[2] = 10000;
+            } else {
+                reg_msg.data[0] = static_cast<uint64_t>(oz::ipc::SchedCmd::REGISTER_THREAD);
+                reg_msg.data[1] = 1;
+                reg_msg.data[2] = 10000;
+            }
+            constexpr std::uint32_t TCB_COPY_SLOT = 160;
+            oz::sys_cap_copy(TCB_COPY_SLOT, proc.tcb_cap, static_cast<std::uint32_t>(oz::CapRights::ALL));
+            reg_msg.has_cap = true;
+            reg_msg.transferred_cap = TCB_COPY_SLOT;
+            oz::IPCMessage reg_resp{};
+            oz::sys_call(sched_cap, &reg_msg, &reg_resp);
+
+            // Resume process!
+            if (!is_interrupt) {
+                oz::sys_tcb_resume(proc.tcb_cap);
+            }
+            oz::sys_write("[ProcMan] Process resumed and registered with Sched: ");
+            oz::sys_write(name);
+            oz::sys_write("\n\r");
+
+            spawned[i] = true;
+            spawned_count++;
+            progress = true;
+            break;
+        }
+
+        if (!progress) {
+            oz::sys_write("[ProcMan] ERROR: DAG dependency deadlock detected!\n\r");
+            break;
+        }
+    }
+
+    oz::sys_write("[ProcMan] Phase 2 DAG Component Orchestration complete!\n\r");
+}
+
+OZ_PROCESS_ENTRY() {
+    oz::LocalNamespace::init(info);
     oz::sys_write("[ProcMan] Process Manager server started (Ring 3)!\n\r");
 
     // 1. Request initial working UntypedMemory (8MB) from MemMan for internal objects & staging
@@ -199,6 +487,13 @@ extern "C" void _start() {
     // 3. Ensure staging intermediate pagetables
     oz::sys_vspace_ensure_pagetables_range(oz::CAP_SELF_VSPACE, g_procman_work_untyped, STAGING_ADDR, 16 * 1024 * 1024);
     oz::sys_vspace_ensure_pagetables_range(oz::CAP_SELF_VSPACE, g_procman_work_untyped, 0x550000000000ULL, 16 * 1024 * 1024);
+
+    std::uint32_t sched_cap = oz::LocalNamespace::get_cap("sched");
+    std::uint32_t drivman_cap = oz::LocalNamespace::get_cap(oz::CapRole::DRIVMAN);
+
+    if (sched_cap != 0) {
+        run_dag_orchestration(sched_cap, drivman_cap);
+    }
 
     oz::sys_write("[ProcMan] Process Manager ready to serve spawn/wait requests.\n\r");
 
@@ -357,7 +652,7 @@ extern "C" void _start() {
                 child_stdout_slot = next_slot++;
                 actual_stdout_cap = g_session.stdout_cap;
                 g_session.startup_info.add_cap(child_stdout_slot, oz::CapRole::STDOUT, "stdout", oz::CapType::STREAM);
-            } else if (has_manifest && manifest.needs_console) {
+            } else if (has_manifest && manifest.requires_service(oz::ServiceId::CONSOLE)) {
                 child_stdout_slot = next_slot++;
                 actual_stdout_cap = CAP_CONSOLE_WRITE;
                 g_session.startup_info.add_cap(child_stdout_slot, oz::CapRole::STDOUT, "stdout", oz::CapType::STREAM);
@@ -365,21 +660,21 @@ extern "C" void _start() {
 
             // WM
             std::uint32_t child_wm_slot = 0;
-            if (has_manifest && manifest.needs_wm) {
+            if (has_manifest && manifest.requires_service(oz::ServiceId::WM)) {
                 child_wm_slot = next_slot++;
                 g_session.startup_info.add_cap(child_wm_slot, oz::CapRole::WM, "wm", oz::CapType::STREAM);
             }
 
             // Display
             std::uint32_t child_display_slot = 0;
-            if (has_manifest && manifest.needs_display) {
+            if (has_manifest && manifest.requires_service(oz::ServiceId::DISPLAY)) {
                 child_display_slot = next_slot++;
                 g_session.startup_info.add_cap(child_display_slot, oz::CapRole::DISPLAY, "display", oz::CapType::STREAM);
             }
 
             // VFS Root
             std::uint32_t child_vfs_slot = 0;
-            if (has_manifest && manifest.needs_vfs_root) {
+            if (has_manifest && manifest.requires_service(oz::ServiceId::VFS_ROOT)) {
                 child_vfs_slot = next_slot++;
                 g_session.startup_info.add_cap(child_vfs_slot, oz::CapRole::ROOT_DIR, "/", oz::CapType::DIR);
             }
@@ -472,7 +767,22 @@ extern "C" void _start() {
             pe->untyped_cap = child_untyped;
             pe->exit_notif = exit_notif;
 
-            // 9. Resume process
+            // 9. Register with Sched daemon if present
+            std::uint32_t sched_cap = oz::LocalNamespace::get_cap("sched", CAP_SCHED_SEND);
+            if (sched_cap != 0) {
+                oz::IPCMessage reg_msg{};
+                reg_msg.data[0] = static_cast<uint64_t>(oz::ipc::SchedCmd::REGISTER_THREAD);
+                reg_msg.data[1] = 1;
+                reg_msg.data[2] = 10000;
+                constexpr std::uint32_t S_TCB_SLOT = 160;
+                oz::sys_cap_copy(S_TCB_SLOT, proc.tcb_cap, static_cast<std::uint32_t>(oz::CapRights::ALL));
+                reg_msg.has_cap = true;
+                reg_msg.transferred_cap = S_TCB_SLOT;
+                oz::IPCMessage reg_resp{};
+                oz::sys_call(sched_cap, &reg_msg, &reg_resp);
+            }
+
+            // 10. Resume process
             oz::sys_tcb_resume(proc.tcb_cap);
             oz::sys_write("[ProcMan] Process spawned and running, pid=");
             char pid_buf[4] = {static_cast<char>('0' + (pid % 10)), '\n', '\r', '\0'};

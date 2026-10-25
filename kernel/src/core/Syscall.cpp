@@ -1029,6 +1029,17 @@ extern "C" SyscallResult handleSyscall(std::uint64_t rdi, std::uint64_t rsi, std
                 current->baton->notify_if_runnable();
             }
 
+            if (orphaned_baton) {
+                ExecutionContext* caller = current_baton ? current_baton->caller_context : nullptr;
+                if (current_baton) {
+                    current_baton->caller_context = nullptr;
+                }
+                if (caller && caller != current) {
+                    caller->sched_reason = SchedReason::ORPHANED;
+                    Kernel::instance().getScheduler().performContextSwitch(current, caller, oz::x86_64::rdtsc());
+                }
+            }
+
             return sender->id;
         }
 
@@ -1328,6 +1339,9 @@ extern "C" SyscallResult handleSyscall(std::uint64_t rdi, std::uint64_t rsi, std
                 // タイムアウト中断からの再開時のみ、呼出元（スケジューラ）を caller_context に設定
                 ithread->caller_context = current;
                 ithread->is_interrupted = false;
+                if (ithread->irq_handler) {
+                    ithread->irq_handler->clearPending();
+                }
             } else {
                 ithread->caller_context = nullptr;
             }
@@ -1404,11 +1418,7 @@ extern "C" SyscallResult handleSyscall(std::uint64_t rdi, std::uint64_t rsi, std
             dprint(" is_waiting_irq=");
             dprint(ithread->is_waiting_irq ? "1" : "0");
             dprint("\n\r");
-            if (ithread->is_interrupted) {
-                // タイムアウト中断されたハンドラへの再充填: 再開可能にする
-                ithread->is_blocked = false;
-                ithread->state = ThreadState::Ready;
-            } else if (ithread->is_waiting_irq && ithread->irq_handler && baton->budget > 0) {
+            if (ithread->is_waiting_irq && ithread->irq_handler && baton->budget > 0) {
                 // 累計枯渇で保留されていた IRQ ラインを Unmask (設計書 3.3)
                 ithread->irq_handler->acknowledge();
             }

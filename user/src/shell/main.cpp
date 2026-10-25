@@ -16,10 +16,9 @@ struct Pixel {
 OZ_MANIFEST((oz::ProcessManifest{
     .magic = oz::ProcessManifest::MAGIC,
     .version = 1,
-    .needs_console = true,
-    .needs_vfs_root = true,
-    .needs_display = true,
-    .needs_wm = true,
+    .provides = 0,
+    .required = oz::ServiceId::CONSOLE | oz::ServiceId::VFS_ROOT | oz::ServiceId::DISPLAY | oz::ServiceId::WM,
+    .device_needed = oz::DeviceRequirement::NONE,
     .needs_untyped = true,
     .default_data_dir = {}
 }));

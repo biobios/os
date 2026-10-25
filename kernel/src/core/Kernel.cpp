@@ -263,6 +263,28 @@ void Kernel::setupRootServerCaps(Thread* init_thread, UntypedMemory& boot_untype
     init_cspace->insert(240, untyped_cap);
     untyped->release();
 
+    // 2.1 Allocate BootInfo frame BEFORE harvesting remaining physical memory
+    std::uint64_t initrd_offset = 0;
+    if (initrd_file && initrd_file->base_address) {
+        std::uintptr_t initrd_raw_phys = initrd_file->base_address - oz::DIRECT_MAP_OFFSET;
+        initrd_offset = initrd_raw_phys & 0xFFFULL;
+    }
+
+    auto* pfd = fm.allocatePages(1);
+    std::uint64_t bootinfo_phys = pfd ? fm.getPhysicalAddress(pfd).get() : 0;
+    oz::BootInfo* bootinfo_virt = nullptr;
+    if (bootinfo_phys) {
+        bootinfo_virt = reinterpret_cast<oz::BootInfo*>(phys_to_virt(createPhysicalAddress<void>(bootinfo_phys)));
+        bootinfo_virt->ahci_abar_phys = devices.ahci_abar_phys;
+        bootinfo_virt->xhci_bar_phys = devices.xhci_bar_phys;
+        bootinfo_virt->initrd_size = initrd_file ? initrd_file->size : 0;
+        bootinfo_virt->initrd_offset = initrd_offset;
+        bootinfo_virt->fb_phys_addr = reinterpret_cast<std::uintptr_t>(platform_info_->frame_buffer_base) - oz::DIRECT_MAP_OFFSET;
+        bootinfo_virt->fb_size = platform_info_->frame_buffer_size;
+        bootinfo_virt->fb_width = platform_info_->frame_buffer_horizontal;
+        bootinfo_virt->fb_height = platform_info_->frame_buffer_vertical;
+    }
+
     // 2.5 Transfer all remaining physical memory to Init as UntypedMemory capabilities (Slots 200..)
     std::uint32_t untyped_start_slot = 200;
     std::uint32_t untyped_count = 0;
@@ -280,6 +302,17 @@ void Kernel::setupRootServerCaps(Thread* init_thread, UntypedMemory& boot_untype
     });
     dprint("[Kernel] Transferred system physical memory to Init as UntypedMemory caps.\n\r");
 
+    if (bootinfo_virt) {
+        bootinfo_virt->untyped_cap_start = untyped_start_slot;
+        bootinfo_virt->untyped_cap_count = untyped_count;
+
+        auto* bootinfo_frame = boot_untyped.allocateObject<Frame>(bootinfo_phys, 4096, false, pfd, free_fn);
+        Capability bootinfo_cap(bootinfo_frame, CapRights::ALL);
+        init_cspace->insert(243, bootinfo_cap);
+        bootinfo_frame->release();
+        dprint("[Kernel] BootInfo capability created.\n\r");
+    }
+
     // 3. AHCI MMIO Frame (Slot 241)
     if (devices.ahci_abar_phys != 0) {
         auto* abar_frame = boot_untyped.allocateObject<Frame>(devices.ahci_abar_phys, 4096, true);
@@ -296,34 +329,6 @@ void Kernel::setupRootServerCaps(Thread* init_thread, UntypedMemory& boot_untype
         xhci_mmio_frame->release();
     }
 
-    // 5. Setup BootInfo (Slot 243)
-    std::uint64_t initrd_offset = 0;
-    if (initrd_file && initrd_file->base_address) {
-        std::uintptr_t initrd_raw_phys = initrd_file->base_address - oz::DIRECT_MAP_OFFSET;
-        initrd_offset = initrd_raw_phys & 0xFFFULL;
-    }
-
-    auto* pfd = fm.allocatePages(1);
-    std::uint64_t bootinfo_phys = pfd ? fm.getPhysicalAddress(pfd).get() : 0;
-    if (bootinfo_phys) {
-        auto* bootinfo_virt = reinterpret_cast<oz::BootInfo*>(phys_to_virt(createPhysicalAddress<void>(bootinfo_phys)));
-        bootinfo_virt->ahci_abar_phys = devices.ahci_abar_phys;
-        bootinfo_virt->xhci_bar_phys = devices.xhci_bar_phys;
-        bootinfo_virt->initrd_size = initrd_file ? initrd_file->size : 0;
-        bootinfo_virt->initrd_offset = initrd_offset;
-        bootinfo_virt->fb_phys_addr = reinterpret_cast<std::uintptr_t>(platform_info_->frame_buffer_base) - oz::DIRECT_MAP_OFFSET;
-        bootinfo_virt->fb_size = platform_info_->frame_buffer_size;
-        bootinfo_virt->fb_width = platform_info_->frame_buffer_horizontal;
-        bootinfo_virt->fb_height = platform_info_->frame_buffer_vertical;
-        bootinfo_virt->untyped_cap_start = untyped_start_slot;
-        bootinfo_virt->untyped_cap_count = untyped_count;
-
-        auto* bootinfo_frame = boot_untyped.allocateObject<Frame>(bootinfo_phys, 4096, false, pfd, free_fn);
-        Capability bootinfo_cap(bootinfo_frame, CapRights::READ);
-        init_cspace->insert(243, bootinfo_cap);
-        bootinfo_frame->release();
-        dprint("[Kernel] BootInfo capability created.\n\r");
-    }
 
     // 6. Setup InitRD Frame capability (Slot 244)
     if (initrd_file && initrd_file->base_address) {
@@ -331,7 +336,7 @@ void Kernel::setupRootServerCaps(Thread* init_thread, UntypedMemory& boot_untype
         std::uintptr_t initrd_aligned_phys = initrd_raw_phys & ~0xFFFULL;
         std::size_t initrd_pages = (initrd_file->size + initrd_offset + 4095) / 4096;
         auto* initrd_frame = boot_untyped.allocateObject<Frame>(initrd_aligned_phys, initrd_pages * 4096, true);
-        Capability initrd_cap(initrd_frame, CapRights::READ);
+        Capability initrd_cap(initrd_frame, CapRights::ALL);
         init_cspace->insert(244, initrd_cap);
         initrd_frame->release();
         dprint("[Kernel] InitRD Frame capability created.\n\r");

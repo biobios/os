@@ -5,10 +5,9 @@
 OZ_MANIFEST((oz::ProcessManifest{
     .magic = oz::ProcessManifest::MAGIC,
     .version = 1,
-    .needs_console = true,
-    .needs_vfs_root = false,
-    .needs_display = false,
-    .needs_wm = false,
+    .provides = 0,
+    .required = static_cast<std::uint32_t>(oz::ServiceId::CONSOLE),
+    .device_needed = oz::DeviceRequirement::NONE,
     .needs_untyped = false,
     .default_data_dir = {}
 }));

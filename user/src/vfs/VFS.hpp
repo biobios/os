@@ -55,13 +55,18 @@ public:
 class VFS {
 private:
     FileSystem* root_fs;
+    FileSystem* disk_fs{nullptr};
 
 public:
     VFS();
     ~VFS();
 
-    // Mount the root filesystem
+    // Mount the root filesystem (e.g. TarFS)
     void mountRoot(FileSystem* fs);
+
+    // Mount the secondary disk filesystem (e.g. FAT32 at /disk)
+    void mountDisk(FileSystem* fs);
+    FileSystem* getDiskFS() const { return disk_fs; }
     
     // Open a file by path
     std::unique_ptr<File> open(const char* path);

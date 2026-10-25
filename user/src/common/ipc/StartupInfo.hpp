@@ -7,21 +7,55 @@ namespace oz {
 // ============================================================================
 // 1. Process Manifest (Declared in ELF .oz_manifest section)
 // ============================================================================
+enum class ServiceId : std::uint32_t {
+    NONE         = 0,
+    CONSOLE      = 1 << 0,
+    DISPLAY      = 1 << 1,
+    WM           = 1 << 2,
+    VFS_ROOT     = 1 << 3,
+    BLOCK_DEV    = 1 << 4,
+};
+
+constexpr inline std::uint32_t operator|(ServiceId a, ServiceId b) {
+    return static_cast<std::uint32_t>(a) | static_cast<std::uint32_t>(b);
+}
+constexpr inline std::uint32_t operator|(std::uint32_t a, ServiceId b) {
+    return a | static_cast<std::uint32_t>(b);
+}
+constexpr inline std::uint32_t operator&(std::uint32_t a, ServiceId b) {
+    return a & static_cast<std::uint32_t>(b);
+}
+
+enum class DeviceRequirement : std::uint32_t {
+    NONE         = 0,
+    AHCI         = 1,
+    XHCI         = 2,
+    FRAMEBUFFER  = 3,
+};
+
 struct ProcessManifest {
     static constexpr std::uint32_t MAGIC = 0x464D5A4FULL; // 'OZMF'
 
     std::uint32_t magic{MAGIC};
     std::uint32_t version{1};
     
-    // Requested standard capabilities
-    bool needs_console{true};      // Requires stdin / stdout
-    bool needs_vfs_root{false};    // Requires full root VFS directory
-    bool needs_display{false};     // Requires Display Server Channel
-    bool needs_wm{false};          // Requires Window Manager Channel
-    bool needs_untyped{false};     // Requires UntypedMemory (privileged)
+    // Service provide / require bitmasks
+    std::uint32_t provides{0}; // Services provided (bitmask of ServiceId)
+    std::uint32_t required{0}; // Services required (bitmask of ServiceId)
 
-    // Requested dedicated subdirectories (if needs_vfs_root is false)
+    // Device requirement (for DrivMan broker)
+    DeviceRequirement device_needed{DeviceRequirement::NONE};
+
+    // Special resource flags
+    bool needs_untyped{false};     // Requires UntypedMemory (privileged)
     char default_data_dir[32]{};   // e.g. "data" or "system"
+
+    constexpr bool provides_service(ServiceId id) const {
+        return (provides & static_cast<std::uint32_t>(id)) != 0;
+    }
+    constexpr bool requires_service(ServiceId id) const {
+        return (required & static_cast<std::uint32_t>(id)) != 0;
+    }
 };
 
 #define OZ_MANIFEST(manifest_obj) \
@@ -41,6 +75,7 @@ enum class CapRole : std::uint32_t {
     WM           = 6, // Window Manager session channel
     UNTYPED      = 7, // UntypedMemory capability
     CUSTOM       = 8, // Named custom service / channel
+    DRIVMAN      = 9, // Driver Manager Broker channel
 };
 
 enum class CapType : std::uint32_t {

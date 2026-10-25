@@ -93,15 +93,15 @@ public:
         // 2. タイマ停止
         oz::x86_64::stopLAPICTimer();
 
-        // 3. タイムアウトしたハンドラを停止状態（中断状態）にする
+        // 3. タイムアウトしたハンドラを中断状態（Ready）にする
         if (handler->baton) {
             handler->baton->budget = 0;
             handler->baton->is_active = false;
         }
         handler->is_waiting_irq = false;
         handler->is_interrupted = true;
-        handler->is_blocked = true;
-        handler->state = ThreadState::Blocked;
+        handler->is_blocked = false;
+        handler->state = ThreadState::Ready;
 
         std::uint64_t now = oz::x86_64::rdtsc();
 

@@ -3,6 +3,17 @@
 #include "HIDKeyboard.hpp"
 #include "ring_buffer.hpp"
 #include "../common/ipc/Protocol.hpp"
+#include "../common/ipc/StartupInfo.hpp"
+
+OZ_MANIFEST((oz::ProcessManifest{
+    .magic = oz::ProcessManifest::MAGIC,
+    .version = 1,
+    .provides = 0,
+    .required = static_cast<std::uint32_t>(oz::ServiceId::WM),
+    .device_needed = oz::DeviceRequirement::XHCI,
+    .needs_untyped = true,
+    .default_data_dir = {}
+}));
 
 static constexpr std::uint32_t CAP_CONSOLE_WRITE  = 1;
 static constexpr std::uint32_t CAP_IRQ_RECV       = 2;
@@ -59,7 +70,8 @@ static void onHIDReport(const std::uint8_t* report) {
 // (Controller is ~290KB due to devices_[256], stack is only 8KB)
 static xHCIDriver::Controller* g_xhci = nullptr;
 
-extern "C" void _start() {
+OZ_PROCESS_ENTRY() {
+    oz::LocalNamespace::init(info);
     oz::sys_debug_print("xHCI Server started!\n\r");
 
     // Map shared Keyboard Ring Buffer Frame (slot 4)

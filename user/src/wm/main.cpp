@@ -4,7 +4,18 @@
 #include "WindowManager.hpp"
 #include "../display/Font.hpp"
 #include "../common/ipc/Protocol.hpp"
+#include "../common/ipc/StartupInfo.hpp"
 #include "../common/utils/utils.hpp"
+
+OZ_MANIFEST((oz::ProcessManifest{
+    .magic = oz::ProcessManifest::MAGIC,
+    .version = 1,
+    .provides = static_cast<std::uint32_t>(oz::ServiceId::WM),
+    .required = static_cast<std::uint32_t>(oz::ServiceId::DISPLAY),
+    .device_needed = oz::DeviceRequirement::NONE,
+    .needs_untyped = true,
+    .default_data_dir = {}
+}));
 
 namespace {
 
@@ -701,7 +712,13 @@ extern "C" void _start() {
         oz::sys_debug_print("[WM] ERROR: Failed to create status bar surface!\n\r");
     }
 
-    // 4. Spawn passive command worker thread for CAP_WM_RECV
+    // 4. Map shared Keyboard Ring Buffer Frame (slot 5) if available
+    if (oz::sys_vspace_map_with_pagetables(oz::CAP_SELF_VSPACE, oz::CAP_UNTYPED, CAP_KBD_RING_FRAME, KBD_RING_VIRT, 0x01, 4096) == 0) {
+        g_kbd_ring = reinterpret_cast<volatile oz::WMInputRing*>(KBD_RING_VIRT);
+        oz::sys_debug_print("[WM] Shared Keyboard Ring Buffer mapped successfully.\n\r");
+    }
+
+    // 5. Spawn passive command worker thread for CAP_WM_RECV
     std::uint32_t worker_tcb = oz::sys_untyped_retype(oz::CAP_UNTYPED, static_cast<std::uint32_t>(oz::ObjectType::TCB), 0);
     std::uint32_t worker_stack = oz::sys_frame_alloc(oz::CAP_UNTYPED, 2);
     static constexpr std::uint64_t WORKER_STACK_TOP = 0x700010000000ULL;
@@ -719,12 +736,6 @@ extern "C" void _start() {
         oz::sys_debug_print("[WM] Command worker initialized and passive.\n\r");
     }
     oz::sys_cap_delete(worker_baton);
-
-    // 5. Map shared Keyboard Ring Buffer Frame (slot 5) if available
-    if (oz::sys_vspace_map_with_pagetables(oz::CAP_SELF_VSPACE, oz::CAP_UNTYPED, CAP_KBD_RING_FRAME, KBD_RING_VIRT, 0x01, 4096) == 0) {
-        g_kbd_ring = reinterpret_cast<volatile oz::WMInputRing*>(KBD_RING_VIRT);
-        oz::sys_debug_print("[WM] Shared Keyboard Ring Buffer mapped successfully.\n\r");
-    }
 
     oz::sys_debug_print("[WM] Main notification loop ready (Autonomous Manager).\n\r");
 

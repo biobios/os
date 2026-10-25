@@ -2,6 +2,7 @@
 #include "IPCBlockDevice.hpp"
 #include "FAT32.hpp"
 #include "VFS.hpp"
+#include "TarFS.hpp"
 #include "../common/ipc/Protocol.hpp"
 #include "../common/utils/utils.hpp"
 
@@ -21,7 +22,7 @@ static constexpr std::uint32_t CAP_CLIENT_RECV = 4;
 static constexpr std::uint32_t CAP_CLIENT_REPLY_BASE = 5;
 static constexpr std::uint32_t MAX_CLIENTS = 3;
 
-static constexpr std::uint32_t CAP_CLIENT_BUF_BASE = 243;
+static constexpr std::uint32_t CLIENT_BUF_SLOTS[MAX_CLIENTS] = {243, 231, 245};
 static constexpr std::uint64_t CLIENT_BUF_BASE_VIRT = 0x300000000000ULL;
 static constexpr std::uint64_t CLIENT_BUF_SIZE = 64 * 1024;
 
@@ -191,35 +192,59 @@ static void handle_file_session_request(FileSession& sess) {
 extern "C" void _start() {
     oz::sys_write("VFS Server started!\n\r");
     
-    // Initialize IPC-based block device connecting to AHCI server
-    oz::IPCBlockDevice block_dev(CAP_AHCI_SEND, CAP_AHCI_RECV);
-    if (!block_dev.initialize()) {
-        oz::sys_write("VFS: Failed to initialize block device!\n\r");
-        oz::sys_exit(1);
-    }
-    oz::sys_write("VFS: Block device connected to AHCI.\n\r");
-
-    // Initialize buffer cache
-    oz::BufferCacheManager cache;
-    cache.init();
-
-    // Initialize FAT32 filesystem
-    oz::FAT32FileSystem fat32(&block_dev, &cache);
-    if (!fat32.init()) {
-        oz::sys_write("VFS: Failed to mount FAT32!\n\r");
-        oz::sys_exit(1);
-    }
-    oz::sys_write("VFS: FAT32 mounted successfully!\n\r");
-
-    // Mount as root
     oz::VFS vfs;
-    vfs.mountRoot(&fat32);
+    oz::TarFileSystem* tar_fs = nullptr;
 
-    // Map shared client buffers (slots 243, 244) if present
+    // 1. Map InitRD Frame (slot 244) and mount TarFS as initial root
+    static constexpr std::uint64_t INITRD_VADDR = 0x500000000000ULL;
+    std::size_t initrd_sz = oz::sys_frame_size(oz::CAP_INITRD);
+    if (initrd_sz > 0) {
+        if (oz::sys_vspace_map_with_pagetables(oz::CAP_SELF_VSPACE, oz::CAP_UNTYPED, oz::CAP_INITRD, INITRD_VADDR, 0x00, initrd_sz) == 0) {
+            tar_fs = new oz::TarFileSystem(reinterpret_cast<const std::uint8_t*>(INITRD_VADDR), initrd_sz);
+            vfs.mountRoot(tar_fs);
+            oz::sys_write("VFS: Mounted InitRD (TarFS) as root filesystem.\n\r");
+        }
+    }
+
+    // 2. Setup Block Device & FAT32 mount helper
+    oz::IPCBlockDevice* block_dev = nullptr;
+    oz::BufferCacheManager* cache = nullptr;
+    oz::FAT32FileSystem* fat32 = nullptr;
+
+    auto mount_block_device = [&](std::uint32_t send_cap, std::uint32_t recv_cap) -> bool {
+        if (fat32) return true; // Already mounted
+        block_dev = new oz::IPCBlockDevice(send_cap, recv_cap);
+        if (!block_dev->initialize()) {
+            delete block_dev;
+            block_dev = nullptr;
+            return false;
+        }
+        cache = new oz::BufferCacheManager();
+        cache->init();
+        fat32 = new oz::FAT32FileSystem(block_dev, cache);
+        if (!fat32->init()) {
+            delete fat32; fat32 = nullptr;
+            delete cache; cache = nullptr;
+            delete block_dev; block_dev = nullptr;
+            return false;
+        }
+        if (!tar_fs) {
+            vfs.mountRoot(fat32);
+        }
+        vfs.mountDisk(fat32);
+        oz::sys_write("VFS: FAT32 mounted successfully at /disk!\n\r");
+        return true;
+    };
+
+    // If pre-connected AHCI channel exists (e.g. standalone vtest), mount it immediately
+    mount_block_device(CAP_AHCI_SEND, CAP_AHCI_RECV);
+
+    // Map shared client buffers (slots 243, 231, 245) if present
     char* client_bufs[MAX_CLIENTS] = {};
     for (std::uint32_t i = 0; i < MAX_CLIENTS; i++) {
         std::uint64_t virt = CLIENT_BUF_BASE_VIRT + static_cast<std::uint64_t>(i) * CLIENT_BUF_SIZE;
-        if (oz::sys_vspace_map_with_pagetables(oz::CAP_SELF_VSPACE, oz::CAP_UNTYPED, CAP_CLIENT_BUF_BASE + i, virt, 0x01, 16 * 4096) == 0) {
+        std::uint32_t slot = CLIENT_BUF_SLOTS[i];
+        if (oz::sys_vspace_map_with_pagetables(oz::CAP_SELF_VSPACE, oz::CAP_UNTYPED, slot, virt, 0x01, 16 * 4096) == 0) {
             client_bufs[i] = reinterpret_cast<char*>(virt);
             oz::sys_write("VFS: Client shared buffer mapped.\n\r");
         }
@@ -244,6 +269,18 @@ extern "C" void _start() {
         std::uint32_t reply_cap = (client_id < MAX_CLIENTS) ? (CAP_CLIENT_REPLY_BASE + client_id) : 0;
 
         switch (cmd) {
+            case oz::ipc::VfsCmd::REGISTER_BLOCK_DEV: {
+                if (req.has_cap && req.transferred_cap != oz::INVALID_CAP_ID) {
+                    if (mount_block_device(req.transferred_cap, req.transferred_cap)) {
+                        resp.data[0] = 0; // Success
+                    } else {
+                        resp.data[0] = 1; // Error
+                    }
+                } else {
+                    resp.data[0] = 1;
+                }
+                break;
+            }
             case oz::ipc::VfsCmd::OPENAT: {
                 std::uint32_t flags = static_cast<std::uint32_t>((req.data[0] >> 48) & 0xFF);
                 std::uint32_t base_dir_handle = static_cast<std::uint32_t>((req.data[0] >> 56) & 0xFF);
@@ -259,7 +296,7 @@ extern "C" void _start() {
                 }
 
                 // 2. Resolve base directory cluster
-                std::uint32_t base_cluster = fat32.getRootCluster();
+                std::uint32_t base_cluster = fat32 ? fat32->getRootCluster() : 0;
                 if (base_dir_handle > 0) {
                     OpenDirectory* d = get_dir(base_dir_handle);
                     if (d && d->cluster != 0) {
@@ -271,9 +308,9 @@ extern "C" void _start() {
                 }
 
                 if (flags == static_cast<std::uint32_t>(oz::ipc::VfsOpenFlags::DIRECTORY)) {
-                    auto dir = fat32.openDirAt(base_cluster, path);
+                    auto dir = fat32 ? fat32->openDirAt(base_cluster, path) : (tar_fs ? tar_fs->openDir(path) : nullptr);
                     if (dir) {
-                        std::uint32_t dir_first_cluster = static_cast<oz::FAT32Directory*>(dir.get())->getFirstCluster();
+                        std::uint32_t dir_first_cluster = fat32 ? static_cast<oz::FAT32Directory*>(dir.get())->getFirstCluster() : 1;
                         int handle = alloc_dir_handle(dir_first_cluster, dir.release());
                         if (handle >= 0) {
                             std::uint32_t vfs_ep = 0, client_ep = 0;
@@ -293,7 +330,7 @@ extern "C" void _start() {
                         resp.data[0] = static_cast<std::uint64_t>(oz::ipc::VfsStatus::NOT_FOUND);
                     }
                 } else {
-                    auto file = fat32.openFileAt(base_cluster, path);
+                    auto file = fat32 ? fat32->openFileAt(base_cluster, path) : (tar_fs ? tar_fs->openFile(path) : nullptr);
                     if (file) {
                         std::size_t sz = file->getSize();
                         int handle = alloc_handle(file.get());

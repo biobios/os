@@ -1,7 +1,18 @@
 #include "syscall.hpp"
 #include "Font.hpp"
 #include "../common/ipc/Protocol.hpp"
+#include "../common/ipc/StartupInfo.hpp"
 #include "../common/utils/utils.hpp"
+
+OZ_MANIFEST((oz::ProcessManifest{
+    .magic = oz::ProcessManifest::MAGIC,
+    .version = 1,
+    .provides = static_cast<std::uint32_t>(oz::ServiceId::DISPLAY),
+    .required = 0,
+    .device_needed = oz::DeviceRequirement::FRAMEBUFFER,
+    .needs_untyped = true,
+    .default_data_dir = {}
+}));
 
 namespace {
 
@@ -609,23 +620,60 @@ static void display_console_worker() {
     }
 }
 
-extern "C" void _start() {
+OZ_PROCESS_ENTRY() {
+    oz::LocalNamespace::init(info);
     oz::sys_debug_print("[Display] Minimal Display Server started (Ring 3)!\n\r");
 
-    // Wait for configuration IPC message from init process on Channel 2
-    oz::IPCMessage config_msg{};
-    oz::ReplyToken init_tok = oz::sys_reply_recv(oz::INVALID_REPLY_TOKEN, CAP_DISPLAY_RECV, nullptr, &config_msg);
-    if (init_tok == oz::INVALID_REPLY_TOKEN) {
-        oz::sys_debug_print("[Display] Failed to receive config message!\n\r");
-        oz::sys_exit(1);
-    }
+    std::uint32_t width = 0;
+    std::uint32_t height = 0;
+    std::size_t size = 0;
+
+    oz::ReplyToken init_tok = oz::INVALID_REPLY_TOKEN;
     oz::IPCMessage init_ack{};
 
-    std::uint32_t width = static_cast<std::uint32_t>(config_msg.data[0]);
-    std::uint32_t height = static_cast<std::uint32_t>(config_msg.data[1]);
-    std::size_t size = static_cast<std::size_t>(config_msg.data[2]);
+    std::uint32_t drivman_cap = oz::LocalNamespace::get_cap(oz::CapRole::DRIVMAN);
+    if (drivman_cap != 0) {
+        oz::IPCMessage fb_req{};
+        fb_req.data[0] = static_cast<std::uint64_t>(oz::ipc::DrivCmd::GET_DEVICE_CAP);
+        const char* dname = "fb";
+        for (int i = 0; i < 2; ++i) reinterpret_cast<char*>(&fb_req.data[1])[i] = dname[i];
+        oz::IPCMessage fb_resp{};
+        if (oz::sys_call(drivman_cap, &fb_req, &fb_resp) && fb_resp.data[0] == 0 && fb_resp.has_cap) {
+            width = static_cast<std::uint32_t>(fb_resp.data[1] >> 32);
+            height = static_cast<std::uint32_t>(fb_resp.data[1] & 0xFFFFFFFFULL);
+            size = static_cast<std::size_t>(fb_resp.data[2]);
+            oz::sys_cap_move(oz::CAP_FRAMEBUFFER, fb_resp.transferred_cap);
+            oz::sys_debug_print("[Display] Received FrameBuffer from DrivMan: w=");
+            char hbuf[17];
+            auto to_hex = [](std::uint64_t val, char* out) {
+                const char* d = "0123456789ABCDEF";
+                for (int i = 15; i >= 0; --i) { out[i] = d[val & 0xF]; val >>= 4; }
+                out[16] = '\0';
+            };
+            to_hex(width, hbuf); oz::sys_debug_print(hbuf);
+            oz::sys_debug_print(" h=");
+            to_hex(height, hbuf); oz::sys_debug_print(hbuf);
+            oz::sys_debug_print(" sz=");
+            to_hex(size, hbuf); oz::sys_debug_print(hbuf);
+            oz::sys_debug_print("\n\r");
+        } else {
+            oz::sys_debug_print("[Display] ERROR: Failed to get FrameBuffer from DrivMan!\n\r");
+            oz::sys_exit(1);
+        }
+    } else {
+        // Wait for configuration IPC message from init process on Channel 2
+        oz::IPCMessage config_msg{};
+        init_tok = oz::sys_reply_recv(oz::INVALID_REPLY_TOKEN, CAP_DISPLAY_RECV, nullptr, &config_msg);
+        if (init_tok == oz::INVALID_REPLY_TOKEN) {
+            oz::sys_debug_print("[Display] Failed to receive config message!\n\r");
+            oz::sys_exit(1);
+        }
 
-    oz::sys_debug_print("[Display] Received config from init.\n\r");
+        width = static_cast<std::uint32_t>(config_msg.data[0]);
+        height = static_cast<std::uint32_t>(config_msg.data[1]);
+        size = static_cast<std::size_t>(config_msg.data[2]);
+        oz::sys_debug_print("[Display] Received config from init.\n\r");
+    }
 
     if (!g_display.init(width, height, size)) {
         oz::sys_exit(1);

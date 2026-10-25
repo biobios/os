@@ -47,6 +47,13 @@ enum class VfsCmd : std::uint64_t {
                         // Response:
                         //   data[0] = status (0: ok, 1: not found, 2: invalid path / '..' rejected)
                         //   transferred_cap = new FileCap or DirectoryCap Channel
+    REGISTER_BLOCK_DEV = 20, // data[1..3] = device name ("sata0"), transferred_cap = BlockDev EP
+};
+
+// ===== Driver Manager (DrivMan) Protocol =====
+enum class DrivCmd : std::uint64_t {
+    GET_DEVICE_CAP = 1, // data[1..3] = device name ("ahci", "xhci", "fb", "xhci_irq") -> transferred_cap
+    GET_BOOT_INFO  = 2, // BootInfo Frame Cap
 };
 
 enum class VfsOpenFlags : std::uint32_t {

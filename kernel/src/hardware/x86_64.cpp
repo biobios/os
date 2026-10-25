@@ -406,6 +406,7 @@ namespace {
 
             // ケース B: budget == 0 の場合（セーフティネット / 遅延充填パス）:
             // ラインの Mask と LAPIC EOI は既に発行済み。
+            // 割り込みが到着したためハンドラを Ready 化（タイムアウト中断扱い）し、
             // ハンドラの bound_notif に非同期シグナルを送信した上で、
             // 現在走行中のスレッド T は中断せずそのまま継続走行（No Time Theft 原則の徹底）。
             if (!ithread->has_baton() || (ithread->baton && ithread->baton->budget == 0)) {
@@ -414,6 +415,11 @@ namespace {
                 oz::utils::to_hex(vector, hbuf);
                 dprint(hbuf);
                 dprint("\n\r");
+                handler->setPending(true);
+                ithread->is_waiting_irq = false;
+                ithread->is_blocked = false;
+                ithread->state = oz::ThreadState::Ready;
+                ithread->is_interrupted = true;
                 if (ithread->baton && ithread->baton->bound_notif) {
                     ithread->baton->bound_notif->signal(ithread->baton->bound_badge);
                 }

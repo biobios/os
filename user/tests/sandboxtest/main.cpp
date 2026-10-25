@@ -24,10 +24,10 @@ static void run_manifest_sandboxing_tests(const std::uint8_t* initrd_ptr, std::u
     TEST_REPORT("SANDBOX", "Parse .oz_manifest section", has_manifest && manifest.magic == oz::ProcessManifest::MAGIC);
 
     if (has_manifest) {
-        bool props_ok = (manifest.needs_console == true &&
-                         manifest.needs_vfs_root == false &&
-                         manifest.needs_display == false &&
-                         manifest.needs_wm == false &&
+        bool props_ok = (manifest.requires_service(oz::ServiceId::CONSOLE) &&
+                         !manifest.requires_service(oz::ServiceId::VFS_ROOT) &&
+                         !manifest.requires_service(oz::ServiceId::DISPLAY) &&
+                         !manifest.requires_service(oz::ServiceId::WM) &&
                          manifest.needs_untyped == false);
         TEST_REPORT("SANDBOX", "Manifest static permission declarations match", props_ok);
 
@@ -35,10 +35,10 @@ static void run_manifest_sandboxing_tests(const std::uint8_t* initrd_ptr, std::u
         oz::ProcessStartupInfo startup_info{};
         std::uint32_t next_slot = 1;
 
-        if (manifest.needs_console) {
+        if (manifest.requires_service(oz::ServiceId::CONSOLE)) {
             startup_info.add_cap(next_slot++, oz::CapRole::STDOUT, "stdout");
         }
-        if (manifest.needs_vfs_root) {
+        if (manifest.requires_service(oz::ServiceId::VFS_ROOT)) {
             startup_info.add_cap(next_slot++, oz::CapRole::ROOT_DIR, "/");
         }
 
