@@ -1,11 +1,12 @@
 #pragma once
 #include "core/Thread.hpp"
-#include "core/InterruptThread.hpp"
 #include "core/Baton.hpp"
 #include "core/IScheduler.hpp"
 #include "core/Syscall.hpp"
+#include "core/IRQHandler.hpp"
 #include "core/Notification.hpp"
 #include "core/SavedInterruptFrame.hpp"
+#include "core/CartesianTree.hpp"
 #include "hardware/x86_64.hpp"
 #include "utils/InterruptGuard.hpp"
 #include <cstdint>
@@ -34,6 +35,9 @@ private:
 
 public:
     Scheduler() = default;
+
+    Baton* cartesian_root{nullptr};
+    Baton* running_baton{nullptr};
 
     Thread* initThread(Thread* thread, void* stack, std::uint64_t stack_size, void (*entry)(void*), void* arg) {
         thread->id = next_thread_id++;
@@ -79,55 +83,61 @@ public:
         main_thread = thread;
     }
 
-    void perform_clean_unwind(InterruptThread* handler) {
-        // 1. 退避スタックから直前の中断コンテキストを取り出す
-        ExecutionContext* interrupted = handler->saved_frame.interrupted_context;
-        std::uint32_t rem_ticks = handler->saved_frame.lapic_remaining_ticks;
-        handler->saved_frame.clear();
-
-        if (g_current_interrupt_thread == handler) {
-            g_current_interrupt_thread = handler->next_nested;
-            handler->next_nested = nullptr;
+    void perform_irq_timeout_unwind(Thread* handler) {
+        Baton* irq_b = handler->borrowed_baton;
+        if (irq_b && irq_b->is_irq_baton) {
+            // 1. 借用バトンの強制解除
+            irq_b->thread = nullptr;
+            irq_b->state = BatonState::READY;
+            irq_b->remaining = 0;
+            handler->borrowed_baton = nullptr;
+            handler->baton = handler->get_active_baton();
         }
 
-        // 2. タイマ停止
-        oz::x86_64::stopLAPICTimer();
-
-        // 3. タイムアウトしたハンドラを中断状態（Ready）にする
-        if (handler->baton) {
-            handler->baton->budget = 0;
-            handler->baton->is_active = false;
+        // 2. ネストスタックのポップ
+        if (g_current_irq_thread == handler) {
+            g_current_irq_thread = handler->next_nested_irq;
+            handler->next_nested_irq = nullptr;
         }
-        handler->is_waiting_irq = false;
-        handler->is_interrupted = true;
+
+        // 3. 親スケジューラ / 通知先へのタイムアウト非同期通知 (Notification)
+        if (handler->bound_notification) {
+            handler->bound_notification->signal(
+                handler->sched_badge ? handler->sched_badge : (1ULL << 61));
+        }
+
+        // 4. ハンドラをタイムアウト中断状態 (Ready) に設定
         handler->is_blocked = false;
         handler->state = ThreadState::Ready;
+        handler->sched_reason = SchedReason::TIMEOUT;
+
+        // 5. 被割り込みスレッド T (または下位ハンドラ H1) の救出
+        ExecutionContext* interrupted = handler->saved_frame.interrupted_context;
+        std::uint32_t rem_ticks = handler->saved_frame.lapic_remaining_ticks;
+        std::uint64_t entry_tsc = handler->saved_frame.entry_tsc;
+        handler->saved_frame.clear();
 
         std::uint64_t now = oz::x86_64::rdtsc();
-
-        // 4. コンテキストの復帰と通知
+        // No Time Theft 補正:
         if (interrupted) {
-            // [ケース1: 割り込み直後の枯渇]
-            if (handler->baton && handler->baton->bound_notif) {
-                handler->baton->bound_notif->signal(handler->baton->bound_badge);
+            Thread* int_t = static_cast<Thread*>(interrupted);
+            if (!int_t->is_irq_handling()) {
+                interrupted->last_switched_in += (now - entry_tsc);
             }
+        }
 
-            // 被害者 T（またはネストされた下位ハンドラ）を救出復帰
-            if (rem_ticks > 0) {
-                oz::x86_64::setLAPICRemainingTicks(rem_ticks, oz::x86_64::APIC_TIMER_VECTOR);
+        if (rem_ticks > 0) {
+            oz::x86_64::setLAPICRemainingTicks(rem_ticks, oz::x86_64::APIC_TIMER_VECTOR);
+        } else if (interrupted) {
+            Thread* int_t = static_cast<Thread*>(interrupted);
+            if (int_t->get_active_baton() && !int_t->get_active_baton()->is_infinite) {
+                oz::x86_64::setLAPICRemainingTicks(1, oz::x86_64::APIC_TIMER_VECTOR);
             }
+        }
 
-            interrupted->last_switched_in = now;
-            performContextSwitch(handler, interrupted, now);
-        } else {
-            // [ケース2: スケジューラ再開後の 2 回目枯渇]
-            ExecutionContext* caller = handler->caller_context;
-            handler->caller_context = nullptr;
-            if (caller) {
-                caller->setSyscallReturnValue(SYS_BATON_SWITCH_TIMEOUT);
-                caller->last_switched_in = now;
-                performContextSwitch(handler, caller, now);
-            }
+        // 6. 被害者 T へ救出復帰
+        if (interrupted) {
+            performIRQResume(interrupted, now);
         }
     }
 
@@ -137,13 +147,91 @@ public:
         if (!prev) return;
         std::uint64_t now = oz::x86_64::rdtsc();
 
-        // 割り込みハンドラの時間切れ（Clean Unwind 方式）
-        if (prev->isInterruptThread()) {
-            perform_clean_unwind(static_cast<InterruptThread*>(prev));
+        Thread* prev_t = static_cast<Thread*>(prev);
+        if (prev_t->is_irq_handling()) {
+            perform_irq_timeout_unwind(prev_t);
             return;
         }
 
-        // 通常スレッドの時間切れ: 呼出元 (Caller) が存在する場合、その Caller へ復帰
+        // デカルト木に基づくタイムアウト処理
+        if (cartesian_root) {
+            std::uint64_t slice = (prev->last_switched_in != 0) ? (now - prev->last_switched_in) : 0;
+            std::uint64_t tsc_per_us = oz::x86_64::getTSCTicksPerUs();
+            std::uint64_t elapsed_us = slice / (tsc_per_us ? tsc_per_us : 1);
+
+            Baton* expired = cartesian_root;
+
+            if (expired == running_baton) {
+                // 下位タイムアウト (末尾自体の枯渇)
+                cartesianPopLeaf(cartesian_root, expired);
+                expired->state = BatonState::READY;
+                expired->remaining = 0;
+                expired->is_active = false;
+                expired->notify_if_runnable();
+
+                prev->sched_reason = SchedReason::TIMEOUT;
+                prev->state = ThreadState::Ready;
+
+                Baton* caller_b = expired->caller_baton;
+                ExecutionContext* caller_ctx = expired->caller_context;
+                expired->caller_baton = nullptr;
+                expired->caller_context = nullptr;
+                if (caller_b) {
+                    caller_b->callee_baton = nullptr;
+                    caller_b->state = BatonState::RUNNING;
+                    cartesianPushDown(caller_b);
+                    running_baton = caller_b;
+                    if (!caller_ctx) caller_ctx = caller_b->thread;
+                }
+                if (caller_ctx) {
+                    caller_ctx->sched_reason = SchedReason::TIMEOUT;
+                    if (cartesian_root && !cartesian_root->is_infinite) {
+                        oz::x86_64::setLAPICOneShot(cartesian_root->get_effective_remaining(), oz::x86_64::APIC_TIMER_VECTOR);
+                    } else {
+                        oz::x86_64::stopLAPICTimer();
+                    }
+                    performContextSwitch(prev, caller_ctx, now);
+                }
+                return;
+            } else {
+                // 上位タイムアウト (親・祖先バトンの枯渇)
+                expired->sub_min_baton = expired->cartesian_right;
+                expired->tail_baton = running_baton;
+
+                cartesianSplitAt(cartesian_root, expired, elapsed_us);
+                expired->state = BatonState::WAIT_START;
+                expired->remaining = 0;
+                expired->is_active = false;
+                expired->notify_if_runnable();
+
+                prev->sched_reason = SchedReason::TIMEOUT;
+                prev->state = ThreadState::Ready;
+
+                Baton* caller_b = expired->caller_baton;
+                ExecutionContext* caller_ctx = expired->caller_context;
+                expired->caller_baton = nullptr;
+                expired->caller_context = nullptr;
+                if (caller_b) {
+                    caller_b->callee_baton = nullptr;
+                    caller_b->state = BatonState::RUNNING;
+                    cartesianPushDown(caller_b);
+                    running_baton = caller_b;
+                    if (!caller_ctx) caller_ctx = caller_b->thread;
+                }
+                if (caller_ctx) {
+                    caller_ctx->sched_reason = SchedReason::TIMEOUT;
+                    if (cartesian_root && !cartesian_root->is_infinite) {
+                        oz::x86_64::setLAPICOneShot(cartesian_root->get_effective_remaining(), oz::x86_64::APIC_TIMER_VECTOR);
+                    } else {
+                        oz::x86_64::stopLAPICTimer();
+                    }
+                    performContextSwitch(prev, caller_ctx, now);
+                }
+                return;
+            }
+        }
+
+        // 通常スレッドの時間切れ: 呼出元 (Caller) が存在する場合、その Caller へ復帰 (Legacy fallback)
         if (prev->baton && prev->baton->caller_context) {
             std::uint64_t slice = (prev->last_switched_in != 0) ? (now - prev->last_switched_in) : 0;
             std::uint64_t tsc_per_us = oz::x86_64::getTSCTicksPerUs();
@@ -157,8 +245,6 @@ public:
                 }
                 prev->baton->budget = 0;
             }
-            prev->last_consumed_cycles = slice;
-            prev->total_cpu_cycles += slice;
             prev->sched_reason = SchedReason::TIMEOUT;
             prev->baton->is_active = false;
             prev->state = ThreadState::Ready;
@@ -223,6 +309,169 @@ public:
         }
     }
 
+    void performIRQSwitchTo(Thread* handler_thread, std::uint64_t now) {
+        ExecutionContext* prev = current_thread;
+        if (prev) {
+            if (prev->state == ThreadState::Running) {
+                prev->state = ThreadState::Ready;
+            }
+            // 被割り込みスレッド T の last_switched_in はゼロクリアせず、そのまま保持する
+            prev->gs_base = oz::x86_64::readMSR(0xC0000101);
+            prev->kernel_gs_base = oz::x86_64::readMSR(0xC0000102);
+            prev->syscall_user_rsp = g_syscall_context.user_rsp;
+        }
+
+        handler_thread->state = ThreadState::Running;
+        handler_thread->last_switched_in = now;
+        current_thread = handler_thread;
+
+        if (handler_thread->gs_base != 0 || handler_thread->kernel_gs_base != 0) {
+            oz::x86_64::writeMSR(0xC0000101, handler_thread->gs_base);
+            oz::x86_64::writeMSR(0xC0000102, handler_thread->kernel_gs_base);
+        }
+
+        std::uint64_t kernel_stack_top = reinterpret_cast<std::uint64_t>(handler_thread->stack_base) + handler_thread->stack_size;
+        setSyscallKernelStack(kernel_stack_top);
+        x86_64::setKernelStack(kernel_stack_top);
+        g_syscall_context.user_rsp = handler_thread->syscall_user_rsp;
+
+        if (handler_thread->pml4_phys.get() != 0) {
+            std::uint64_t current_cr3;
+            __asm__ volatile("mov %%cr3, %0" : "=r"(current_cr3));
+            if (current_cr3 != static_cast<std::uint64_t>(handler_thread->pml4_phys.get())) {
+                __asm__ volatile("mov %0, %%cr3" :: "r"(static_cast<std::uint64_t>(handler_thread->pml4_phys.get())));
+            }
+        }
+
+        if (prev) {
+            if (prev != handler_thread) {
+                switch_context(&prev->rsp, handler_thread->rsp);
+            }
+        } else {
+            void* dummy_rsp;
+            switch_context(&dummy_rsp, handler_thread->rsp);
+        }
+    }
+
+    void performIRQResume(ExecutionContext* interrupted, std::uint64_t now) {
+        ExecutionContext* prev = current_thread;
+        if (prev) {
+            if (prev->state == ThreadState::Running) {
+                prev->state = ThreadState::Ready;
+            }
+            if (prev->last_switched_in != 0) {
+                std::uint64_t slice = now - prev->last_switched_in;
+                prev->total_cpu_cycles += slice;
+                prev->last_consumed_cycles = slice;
+            }
+            prev->last_switched_in = 0;
+            prev->gs_base = oz::x86_64::readMSR(0xC0000101);
+            prev->kernel_gs_base = oz::x86_64::readMSR(0xC0000102);
+            prev->syscall_user_rsp = g_syscall_context.user_rsp;
+        }
+
+        // interrupted->last_switched_in は事前に加算補正済みなので上書きしない
+        interrupted->state = ThreadState::Running;
+        current_thread = interrupted;
+
+        if (interrupted->gs_base != 0 || interrupted->kernel_gs_base != 0) {
+            oz::x86_64::writeMSR(0xC0000101, interrupted->gs_base);
+            oz::x86_64::writeMSR(0xC0000102, interrupted->kernel_gs_base);
+        }
+
+        std::uint64_t kernel_stack_top = reinterpret_cast<std::uint64_t>(interrupted->stack_base) + interrupted->stack_size;
+        setSyscallKernelStack(kernel_stack_top);
+        x86_64::setKernelStack(kernel_stack_top);
+        g_syscall_context.user_rsp = interrupted->syscall_user_rsp;
+
+        if (interrupted->pml4_phys.get() != 0) {
+            std::uint64_t current_cr3;
+            __asm__ volatile("mov %%cr3, %0" : "=r"(current_cr3));
+            if (current_cr3 != static_cast<std::uint64_t>(interrupted->pml4_phys.get())) {
+                __asm__ volatile("mov %0, %%cr3" :: "r"(static_cast<std::uint64_t>(interrupted->pml4_phys.get())));
+            }
+        }
+
+        if (prev) {
+            if (prev != interrupted) {
+                switch_context(&prev->rsp, interrupted->rsp);
+            }
+        } else {
+            void* dummy_rsp;
+            switch_context(&dummy_rsp, interrupted->rsp);
+        }
+    }
+
+    void yieldToSchedulerBlocked(Thread* current, std::uint64_t now, Baton* target_baton = nullptr) {
+        if (!current) return;
+        current->sched_reason = SchedReason::BLOCKED;
+        Baton* b = target_baton ? target_baton : current->get_active_baton();
+        if (b) {
+            cartesianPopLeaf(cartesian_root, b);
+            b->state = BatonState::BLOCKED;
+            b->is_active = false;
+            Baton* caller_b = b->caller_baton;
+            ExecutionContext* caller = b->caller_context;
+            b->caller_baton = nullptr;
+            b->caller_context = nullptr;
+            if (caller_b) {
+                caller_b->callee_baton = nullptr;
+                caller_b->state = BatonState::RUNNING;
+                cartesianPushDown(caller_b);
+                running_baton = caller_b;
+                if (!caller) caller = caller_b->thread;
+            }
+            if (caller && caller != current) {
+                caller->sched_reason = SchedReason::BLOCKED;
+                if (cartesian_root && !cartesian_root->is_infinite) {
+                    oz::x86_64::setLAPICOneShot(cartesian_root->get_effective_remaining(), oz::x86_64::APIC_TIMER_VECTOR);
+                } else {
+                    oz::x86_64::stopLAPICTimer();
+                }
+                performContextSwitch(current, caller, now);
+                return;
+            }
+        }
+        if (g_block_thread_func) {
+            g_block_thread_func();
+        }
+    }
+
+    void yieldToSchedulerOrphaned(Thread* current, Baton* b, std::uint64_t now) {
+        if (!current) return;
+        current->sched_reason = SchedReason::ORPHANED;
+        if (b) {
+            cartesianPopLeaf(cartesian_root, b);
+            b->state = BatonState::READY;
+            b->is_active = false;
+            b->thread = nullptr;
+            Baton* caller_b = b->caller_baton;
+            ExecutionContext* caller = b->caller_context;
+            b->caller_baton = nullptr;
+            b->caller_context = nullptr;
+            if (caller_b) {
+                caller_b->callee_baton = nullptr;
+                caller_b->state = BatonState::RUNNING;
+                cartesianPushDown(caller_b);
+                running_baton = caller_b;
+                if (!caller) caller = caller_b->thread;
+            }
+            if (caller && caller != current) {
+                caller->sched_reason = SchedReason::ORPHANED;
+                if (cartesian_root && !cartesian_root->is_infinite) {
+                    oz::x86_64::setLAPICOneShot(cartesian_root->get_effective_remaining(), oz::x86_64::APIC_TIMER_VECTOR);
+                } else {
+                    oz::x86_64::stopLAPICTimer();
+                }
+                performContextSwitch(current, caller, now);
+                return;
+            }
+        }
+        if (g_block_thread_func) {
+            g_block_thread_func();
+        }
+    }
+
     void schedule() {
         InterruptGuard guard;
         std::uint64_t now = oz::x86_64::rdtsc();
@@ -230,11 +479,28 @@ public:
         if (current_thread) {
             current_thread->sched_reason = SchedReason::BLOCKED;
             if (current_thread->baton) {
-                current_thread->baton->is_active = false;
-                if (current_thread->baton->caller_context) {
-                    ExecutionContext* caller = current_thread->baton->caller_context;
-                    current_thread->baton->caller_context = nullptr;
+                Baton* b = current_thread->baton;
+                cartesianPopLeaf(cartesian_root, b);
+                b->state = BatonState::BLOCKED;
+                b->is_active = false;
+                Baton* caller_b = b->caller_baton;
+                ExecutionContext* caller = b->caller_context;
+                b->caller_baton = nullptr;
+                b->caller_context = nullptr;
+                if (caller_b) {
+                    caller_b->callee_baton = nullptr;
+                    caller_b->state = BatonState::RUNNING;
+                    cartesianPushDown(caller_b);
+                    running_baton = caller_b;
+                    if (!caller) caller = caller_b->thread;
+                }
+                if (caller && caller != current_thread) {
                     caller->sched_reason = SchedReason::BLOCKED;
+                    if (cartesian_root && !cartesian_root->is_infinite) {
+                        oz::x86_64::setLAPICOneShot(cartesian_root->get_effective_remaining(), oz::x86_64::APIC_TIMER_VECTOR);
+                    } else {
+                        oz::x86_64::stopLAPICTimer();
+                    }
                     performContextSwitch(current_thread, caller, now);
                     return;
                 }
@@ -243,8 +509,19 @@ public:
     }
 
     void exitThread() {
-        bool had_baton = false;
         Thread* cur = getCurrentThread();
+        if (cur && cur->is_irq_handling()) {
+            perform_irq_timeout_unwind(cur);
+            return;
+        }
+        if (cur && cur->bound_irq_handler) {
+            if (cur->bound_irq_handler->handler_thread == cur) {
+                cur->bound_irq_handler->handler_thread = nullptr;
+                cur->bound_irq_handler->assigned_irq_baton = nullptr;
+            }
+            cur->bound_irq_handler = nullptr;
+        }
+        bool had_baton = false;
         ExecutionContext* caller = nullptr;
         {
             InterruptGuard guard;
@@ -252,10 +529,22 @@ public:
             current_thread->is_dead = true;
             
             if (current_thread->baton) {
-                caller = current_thread->baton->caller_context;
-                current_thread->baton->caller_context = nullptr;
-                current_thread->baton->thread = nullptr;
-                current_thread->baton->is_active = false;
+                Baton* b = current_thread->baton;
+                cartesianPopLeaf(cartesian_root, b);
+                b->state = BatonState::READY;
+                b->is_active = false;
+                caller = b->caller_context;
+                Baton* caller_b = b->caller_baton;
+                b->caller_baton = nullptr;
+                if (caller_b) {
+                    caller_b->callee_baton = nullptr;
+                    caller_b->state = BatonState::RUNNING;
+                    cartesianPushDown(caller_b);
+                    running_baton = caller_b;
+                    if (!caller) caller = caller_b->thread;
+                }
+                b->caller_context = nullptr;
+                b->thread = nullptr;
                 current_thread->baton = nullptr;
                 had_baton = true;
             }
@@ -278,6 +567,11 @@ public:
             InterruptGuard guard;
             std::uint64_t now = oz::x86_64::rdtsc();
             caller->sched_reason = had_baton ? SchedReason::ORPHANED : SchedReason::EXIT;
+            if (cartesian_root && !cartesian_root->is_infinite) {
+                oz::x86_64::setLAPICOneShot(cartesian_root->get_effective_remaining(), oz::x86_64::APIC_TIMER_VECTOR);
+            } else {
+                oz::x86_64::stopLAPICTimer();
+            }
             performContextSwitch(current_thread, caller, now);
             while (1) __asm__ volatile("cli; hlt");
         }
@@ -316,7 +610,7 @@ public:
 
     ExecutionContext* getCurrentContext() { return current_thread; }
     Thread* getCurrentThread() {
-        return (current_thread && !current_thread->isInterruptThread()) ? static_cast<Thread*>(current_thread) : nullptr;
+        return current_thread ? static_cast<Thread*>(current_thread) : nullptr;
     }
 };
 

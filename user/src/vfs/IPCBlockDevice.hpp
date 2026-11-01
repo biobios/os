@@ -22,6 +22,7 @@ private:
     void* shared_buf{nullptr};
     std::uint64_t shared_buf_phys{0};
     static constexpr std::size_t SHARED_BUF_SIZE = 64 * 1024; // 64KB
+    static constexpr std::uint64_t SHARED_BUF_VIRT = 0x200000000000;
 
     // Shared Ring Buffer
     volatile BlockIORing* ring_{nullptr};
@@ -58,29 +59,24 @@ private:
 
 public:
     IPCBlockDevice(std::uint32_t send_cap_id, std::uint32_t recv_cap_id,
-                   std::uint32_t notif_ahci = 8, std::uint32_t notif_vfs = 9,
-                   std::uint32_t ring_cap = 250)
+                   std::uint32_t notif_ahci = 0, std::uint32_t notif_vfs = 0,
+                   std::uint32_t ring_cap = 0, std::uint32_t sector_size = 512)
         : send_cap(send_cap_id), recv_cap(recv_cap_id),
           notif_ahci_cap(notif_ahci), notif_vfs_cap(notif_vfs),
-          ring_buf_cap(ring_cap) {}
+          ring_buf_cap(ring_cap), sector_sz(sector_size ? sector_size : 512) {}
 
     bool initialize() {
-        // 1. Map shared data buffer Frame (slot 242) into our VSpace if already present
-        static constexpr std::uint64_t SHARED_BUF_VIRT = 0x200000000000;
-        if (sys_vspace_map_with_pagetables(oz::CAP_SELF_VSPACE, oz::CAP_UNTYPED, 242, SHARED_BUF_VIRT, 0x01, 16 * 4096) == 0) {
-            shared_buf = reinterpret_cast<void*>(SHARED_BUF_VIRT);
-            shared_buf_phys = sys_frame_phys_addr(242);
-        }
-
-        // 2. Map shared Ring Buffer Frame (slot 250) if available
+        // Map shared Ring Buffer Frame if explicitly provided
         static constexpr std::uint64_t RING_BUF_VIRT = 0x205000000000;
-        if (sys_vspace_map_with_pagetables(oz::CAP_SELF_VSPACE, oz::CAP_UNTYPED, ring_buf_cap, RING_BUF_VIRT, 0x01, 4096) == 0) {
-            ring_ = reinterpret_cast<volatile BlockIORing*>(RING_BUF_VIRT);
-            utils::memset(const_cast<void*>(reinterpret_cast<volatile void*>(ring_)), 0, sizeof(BlockIORing));
-            use_ring_ = true;
-            sys_write("VFS: IPCBlockDevice using RingBuffer + Notification mode.\n\r");
-        } else {
-            sys_write("VFS: IPCBlockDevice falling back to synchronous Channel IPC.\n\r");
+        if (ring_buf_cap != 0 && notif_ahci_cap != 0 && notif_vfs_cap != 0) {
+            if (sys_vspace_map_with_pagetables(oz::CAP_SELF_VSPACE, oz::CAP_UNTYPED, ring_buf_cap, RING_BUF_VIRT, 0x01, 4096) == 0) {
+                ring_ = reinterpret_cast<volatile BlockIORing*>(RING_BUF_VIRT);
+                utils::memset(const_cast<void*>(reinterpret_cast<volatile void*>(ring_)), 0, sizeof(BlockIORing));
+                use_ring_ = true;
+                sys_write("VFS: IPCBlockDevice using RingBuffer + Notification mode.\n\r");
+            } else {
+                sys_write("VFS: IPCBlockDevice falling back to synchronous Channel IPC.\n\r");
+            }
         }
         
         // 3. Query sector size

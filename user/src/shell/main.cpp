@@ -189,8 +189,11 @@ static void shell_write(const char* str) {
 }
 
 static int vfs_open(const char* path) {
+    oz::sys_debug_print("[Shell] vfs_open: calling sys_call(CAP_VFS_SEND) for '");
+    oz::sys_debug_print(path);
+    oz::sys_debug_print("'\n\r");
     oz::IPCMessage req{};
-    req.data[0] = oz::ipc::vfs_make_command(oz::ipc::VfsCmd::OPEN, 1);
+    req.data[0] = oz::ipc::vfs_make_command(oz::ipc::VfsCmd::OPEN, 0); // Client 0 = Shell
     char* dst = reinterpret_cast<char*>(&req.data[1]);
     int i = 0;
     for (; i < 23 && path[i] != '\0'; i++) {
@@ -199,7 +202,14 @@ static int vfs_open(const char* path) {
     dst[i] = '\0';
 
     oz::IPCMessage resp{};
-    if (oz::sys_call(CAP_VFS_SEND, &req, &resp)) {
+    bool ok = oz::sys_call(CAP_VFS_SEND, &req, &resp);
+    oz::sys_debug_print("[Shell] vfs_open: sys_call returned ");
+    oz::sys_debug_print(ok ? "ok" : "failed");
+    oz::sys_debug_print(", resp.data[0]=");
+    char buf[4] = { static_cast<char>('0' + (resp.data[0] % 10)), '\n', '\r', '\0' };
+    oz::sys_debug_print(buf);
+
+    if (ok) {
         if (resp.data[0] == 0) return static_cast<int>(resp.data[1]);
     }
     return -1;
@@ -213,7 +223,7 @@ static std::size_t vfs_read(int handle, std::size_t offset, char* buf, std::size
         if (chunk > 64 * 1024) chunk = 64 * 1024;
 
         oz::IPCMessage req{};
-        req.data[0] = oz::ipc::vfs_make_command(oz::ipc::VfsCmd::READ, 1);
+        req.data[0] = oz::ipc::vfs_make_command(oz::ipc::VfsCmd::READ, 0);
         req.data[1] = static_cast<std::uint64_t>(handle);
         req.data[2] = static_cast<std::uint64_t>(offset + total_read);
         req.data[3] = static_cast<std::uint64_t>(chunk);
@@ -246,7 +256,7 @@ static std::size_t vfs_write(int handle, std::size_t offset, const char* buf, st
         }
 
         oz::IPCMessage req{};
-        req.data[0] = oz::ipc::vfs_make_command(oz::ipc::VfsCmd::WRITE, 1);
+        req.data[0] = oz::ipc::vfs_make_command(oz::ipc::VfsCmd::WRITE, 0);
         req.data[1] = static_cast<std::uint64_t>(handle);
         req.data[2] = static_cast<std::uint64_t>(offset + total_written);
         req.data[3] = static_cast<std::uint64_t>(chunk);
@@ -266,7 +276,7 @@ static std::size_t vfs_write(int handle, std::size_t offset, const char* buf, st
 
 static std::size_t vfs_get_size(int handle) {
     oz::IPCMessage req{};
-    req.data[0] = oz::ipc::vfs_make_command(oz::ipc::VfsCmd::GET_SIZE, 1);
+    req.data[0] = oz::ipc::vfs_make_command(oz::ipc::VfsCmd::GET_SIZE, 0);
     req.data[1] = static_cast<std::uint64_t>(handle);
     oz::IPCMessage resp{};
     if (oz::sys_call(CAP_VFS_SEND, &req, &resp)) {
@@ -277,7 +287,7 @@ static std::size_t vfs_get_size(int handle) {
 
 static void vfs_close(int handle) {
     oz::IPCMessage req{};
-    req.data[0] = oz::ipc::vfs_make_command(oz::ipc::VfsCmd::CLOSE, 1);
+    req.data[0] = oz::ipc::vfs_make_command(oz::ipc::VfsCmd::CLOSE, 0);
     req.data[1] = static_cast<std::uint64_t>(handle);
     oz::IPCMessage resp{};
     oz::sys_call(CAP_VFS_SEND, &req, &resp);
@@ -285,7 +295,7 @@ static void vfs_close(int handle) {
 
 static bool vfs_list_dir(const char* path) {
     oz::IPCMessage req{};
-    req.data[0] = oz::ipc::vfs_make_command(oz::ipc::VfsCmd::LIST_DIR, 1);
+    req.data[0] = oz::ipc::vfs_make_command(oz::ipc::VfsCmd::LIST_DIR, 0);
     char* dst = reinterpret_cast<char*>(&req.data[1]);
     int i = 0;
     for (; i < 23 && path[i] != '\0'; i++) {

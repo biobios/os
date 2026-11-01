@@ -161,7 +161,7 @@ Thread* Notification::signal(std::uint64_t badge) {
         unblocked = last_waiter_;
     }
 
-    // Edge-triggered cascading: only signal parent if 0 -> non-zero (rising edge)
+    // Cascade notification to parent if bound (rising edge: only if 0 -> non-zero)
     if (was_zero && value_ != 0 && parent_ != nullptr) {
         Thread* parent_unblocked = parent_->signal(parent_badge_);
         if (!unblocked) {

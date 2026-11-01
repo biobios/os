@@ -223,17 +223,16 @@ extern "C" void _start() {
     oz::sys_cspace_cap_insert(oz::CAP_SELF_CSPACE, oz::vtest::CAP_VFS_RECV, init_reply_recv, static_cast<std::uint32_t>(oz::CapRights::READ));
 
     oz::sys_cspace_cap_insert(vfs_proc.cspace_cap, 1, cons_send, static_cast<std::uint32_t>(oz::CapRights::WRITE | oz::CapRights::GRANT));
-    oz::sys_cspace_cap_insert(vfs_proc.cspace_cap, 2, vfs_ahci_send, static_cast<std::uint32_t>(oz::CapRights::WRITE | oz::CapRights::GRANT));
-    oz::sys_cspace_cap_insert(vfs_proc.cspace_cap, 3, vfs_ahci_recv, static_cast<std::uint32_t>(oz::CapRights::READ));
     oz::sys_cspace_cap_insert(vfs_proc.cspace_cap, 4, vfs_req_recv, static_cast<std::uint32_t>(oz::CapRights::READ));
     oz::sys_cspace_cap_insert(vfs_proc.cspace_cap, 5, vfs_init_reply_send, static_cast<std::uint32_t>(oz::CapRights::WRITE | oz::CapRights::GRANT));
-    oz::sys_cspace_cap_insert(vfs_proc.cspace_cap, 8, notif_ahci, static_cast<std::uint32_t>(oz::CapRights::WRITE | oz::CapRights::GRANT));
-    oz::sys_cspace_cap_insert(vfs_proc.cspace_cap, 9, notif_vfs, static_cast<std::uint32_t>(oz::CapRights::ALL));
     oz::sys_cspace_cap_insert(vfs_proc.cspace_cap, oz::CAP_UNTYPED, oz::CAP_UNTYPED, static_cast<std::uint32_t>(oz::CapRights::ALL));
-    oz::sys_cspace_cap_insert(vfs_proc.cspace_cap, 242, shared_buf_frame, static_cast<std::uint32_t>(oz::CapRights::ALL));
+    oz::sys_cspace_cap_insert(vfs_proc.cspace_cap, oz::CAP_INITRD, oz::CAP_INITRD, static_cast<std::uint32_t>(oz::CapRights::ALL));
 
     std::uint32_t init_client_frame = oz::sys_frame_alloc(oz::CAP_UNTYPED, 16);
-    oz::sys_cspace_cap_insert(vfs_proc.cspace_cap, 243, init_client_frame, static_cast<std::uint32_t>(oz::CapRights::ALL));
+    oz::sys_cspace_cap_insert(vfs_proc.cspace_cap, 231, init_client_frame, static_cast<std::uint32_t>(oz::CapRights::ALL));
+
+    std::uint32_t dummy_procman_frame = oz::sys_frame_alloc(oz::CAP_UNTYPED, 16);
+    oz::sys_cspace_cap_insert(vfs_proc.cspace_cap, 245, dummy_procman_frame, static_cast<std::uint32_t>(oz::CapRights::ALL));
 
     oz::sys_vspace_map_with_pagetables(oz::CAP_SELF_VSPACE, oz::CAP_UNTYPED, init_client_frame,
                                        oz::vtest::CLIENT_SHARED_BUF_VIRT, 0x03, 64 * 1024);
@@ -241,6 +240,17 @@ extern "C" void _start() {
 
     oz::sys_tcb_resume(vfs_proc.tcb_cap);
     init_coroutine(vfs_proc.tcb_cap);
+
+    // Register AHCI block device with VFS via official IPC (just like production)
+    oz::IPCMessage reg_req{};
+    reg_req.data[0] = static_cast<std::uint64_t>(oz::ipc::VfsCmd::REGISTER_BLOCK_DEV);
+    const char* sname = "sata0";
+    for (int i = 0; i < 5; ++i) reinterpret_cast<char*>(&reg_req.data[1])[i] = sname[i];
+    reg_req.data[3] = 0;
+    reg_req.has_cap = true;
+    reg_req.transferred_cap = vfs_ahci_send;
+    oz::IPCMessage reg_resp{};
+    oz::sys_call(oz::vtest::CAP_VFS_SEND, &reg_req, &reg_resp);
 
     // Run VFS tests
     oz::vtest::run_tests();

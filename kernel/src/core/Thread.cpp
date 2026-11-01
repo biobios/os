@@ -2,9 +2,12 @@
 #include "core/Capability.hpp"
 #include "core/Channel.hpp"
 #include "core/Baton.hpp"
+#include "core/IRQHandler.hpp"
 #include "utils/utils.hpp"
 
 namespace oz {
+
+Thread* g_current_irq_thread = nullptr;
 
 extern void (*g_unblock_thread_func)(Thread*);
 
@@ -85,6 +88,39 @@ Thread::Thread(std::uint64_t id, void* stack, std::uint64_t size, PageBlock<> bl
 }
 
 Thread::~Thread() {
+    if (this->pending_server) {
+        if (this->pending_server->reply_target == this) {
+            this->pending_server->reply_target = nullptr;
+        }
+        this->pending_server = nullptr;
+    }
+    if (this->reply_target) {
+        if (this->reply_target->pending_server == this) {
+            this->reply_target->pending_server = nullptr;
+        }
+        this->reply_target = nullptr;
+    }
+    if (this->own_baton) {
+        if (this->own_baton->thread == this) {
+            this->own_baton->thread = nullptr;
+            this->own_baton->is_active = false;
+        }
+        this->own_baton = nullptr;
+    }
+    if (this->borrowed_baton) {
+        if (this->borrowed_baton->thread == this) {
+            this->borrowed_baton->thread = nullptr;
+            this->borrowed_baton->is_active = false;
+        }
+        this->borrowed_baton = nullptr;
+    }
+    if (this->bound_irq_handler) {
+        if (this->bound_irq_handler->handler_thread == this) {
+            this->bound_irq_handler->handler_thread = nullptr;
+            this->bound_irq_handler->assigned_irq_baton = nullptr;
+        }
+        this->bound_irq_handler = nullptr;
+    }
     unregister_thread(this);
 }
 
@@ -92,6 +128,18 @@ bool Thread::cancel_ipc() {
     if (state != ThreadState::BlockedOnRecv && state != ThreadState::BlockedOnSend &&
         state != ThreadState::BlockedOnCall && state != ThreadState::BlockedOnReply) {
         return false;
+    }
+    if (this->pending_server) {
+        if (this->pending_server->reply_target == this) {
+            this->pending_server->reply_target = nullptr;
+        }
+        this->pending_server = nullptr;
+    }
+    if (this->reply_target) {
+        if (this->reply_target->pending_server == this) {
+            this->reply_target->pending_server = nullptr;
+        }
+        this->reply_target = nullptr;
     }
     if (blocking_ep) {
         if (state == ThreadState::BlockedOnRecv) {

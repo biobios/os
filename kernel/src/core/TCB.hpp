@@ -83,6 +83,7 @@ public:
     void setSchedNotification(Notification* notif, std::uint64_t badge) {
         if (thread_) {
             thread_->sched_notif = notif;
+            thread_->bound_notification = notif;
             thread_->sched_badge = badge;
         }
     }

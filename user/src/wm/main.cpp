@@ -718,21 +718,42 @@ extern "C" void _start() {
         oz::sys_debug_print("[WM] Shared Keyboard Ring Buffer mapped successfully.\n\r");
     }
 
+    oz::sys_debug_print("[WM] DEBUG: Step 5 starting...\n\r");
+
     // 5. Spawn passive command worker thread for CAP_WM_RECV
     std::uint32_t worker_tcb = oz::sys_untyped_retype(oz::CAP_UNTYPED, static_cast<std::uint32_t>(oz::ObjectType::TCB), 0);
     std::uint32_t worker_stack = oz::sys_frame_alloc(oz::CAP_UNTYPED, 2);
     static constexpr std::uint64_t WORKER_STACK_TOP = 0x700010000000ULL;
-    oz::sys_vspace_map_with_pagetables(oz::CAP_SELF_VSPACE, oz::CAP_UNTYPED, worker_stack, WORKER_STACK_TOP - 8192, 0x01, 8192);
-    oz::sys_tcb_configure(worker_tcb, oz::CAP_SELF_CSPACE, oz::CAP_SELF_VSPACE,
+    int map_res = oz::sys_vspace_map_with_pagetables(oz::CAP_SELF_VSPACE, oz::CAP_UNTYPED, worker_stack, WORKER_STACK_TOP - 8192, 0x03, 8192);
+    int cfg_res = oz::sys_tcb_configure(worker_tcb, oz::CAP_SELF_CSPACE, oz::CAP_SELF_VSPACE,
                           reinterpret_cast<std::uint64_t>(wm_cmd_worker), WORKER_STACK_TOP - 8);
-    oz::sys_tcb_resume(worker_tcb);
+    int res_res = oz::sys_tcb_resume(worker_tcb);
+
+    // Print values
+    auto print_val = [](const char* name, std::uint64_t val) {
+        oz::sys_debug_print(name);
+        char buf[17];
+        const char* d = "0123456789ABCDEF";
+        for (int i = 15; i >= 0; --i) { buf[i] = d[val & 0xF]; val >>= 4; }
+        buf[16] = '\0';
+        oz::sys_debug_print(buf);
+        oz::sys_debug_print("\n\r");
+    };
+    print_val("[WM] worker_tcb: ", worker_tcb);
+    print_val("[WM] worker_stack: ", worker_stack);
+    print_val("[WM] map_res: ", (std::uint64_t)map_res);
+    print_val("[WM] cfg_res: ", (std::uint64_t)cfg_res);
+    print_val("[WM] res_res: ", (std::uint64_t)res_res);
 
     // Initial hand-off to let worker reach sys_reply_recv(token=0) and unbind
     std::uint32_t worker_baton = oz::sys_untyped_retype(oz::CAP_UNTYPED, static_cast<std::uint32_t>(oz::ObjectType::Baton), 0);
+    print_val("[WM] worker_baton: ", worker_baton);
     oz::sys_tcb_bind_baton(worker_tcb, worker_baton);
     oz::sys_baton_inject(worker_baton, 10000);
+    oz::sys_debug_print("[WM] DEBUG: switching to worker baton...\n\r");
     oz::SchedResult w_res = oz::sys_baton_switch(worker_baton);
-    if (w_res.reason == oz::SchedReason::ORPHANED) {
+    oz::sys_debug_print("[WM] DEBUG: returned from worker baton!\n\r");
+    if (w_res.reason == oz::SchedReason::ORPHANED || w_res.reason == oz::SchedReason::BLOCKED) {
         oz::sys_debug_print("[WM] Command worker initialized and passive.\n\r");
     }
     oz::sys_cap_delete(worker_baton);
@@ -742,6 +763,7 @@ extern "C" void _start() {
     // 6. Main Notification Loop (Autonomous keyboard event processor)
     while (true) {
         std::uint64_t badge = 0;
+        oz::sys_debug_print("[WM] Waiting for notification...\n\r");
         if (oz::sys_notification_wait(CAP_NOTIF_WM, &badge) != 0) {
             continue;
         }

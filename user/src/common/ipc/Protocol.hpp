@@ -47,13 +47,40 @@ enum class VfsCmd : std::uint64_t {
                         // Response:
                         //   data[0] = status (0: ok, 1: not found, 2: invalid path / '..' rejected)
                         //   transferred_cap = new FileCap or DirectoryCap Channel
-    REGISTER_BLOCK_DEV = 20, // data[1..3] = device name ("sata0"), transferred_cap = BlockDev EP
+    REGISTER_BLOCK_DEV      = 20, // data[1] = device name ("sata0"), data[2] = sector_size, data[3] = reconnect_token, transferred_cap = BlockDev EP
+    NOTIFY_DEVICE_SUSPENDED = 21, // data[1] = dev_id, data[2] = reason, data[3] = reconnect_token
 };
 
 // ===== Driver Manager (DrivMan) Protocol =====
 enum class DrivCmd : std::uint64_t {
-    GET_DEVICE_CAP = 1, // data[1..3] = device name ("ahci", "xhci", "fb", "xhci_irq") -> transferred_cap
-    GET_BOOT_INFO  = 2, // BootInfo Frame Cap
+    GET_DEVICE_CAP          = 1, // 互換用 (Phase 1)
+    GET_BOOT_INFO           = 2,
+
+    // ===== Phase 2: Dynamic Driver Session & Lifecycle =====
+    INIT_DEVICE_SESSION     = 10,
+    GET_DEVICE_RESOURCE     = 11,
+    NOTIFY_DEVICE_ONLINE    = 12,
+    NOTIFY_DEVICE_SUSPENDED = 13,
+    REGISTER_CHILD_DEV      = 14,
+    NOTIFY_DEVICE_REMOVED   = 15,
+};
+
+struct DriverBindingRule {
+    std::uint8_t  class_code;
+    std::uint8_t  subclass;
+    std::uint8_t  prog_if;
+    std::uint16_t vendor_id; // 0xFFFF = Any
+    std::uint16_t device_id; // 0xFFFF = Any
+    const char*   driver_binary;
+};
+
+static constexpr DriverBindingRule G_BINDING_RULES[] = {
+    // AHCI (Mass Storage / SATA Controller)
+    { 0x01, 0x06, 0x01, 0xFFFF, 0xFFFF, "/ahci" },
+    // xHCI (Serial Bus / USB 3.0 xHCI Controller)
+    { 0x0C, 0x03, 0x30, 0xFFFF, 0xFFFF, "/xhci" },
+    // VGA / Graphics Controller (Display Server)
+    { 0x03, 0x00, 0x00, 0xFFFF, 0xFFFF, "/display" },
 };
 
 enum class VfsOpenFlags : std::uint32_t {
@@ -224,6 +251,10 @@ enum class ProcCmd : std::uint64_t {
                           // Resp: data[0] = status
     CREATE_PIPE      = 8, // Requests a new Channel pipe (write-end returned in data[1], read-end in transferred_cap)
                           // Resp: data[0] = status, data[1] = pipe_write_cap, transferred_cap = pipe_read_cap
+
+    // ===== Phase 2: Supervisor & Factory Model =====
+    SPAWN_DRIVER     = 10,
+    REAP_DRIVER      = 11,
 };
 
 // ===== Scheduler IPC Protocol =====

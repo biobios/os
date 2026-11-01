@@ -8,21 +8,15 @@
 
 // Cap slot assignments:
 //   1: write to console (sys_write uses this)
-//   2: send block I/O requests to AHCI
-//   3: recv block I/O responses from AHCI
 //   4: recv file operation requests from all clients (shared request channel)
-//   5: send file operation responses to client 0 (init)
-//   6: send file operation responses to client 1 (shell)
-//   243: shared buffer frame for client 0 (init) (64KB)
-//   244: shared buffer frame for client 1 (shell) (64KB)
+//   231: shared buffer frame for client 0 (shell) (64KB)
+//   245: shared buffer frame for client 1 (procman) (64KB)
 
-static constexpr std::uint32_t CAP_AHCI_SEND = 2;
-static constexpr std::uint32_t CAP_AHCI_RECV = 3;
 static constexpr std::uint32_t CAP_CLIENT_RECV = 4;
 static constexpr std::uint32_t CAP_CLIENT_REPLY_BASE = 5;
-static constexpr std::uint32_t MAX_CLIENTS = 3;
+static constexpr std::uint32_t MAX_CLIENTS = 2;
 
-static constexpr std::uint32_t CLIENT_BUF_SLOTS[MAX_CLIENTS] = {243, 231, 245};
+static constexpr std::uint32_t CLIENT_BUF_SLOTS[MAX_CLIENTS] = {231, 245};
 static constexpr std::uint64_t CLIENT_BUF_BASE_VIRT = 0x300000000000ULL;
 static constexpr std::uint64_t CLIENT_BUF_SIZE = 64 * 1024;
 
@@ -189,6 +183,26 @@ static void handle_file_session_request(FileSession& sess) {
 }
 
 
+static void print_dec(std::uint64_t val) {
+    char buf[24];
+    int idx = 0;
+    if (val == 0) {
+        buf[idx++] = '0';
+    } else {
+        char temp[24];
+        int t_idx = 0;
+        while (val > 0) {
+            temp[t_idx++] = '0' + (val % 10);
+            val /= 10;
+        }
+        while (t_idx > 0) {
+            buf[idx++] = temp[--t_idx];
+        }
+    }
+    buf[idx] = '\0';
+    oz::sys_debug_print(buf);
+}
+
 extern "C" void _start() {
     oz::sys_write("VFS Server started!\n\r");
     
@@ -210,10 +224,12 @@ extern "C" void _start() {
     oz::IPCBlockDevice* block_dev = nullptr;
     oz::BufferCacheManager* cache = nullptr;
     oz::FAT32FileSystem* fat32 = nullptr;
+    std::uint32_t g_block_dev_cap = 0;
+    std::uint32_t g_block_dev_sector_sz = 512;
 
-    auto mount_block_device = [&](std::uint32_t send_cap, std::uint32_t recv_cap) -> bool {
+    auto mount_block_device = [&](std::uint32_t send_cap, std::uint32_t recv_cap, std::uint32_t sector_size = 512) -> bool {
         if (fat32) return true; // Already mounted
-        block_dev = new oz::IPCBlockDevice(send_cap, recv_cap);
+        block_dev = new oz::IPCBlockDevice(send_cap, recv_cap, 0, 0, 0, sector_size);
         if (!block_dev->initialize()) {
             delete block_dev;
             block_dev = nullptr;
@@ -236,10 +252,14 @@ extern "C" void _start() {
         return true;
     };
 
-    // If pre-connected AHCI channel exists (e.g. standalone vtest), mount it immediately
-    mount_block_device(CAP_AHCI_SEND, CAP_AHCI_RECV);
+    auto ensure_disk_mounted = [&]() -> bool {
+        if (fat32) return true;
+        if (g_block_dev_cap == 0 || g_block_dev_cap == oz::INVALID_CAP_ID) return false;
+        oz::sys_debug_print("[VFS] Lazy mounting FAT32 disk device...\n\r");
+        return mount_block_device(g_block_dev_cap, g_block_dev_cap, g_block_dev_sector_sz);
+    };
 
-    // Map shared client buffers (slots 243, 231, 245) if present
+    // Map shared client buffers (slots 231, 245) if present
     char* client_bufs[MAX_CLIENTS] = {};
     for (std::uint32_t i = 0; i < MAX_CLIENTS; i++) {
         std::uint64_t virt = CLIENT_BUF_BASE_VIRT + static_cast<std::uint64_t>(i) * CLIENT_BUF_SIZE;
@@ -253,13 +273,18 @@ extern "C" void _start() {
     // Main request loop
     oz::sys_write("VFS: Ready to serve file requests.\n\r");
 
+    static std::uint64_t g_expected_reconnect_token = 0;
+
     oz::ReplyToken cli_tok = oz::INVALID_REPLY_TOKEN;
     oz::IPCMessage req{};
     oz::IPCMessage resp{};
 
     while (true) {
         cli_tok = oz::sys_reply_recv(cli_tok, CAP_CLIENT_RECV, (cli_tok != oz::INVALID_REPLY_TOKEN) ? &resp : nullptr, &req);
-        if (cli_tok == oz::INVALID_REPLY_TOKEN) continue;
+
+        if (cli_tok == oz::INVALID_REPLY_TOKEN) {
+            continue;
+        }
 
         std::uint32_t client_id = oz::ipc::vfs_get_client_id(req.data[0]);
         auto cmd = static_cast<oz::ipc::VfsCmd>(oz::ipc::vfs_get_cmd(req.data[0]));
@@ -270,18 +295,35 @@ extern "C" void _start() {
 
         switch (cmd) {
             case oz::ipc::VfsCmd::REGISTER_BLOCK_DEV: {
+                std::uint64_t token = req.data[3];
+                if (g_expected_reconnect_token != 0 && token != g_expected_reconnect_token) {
+                    oz::sys_write("VFS: REGISTER_BLOCK_DEV rejected invalid reconnect_token!\n\r");
+                    resp.data[0] = 2; // Auth failure
+                    break;
+                }
+                g_expected_reconnect_token = 0;
                 if (req.has_cap && req.transferred_cap != oz::INVALID_CAP_ID) {
-                    if (mount_block_device(req.transferred_cap, req.transferred_cap)) {
-                        resp.data[0] = 0; // Success
-                    } else {
-                        resp.data[0] = 1; // Error
-                    }
+                    g_block_dev_cap = req.transferred_cap;
+                    g_block_dev_sector_sz = req.data[2] ? static_cast<std::uint32_t>(req.data[2]) : 512;
+                    oz::sys_debug_print("[VFS] Block device registered (cap=");
+                    print_dec(g_block_dev_cap);
+                    oz::sys_debug_print(", sector_sz=");
+                    print_dec(g_block_dev_sector_sz);
+                    oz::sys_debug_print(").\n\r");
+                    resp.data[0] = 0; // Success
                 } else {
                     resp.data[0] = 1;
                 }
                 break;
             }
+            case oz::ipc::VfsCmd::NOTIFY_DEVICE_SUSPENDED: {
+                g_expected_reconnect_token = req.data[3];
+                oz::sys_write("VFS: Block device suspended, waiting for recovery token...\n\r");
+                resp.data[0] = 0;
+                break;
+            }
             case oz::ipc::VfsCmd::OPENAT: {
+                ensure_disk_mounted();
                 std::uint32_t flags = static_cast<std::uint32_t>((req.data[0] >> 48) & 0xFF);
                 std::uint32_t base_dir_handle = static_cast<std::uint32_t>((req.data[0] >> 56) & 0xFF);
 
@@ -378,6 +420,14 @@ extern "C" void _start() {
             case oz::ipc::VfsCmd::OPEN: {
                 char path[25];
                 extract_path(req, path, sizeof(path));
+                oz::sys_debug_print("[VFS] Handling OPEN for path: '");
+                oz::sys_debug_print(path);
+                oz::sys_debug_print("'\n\r");
+                const char* p = path;
+                while (*p == '/') p++;
+                if (p[0] == 'd' && p[1] == 'i' && p[2] == 's' && p[3] == 'k') {
+                    ensure_disk_mounted();
+                }
                 auto file = vfs.open(path);
                 if (file) {
                     int handle = alloc_handle(file.release());
@@ -390,6 +440,11 @@ extern "C" void _start() {
                 } else {
                     resp.data[0] = 1; // not found
                 }
+                oz::sys_debug_print("[VFS] OPEN completed: status=");
+                print_dec(resp.data[0]);
+                oz::sys_debug_print(", handle=");
+                print_dec(resp.data[1]);
+                oz::sys_debug_print("\n\r");
                 break;
             }
 
@@ -475,6 +530,11 @@ extern "C" void _start() {
             case oz::ipc::VfsCmd::LIST_DIR: {
                 char path[25];
                 extract_path(req, path, sizeof(path));
+                const char* p = path;
+                while (*p == '/') p++;
+                if (p[0] == 'd' && p[1] == 'i' && p[2] == 's' && p[3] == 'k') {
+                    ensure_disk_mounted();
+                }
                 auto dir = vfs.openDir(path);
                 if (!dir) {
                     resp.data[0] = 1; // not found

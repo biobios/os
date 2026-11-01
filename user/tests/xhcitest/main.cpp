@@ -35,8 +35,8 @@ extern "C" void _start() {
     TEST_REPORT("XHCITEST", "Find xhci binary in initrd", xhci_file.data != nullptr);
 
     if (xhci_file.data && xhci_bar_phys != 0) {
-        auto xhci_proc = oz::loader::spawn_interrupt_process(oz::CAP_UNTYPED, oz::CAP_SELF_VSPACE, xhci_file.data, xhci_file.size);
-        TEST_REPORT("XHCITEST", "Spawn xhci interrupt process", xhci_proc.success);
+        auto xhci_proc = oz::loader::spawn_process(oz::CAP_UNTYPED, oz::CAP_SELF_VSPACE, xhci_file.data, xhci_file.size, 0x550000000000ULL, nullptr, false);
+        TEST_REPORT("XHCITEST", "Spawn xhci process", xhci_proc.success);
 
         if (xhci_proc.success) {
             std::uint32_t irq_send = 0;
@@ -56,6 +56,7 @@ extern "C" void _start() {
             oz::sys_cspace_cap_insert(xhci_proc.cspace_cap, 4, kbd_ring_frame, static_cast<std::uint32_t>(oz::CapRights::ALL));
             oz::sys_cspace_cap_insert(xhci_proc.cspace_cap, 5, notif_wm_kbd, static_cast<std::uint32_t>(oz::CapRights::WRITE | oz::CapRights::GRANT));
             oz::sys_cspace_cap_insert(xhci_proc.cspace_cap, oz::CAP_UNTYPED, oz::CAP_UNTYPED, static_cast<std::uint32_t>(oz::CapRights::ALL));
+            oz::sys_cspace_cap_insert(xhci_proc.cspace_cap, oz::CAP_IRQ_CONTROL, oz::CAP_IRQ_CONTROL, static_cast<std::uint32_t>(oz::CapRights::ALL));
             oz::sys_cspace_cap_insert(xhci_proc.cspace_cap, 241, oz::CAP_XHCI_MMIO, static_cast<std::uint32_t>(oz::CapRights::ALL));
 
             // Bind baton and dispatch xhci driver

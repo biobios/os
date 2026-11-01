@@ -5,10 +5,19 @@
 
 namespace oz {
 
+enum class ChannelMode : std::uint8_t {
+    BLOCKING        = 0, // 送信側: ブロッキング / 受信側: ブロッキング (従来互換)
+    RECV_NONBLOCK   = 1, // 送信側: ブロッキング / 受信側: ノンブロッキング
+    SEND_NONBLOCK   = 2, // 送信側: ノンブロッキング / 受信側: ブロッキング
+};
+
+constexpr std::uint32_t IPC_FLAG_BLOCK = 1;
+
 struct IPCMessage {
     std::uint64_t data[4]{};
     CapID transferred_cap{0};
     bool has_cap{false};
+    std::uint64_t badge{0};
 };
 
 // Internal message transferred between endpoints (kernel-side only)
@@ -25,6 +34,7 @@ class Notification;
 class ChannelEndpoint : public KernelObject {
 private:
     ChannelEndpoint* peer{nullptr};
+    ChannelMode mode_{ChannelMode::BLOCKING};
 
     // Waiter list for threads blocked on recv on THIS endpoint
     Thread* recv_waiter_head{nullptr};
@@ -54,6 +64,9 @@ public:
     void set_peer(ChannelEndpoint* p) {
         peer = p;
     }
+
+    ChannelMode get_mode() const { return mode_; }
+    void set_mode(ChannelMode m) { mode_ = m; }
 
     void on_peer_closed();
 

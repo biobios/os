@@ -12,7 +12,8 @@ enum class CapRights : std::uint32_t {
     GRANT     = 1 << 3,
     DUPLICATE = 1 << 4,
     ONCE      = 1 << 5,
-    ALL       = (1 << 0) | (1 << 1) | (1 << 2) | (1 << 3) | (1 << 4)
+    USE       = 1 << 6,
+    ALL       = (1 << 0) | (1 << 1) | (1 << 2) | (1 << 3) | (1 << 4) | (1 << 6)
 };
 
 inline constexpr CapRights operator|(CapRights a, CapRights b) {
@@ -40,7 +41,7 @@ enum class ObjectType : std::uint32_t {
     PageTable = 9,
     Notification = 10,
     Baton = 11,
-    InterruptThread = 12,
+    IRQBatonControl = 12,
 };
 
 constexpr int SYS_ERR_INVALID      = -1;
@@ -48,6 +49,28 @@ constexpr int SYS_ERR_WOULDBLOCK   = -2;
 constexpr int SYS_ERR_CANCELLED    = -3;
 constexpr int SYS_ERR_DEADLK       = -4;
 constexpr int SYS_ERR_INVALID_TYPE = -5;
+constexpr int SYS_ERR_BUSY         = -6;
+constexpr int SYS_ERR_INVALID_STATE = -7;
+constexpr int SYS_ERR_PERM          = -8;
+
+constexpr std::uint64_t TIMEOUT_BADGE          = 1ULL << 61;
+constexpr std::uint64_t BUDGET_EXHAUSTED_BADGE = 1ULL << 62;
+
+enum class ChannelMode : std::uint8_t {
+    BLOCKING        = 0, // 送信側: ブロッキング / 受信側: ブロッキング (従来互換)
+    RECV_NONBLOCK   = 1, // 送信側: ブロッキング / 受信側: ノンブロッキング
+    SEND_NONBLOCK   = 2, // 送信側: ノンブロッキング / 受信側: ブロッキング
+};
+
+constexpr std::uint32_t IPC_FLAG_BLOCK = 1;
+
+enum class BatonState : std::uint8_t {
+    READY       = 0,
+    RUNNING     = 1,
+    WAIT_RETURN = 2,
+    WAIT_START  = 3,
+    BLOCKED     = 4
+};
 
 enum class SchedReason : std::uint64_t {
     NONE      = 0,
@@ -61,10 +84,14 @@ enum class SchedReason : std::uint64_t {
 };
 
 constexpr SchedReason SYS_BATON_SWITCH_TIMEOUT = SchedReason::TIMEOUT;
+constexpr SchedReason SYS_BATON_SWITCH_INVALID = static_cast<SchedReason>(SYS_ERR_INVALID);
 
 struct SchedResult {
     SchedReason reason{SchedReason::NONE};
-    std::uint64_t consumed_cycles{0}; // PREEMPTED時は時間切れとなったirq_vector
+    union {
+        std::uint64_t consumed_cycles{0}; // PREEMPTED時は時間切れとなったirq_vector
+        std::uint64_t consumed_us;
+    };
 };
 
 using ReplyToken = std::uint64_t;
@@ -78,6 +105,7 @@ struct IPCMessage {
     std::uint64_t data[4];
     std::uint32_t transferred_cap;
     bool has_cap{false};
+    std::uint64_t badge{0};
 };
 
 void sys_exit(int status);
@@ -85,12 +113,22 @@ int sys_yield();
 
 std::size_t sys_write(const char* str);
 
-// Note: sys_channel_send/try_send is deprecated and removed in favor of sys_call / sys_reply_recv
+// Note: sys_channel_send/try_send is deprecated and removed in favor of sys_call / sys_reply_and_recv
 bool sys_channel_recv(std::uint32_t cap_id, IPCMessage* msg);
-bool sys_channel_create(std::uint32_t untyped_cap, std::uint32_t* out_cap0, std::uint32_t* out_cap1);
-bool sys_channel_create_ext(std::uint32_t untyped_cap, std::uint32_t rights0, std::uint32_t rights1, std::uint32_t* out_cap0, std::uint32_t* out_cap1);
+bool sys_channel_create(std::uint32_t untyped_cap, std::uint32_t* out_cap0, std::uint32_t* out_cap1, ChannelMode mode0 = ChannelMode::BLOCKING, ChannelMode mode1 = ChannelMode::BLOCKING);
+bool sys_channel_create_ext(std::uint32_t untyped_cap, std::uint32_t rights0, std::uint32_t rights1, std::uint32_t* out_cap0, std::uint32_t* out_cap1, ChannelMode mode0 = ChannelMode::BLOCKING, ChannelMode mode1 = ChannelMode::BLOCKING);
 bool sys_call(std::uint32_t cap_id, const IPCMessage* send_msg, IPCMessage* recv_msg);
+int sys_call_ext(std::uint32_t cap_id, const IPCMessage* send_msg, IPCMessage* recv_msg, std::uint32_t flags = 0);
+int sys_reply_and_recv(std::uint32_t ep_cap, const IPCMessage* reply_msg, IPCMessage* recv_msg, std::uint32_t flags = 0);
 ReplyToken sys_reply_recv(ReplyToken reply_token, std::uint32_t ep_cap, const IPCMessage* reply_msg, IPCMessage* recv_msg);
+
+inline int sys_reply(const IPCMessage* reply_msg) {
+    return sys_reply_and_recv(0, reply_msg, nullptr, 0);
+}
+
+inline int sys_recv(std::uint32_t ep_cap, IPCMessage* recv_msg, std::uint32_t flags = 0) {
+    return sys_reply_and_recv(ep_cap, nullptr, recv_msg, flags);
+}
 
 // Capability-based memory management
 int sys_vspace_map(std::uint32_t vspace_cap, std::uint32_t frame_cap,
@@ -113,7 +151,8 @@ int sys_untyped_revoke(std::uint32_t untyped_cap);
 void sys_debug_print(const char* str);
 
 // Capability management
-std::uint32_t sys_cap_mint(std::uint32_t src_cap, std::uint32_t new_rights);
+std::uint32_t sys_cap_mint(std::uint32_t src_cap, std::uint32_t new_rights, std::uint64_t badge = 0);
+int sys_cap_revoke(std::uint32_t cap_id);
 int sys_cap_delete(std::uint32_t cap_id);
 int sys_cap_move(std::uint32_t dest_slot, std::uint32_t src_slot);
 int sys_cspace_cap_move(std::uint32_t target_cspace_cap, std::uint32_t target_slot, std::uint32_t src_slot);
@@ -132,15 +171,28 @@ int sys_tcb_get_cpu_time(std::uint32_t tcb_cap, std::uint64_t* out_cycles);
 int sys_tcb_get_id(std::uint32_t tcb_cap, std::uint64_t* out_id);
 int sys_tcb_set_sched_notification(std::uint32_t tcb_cap, std::uint32_t notif_cap, std::uint64_t badge);
 int sys_tcb_bind_baton(std::uint32_t tcb_cap, std::uint32_t baton_cap);
+inline int sys_tcb_unbind_baton(std::uint32_t tcb_cap) {
+    return sys_tcb_bind_baton(tcb_cap, 0);
+}
 int sys_baton_bind_notification(std::uint32_t baton_cap, std::uint32_t notif_cap, std::uint64_t badge);
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wreturn-type-c-linkage"
-SchedResult sys_baton_switch(std::uint32_t target_baton_cap);
+SchedResult sys_baton_switch(std::uint32_t target_baton_cap, std::uint64_t quantum_us = 0);
 SchedResult sys_baton_split(std::uint32_t target_tcb_cap, std::uint64_t budget_us);
 SchedResult sys_donate_time(std::uint32_t target_tcb_cap, std::uint64_t time_budget_us);
 #pragma GCC diagnostic pop
+[[noreturn]] inline void sys_baton_exit(int exit_code) {
+    sys_exit(exit_code);
+    while (1) {}
+}
+inline int sys_baton_yield() {
+    return sys_yield();
+}
 int sys_baton_inject(std::uint32_t target_baton_cap, std::uint64_t budget_us);
-int sys_irq_wait(std::uint32_t irq_handler_cap);
+int sys_baton_set_budget(std::uint32_t baton_cap, std::uint64_t budget_us);
+std::uint32_t sys_baton_create_irq(std::uint32_t irq_control_cap, std::uint32_t untyped_cap, std::uint64_t initial_budget_us);
+int sys_thread_set_notification(std::uint32_t thread_cap, std::uint32_t notif_cap, std::uint64_t badge);
+int sys_irq_wait(std::uint32_t irq_handler_cap, std::uint32_t irq_baton_cap);
 int sys_irq_handler_set_notification(std::uint32_t irq_handler_cap, std::uint32_t notif_cap, std::uint64_t badge);
 std::uint32_t sys_cspace_create(std::uint32_t untyped_cap);
 int sys_cspace_cap_insert(std::uint32_t cspace_cap, std::uint32_t target_slot,
@@ -176,6 +228,7 @@ static constexpr std::uint32_t CAP_SELF_CSPACE = 245;
 static constexpr std::uint32_t CAP_FRAMEBUFFER = 246;
 static constexpr std::uint32_t CAP_ROOT_IOPORT = 247;
 static constexpr std::uint32_t CAP_ROOT_BATON = 248;
+static constexpr std::uint32_t CAP_IRQ_CONTROL = 249;
 static constexpr std::uint32_t CAP_NULL = 0;
 static constexpr std::uint32_t INVALID_CAP_ID = 0xFFFFFFFF;
 

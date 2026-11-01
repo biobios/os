@@ -34,16 +34,27 @@ bool sys_channel_recv(std::uint32_t cap_id, IPCMessage* msg) {
     return syscall(2, cap_id, reinterpret_cast<std::uint64_t>(msg), 0, 0, 0, 0) == 0;
 }
 
-bool sys_channel_create(std::uint32_t untyped_cap, std::uint32_t* out_cap0, std::uint32_t* out_cap1) {
-    return syscall(3, untyped_cap, reinterpret_cast<std::uint64_t>(out_cap0), reinterpret_cast<std::uint64_t>(out_cap1), 0, 0, 0) == 0;
+bool sys_channel_create(std::uint32_t untyped_cap, std::uint32_t* out_cap0, std::uint32_t* out_cap1, ChannelMode mode0, ChannelMode mode1) {
+    return syscall(3, untyped_cap, reinterpret_cast<std::uint64_t>(out_cap0), reinterpret_cast<std::uint64_t>(out_cap1), static_cast<std::uint64_t>(mode0), static_cast<std::uint64_t>(mode1), 0) == 0;
 }
 
 bool sys_call(std::uint32_t cap_id, const IPCMessage* send_msg, IPCMessage* recv_msg) {
     return syscall(27, cap_id, reinterpret_cast<std::uint64_t>(send_msg), reinterpret_cast<std::uint64_t>(recv_msg), 0, 0, 0) == 0;
 }
 
+int sys_call_ext(std::uint32_t cap_id, const IPCMessage* send_msg, IPCMessage* recv_msg, std::uint32_t flags) {
+    return static_cast<int>(syscall(27, cap_id, reinterpret_cast<std::uint64_t>(send_msg), reinterpret_cast<std::uint64_t>(recv_msg), flags, 0, 0));
+}
+
+int sys_reply_and_recv(std::uint32_t ep_cap, const IPCMessage* reply_msg, IPCMessage* recv_msg, std::uint32_t flags) {
+    return static_cast<int>(syscall(28, ep_cap, reinterpret_cast<std::uint64_t>(reply_msg), reinterpret_cast<std::uint64_t>(recv_msg), flags, 0, 0));
+}
+
 ReplyToken sys_reply_recv(ReplyToken reply_token, std::uint32_t ep_cap, const IPCMessage* reply_msg, IPCMessage* recv_msg) {
-    return syscall(28, reply_token, ep_cap, reinterpret_cast<std::uint64_t>(reply_msg), reinterpret_cast<std::uint64_t>(recv_msg), 0, 0);
+    (void)reply_token;
+    int res = sys_reply_and_recv(ep_cap, reply_msg, recv_msg, IPC_FLAG_BLOCK);
+    if (res == 0) return 1;
+    return INVALID_REPLY_TOKEN;
 }
 
 std::size_t sys_write(const char* str) {
@@ -119,8 +130,12 @@ void sys_debug_print(const char* str) {
     syscall(6, reinterpret_cast<std::uint64_t>(str), 0, 0, 0, 0, 0);
 }
 
-std::uint32_t sys_cap_mint(std::uint32_t src_cap, std::uint32_t new_rights) {
-    return static_cast<std::uint32_t>(syscall(9, src_cap, new_rights, 0, 0, 0, 0));
+std::uint32_t sys_cap_mint(std::uint32_t src_cap, std::uint32_t new_rights, std::uint64_t badge) {
+    return static_cast<std::uint32_t>(syscall(9, src_cap, new_rights, badge, 0, 0, 0));
+}
+
+int sys_cap_revoke(std::uint32_t cap_id) {
+    return static_cast<int>(syscall(55, cap_id, 0, 0, 0, 0, 0));
 }
 
 int sys_cap_delete(std::uint32_t cap_id) {
@@ -190,8 +205,14 @@ int sys_untyped_revoke(std::uint32_t untyped_cap) {
     return static_cast<int>(syscall(24, untyped_cap, 0, 0, 0, 0, 0));
 }
 
-bool sys_channel_create_ext(std::uint32_t untyped_cap, std::uint32_t rights0, std::uint32_t rights1, std::uint32_t* out_cap0, std::uint32_t* out_cap1) {
-    return syscall(33, untyped_cap, rights0, rights1, reinterpret_cast<std::uint64_t>(out_cap0), reinterpret_cast<std::uint64_t>(out_cap1), 0) == 0;
+bool sys_channel_create_ext(std::uint32_t untyped_cap, std::uint32_t rights0, std::uint32_t rights1,
+                            std::uint32_t* out_cap0, std::uint32_t* out_cap1,
+                            ChannelMode mode0, ChannelMode mode1) {
+    std::uint64_t modes = static_cast<std::uint32_t>(mode0) | (static_cast<std::uint64_t>(mode1) << 32);
+    return syscall(33, untyped_cap, rights0, rights1,
+                   reinterpret_cast<std::uint64_t>(out_cap0),
+                   reinterpret_cast<std::uint64_t>(out_cap1),
+                   modes) == 0;
 }
 
 int sys_cap_move(std::uint32_t dest_slot, std::uint32_t src_slot) {
@@ -256,10 +277,10 @@ int sys_baton_bind_notification(std::uint32_t baton_cap, std::uint32_t notif_cap
 
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wreturn-type-c-linkage"
-SchedResult sys_baton_switch(std::uint32_t target_baton_cap) {
+SchedResult sys_baton_switch(std::uint32_t target_baton_cap, std::uint64_t quantum_us) {
     register std::uint64_t rax __asm__("rax") = 42;
     register std::uint64_t rdi __asm__("rdi") = target_baton_cap;
-    register std::uint64_t rsi __asm__("rsi") = 0;
+    register std::uint64_t rsi __asm__("rsi") = quantum_us;
     register std::uint64_t rdx __asm__("rdx") = 0;
     register std::uint64_t r10 __asm__("r10") = 0;
     register std::uint64_t r8  __asm__("r8")  = 0;
@@ -293,8 +314,24 @@ int sys_baton_inject(std::uint32_t target_baton_cap, std::uint64_t budget_us) {
     return static_cast<int>(syscall(43, target_baton_cap, budget_us, 0, 0, 0, 0));
 }
 
-int sys_irq_wait(std::uint32_t irq_handler_cap) {
-    return static_cast<int>(syscall(50, irq_handler_cap, 0, 0, 0, 0, 0));
+int sys_baton_set_budget(std::uint32_t baton_cap, std::uint64_t budget_us) {
+    return static_cast<int>(syscall(57, baton_cap, budget_us, 0, 0, 0, 0));
+}
+
+std::uint32_t sys_baton_create_irq(std::uint32_t irq_control_cap, std::uint32_t untyped_cap, std::uint64_t initial_budget_us) {
+    std::uint64_t ret = syscall(56, irq_control_cap, untyped_cap, initial_budget_us, 0, 0, 0);
+    if (static_cast<std::int64_t>(ret) < 0) {
+        return INVALID_CAP_ID;
+    }
+    return static_cast<std::uint32_t>(ret);
+}
+
+int sys_thread_set_notification(std::uint32_t thread_cap, std::uint32_t notif_cap, std::uint64_t badge) {
+    return static_cast<int>(syscall(46, thread_cap, notif_cap, badge, 0, 0, 0));
+}
+
+int sys_irq_wait(std::uint32_t irq_handler_cap, std::uint32_t irq_baton_cap) {
+    return static_cast<int>(syscall(50, irq_handler_cap, irq_baton_cap, 0, 0, 0, 0));
 }
 
 int sys_irq_handler_set_notification(std::uint32_t irq_handler_cap, std::uint32_t notif_cap, std::uint64_t badge) {

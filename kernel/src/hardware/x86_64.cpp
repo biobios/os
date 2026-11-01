@@ -8,7 +8,6 @@
 #include "core/IRQDispatch.hpp"
 #include "core/IRQHandler.hpp"
 #include "core/Thread.hpp"
-#include "core/InterruptThread.hpp"
 #include "core/Syscall.hpp"
 #include "core/Channel.hpp"
 #include "core/SavedInterruptFrame.hpp"
@@ -165,16 +164,21 @@ namespace{
                         } else {
                             peer->set_rendezvous_msg(msg);
                         }
-                        pager->current_reply_token = current->id;
+                        pager->reply_target = current;
+                        current->pending_server = pager;
 
                         // Hand-off baton from current to pager
-                        Baton* b = current->baton;
-                        current->baton = nullptr;
-                        pager->baton = b;
+                        Baton* b = current->get_active_baton();
+                        if (current->borrowed_baton == b) {
+                            current->borrowed_baton = nullptr;
+                        }
+                        pager->borrowed_baton = b;
                         if (b) {
                             b->thread = pager;
                             b->is_active = true;
                         }
+                        current->baton = current->get_active_baton();
+                        pager->baton = pager->get_active_baton();
 
                         current->state = ThreadState::BlockedOnReply;
                         current->is_blocked = true;
@@ -223,7 +227,20 @@ namespace{
                 current->is_dead = true;
                 ExecutionContext* caller = nullptr;
                 if (current->baton) {
+                    if (oz::g_scheduler_ptr) {
+                        cartesianPopLeaf(oz::g_scheduler_ptr->cartesian_root, current->baton);
+                    }
                     caller = current->baton->caller_context;
+                    Baton* caller_b = current->baton->caller_baton;
+                    current->baton->caller_baton = nullptr;
+                    if (caller_b && oz::g_scheduler_ptr) {
+                        caller_b->callee_baton = nullptr;
+                        caller_b->state = BatonState::RUNNING;
+                        cartesianPushDown(caller_b);
+                        oz::g_scheduler_ptr->running_baton = caller_b;
+                        if (!caller) caller = caller_b->thread;
+                    }
+                    current->baton->state = BatonState::BLOCKED;
                     current->baton->caller_context = nullptr;
                     current->baton->thread = nullptr;
                     current->baton->is_active = false;
@@ -336,101 +353,84 @@ void oz::x86_64::initIDTR() {
 namespace {
     static void handleIRQ(std::uint8_t vector) {
         auto* handler = oz::irq::getHandler(vector);
-
-        // すでにラインが Mask されている場合（ハンドラが現在処理中など）:
-        // MSI / エッジトリガ割り込みの喪失を防ぐため、保留フラグをセットして EOI を発行
-        if (handler && handler->isMasked()) {
-            handler->setPending(true);
+        if (!handler) {
             oz::x86_64::notifyEndOfInterrupt();
-            dprint("[IRQ] Line masked, set pending for vec=0x");
-            char hbuf[17];
-            oz::utils::to_hex(vector, hbuf);
-            dprint(hbuf);
-            dprint("\n\r");
             return;
         }
 
-        // 1. 発火時（handleIRQ）:
-        // ハードウェア割り込みが発火した瞬間、カーネルは当該 IRQ ライン（IOAPIC ピンまたは MSI）を
-        // 直ちにハードウェアレベルで Mask（無効化）し、LAPIC EOI を発行してハンドラへ切り替える。
-        if (handler) {
-            handler->mask();
+        // 1. すでに Mask 中 (ハンドラ走行中) に同一割り込みが再到着した場合: Pending として記録
+        if (handler->isMasked()) {
+            handler->setPending(true);
+            oz::x86_64::notifyEndOfInterrupt();
+            return;
         }
+
+        // 2. ハードウェアラインの Mask と EOI 発行
+        handler->mask();
         oz::x86_64::notifyEndOfInterrupt();
 
-        oz::ExecutionContext* handler_ctx = handler ? handler->getHandlerThread() : nullptr;
+        oz::Thread* handler_thread = handler->handler_thread;
         oz::ExecutionContext* current = oz::g_scheduler_ptr ? oz::g_scheduler_ptr->getCurrentContext() : nullptr;
 
-        if (handler && handler_ctx && handler_ctx->isInterruptThread()) {
-            auto* ithread = static_cast<oz::InterruptThread*>(handler_ctx);
-
-            // ハンドラが現在走行中（未ブロック）の場合:
-            // 処理中に到着した割り込みを保留フラグに記録して return
-            if (!ithread->is_blocked) {
-                handler->setPending(true);
-                dprint("[IRQ] ithread running, set pending for vec=0x");
-                char hbuf[17];
-                oz::utils::to_hex(vector, hbuf);
-                dprint(hbuf);
-                dprint("\n\r");
-                return;
-            }
-
-            // ケース A: budget > 0 の場合: InterruptThread の退避フレームに現在の current を Push し、ハンドラへ切り替え
-            if (ithread->is_blocked && ithread->has_baton() && ithread->baton->budget > 0) {
-                std::uint32_t rem_ticks = oz::x86_64::getLAPICCurrentCount();
-
-                // Intrusive Stack に退避
-                ithread->saved_frame.interrupted_context = current;
-                ithread->saved_frame.lapic_remaining_ticks = rem_ticks;
-                ithread->saved_frame.irq_vector = vector;
-                ithread->next_nested = oz::g_current_interrupt_thread;
-                oz::g_current_interrupt_thread = ithread;
-
-                if (ithread->baton) {
-                    ithread->baton->is_active = true;
-                    oz::x86_64::setLAPICOneShot(ithread->baton->budget, oz::x86_64::APIC_TIMER_VECTOR);
-                }
-
-                ithread->is_waiting_irq = false;
-                ithread->is_interrupted = false;
-                ithread->is_blocked = false;
-                ithread->state = oz::ThreadState::Ready;
-
-                std::uint64_t now = oz::x86_64::rdtsc();
-                if (oz::g_scheduler_ptr) {
-                    oz::g_scheduler_ptr->performContextSwitch(current, ithread, now);
-                }
-                return;
-            }
-
-            // ケース B: budget == 0 の場合（セーフティネット / 遅延充填パス）:
-            // ラインの Mask と LAPIC EOI は既に発行済み。
-            // 割り込みが到着したためハンドラを Ready 化（タイムアウト中断扱い）し、
-            // ハンドラの bound_notif に非同期シグナルを送信した上で、
-            // 現在走行中のスレッド T は中断せずそのまま継続走行（No Time Theft 原則の徹底）。
-            if (!ithread->has_baton() || (ithread->baton && ithread->baton->budget == 0)) {
-                dprint("[IRQ] Case B (budget==0): signaling sched for vec=0x");
-                char hbuf[17];
-                oz::utils::to_hex(vector, hbuf);
-                dprint(hbuf);
-                dprint("\n\r");
-                handler->setPending(true);
-                ithread->is_waiting_irq = false;
-                ithread->is_blocked = false;
-                ithread->state = oz::ThreadState::Ready;
-                ithread->is_interrupted = true;
-                if (ithread->baton && ithread->baton->bound_notif) {
-                    ithread->baton->bound_notif->signal(ithread->baton->bound_badge);
-                }
-                // スレッド T は何事もなかったかのようにそのまま実行継続！
-                return;
-            }
+        if (!handler_thread) {
+            // レガシー通知フォールバック
+            handler->onInterrupt();
+            return;
         }
 
-        // レガシーハンドラフォールバック
-        if (handler) {
-            handler->onInterrupt();
+        oz::Baton* irq_baton = handler->assigned_irq_baton;
+        if (!irq_baton) {
+            return; // バトン未登録
+        }
+
+        // ★ 3. バトンの残量検査 (明示補充モデル: 予算枯渇時のセーフティネット)
+        if (irq_baton->remaining == 0) {
+            handler->setPending(true);
+            if (handler_thread->bound_notification) {
+                handler_thread->bound_notification->signal(
+                    handler_thread->sched_badge ? handler_thread->sched_badge : (1ULL << 62));
+            }
+            return;
+        }
+
+        // ★ 4. ワンショット・アンバインド: 発火と同時に待機登録を消費・解除
+        handler->handler_thread = nullptr;
+        handler_thread->bound_irq_handler = nullptr;
+
+        // 5. 現在の LAPIC 残りカウンタと entry_tsc の取得
+        std::uint32_t rem_ticks = oz::x86_64::getLAPICCurrentCount();
+        std::uint64_t entry_tsc = oz::x86_64::rdtsc();
+        std::uint64_t ticks_per_us = oz::x86_64::getLAPICTicksPerUs();
+        if (ticks_per_us == 0) ticks_per_us = 1;
+
+        // 6. ハンドラの退避フレーム (saved_frame) に被割り込みコンテキストを退避
+        handler_thread->saved_frame.interrupted_context = current;
+        handler_thread->saved_frame.lapic_remaining_ticks = rem_ticks;
+        std::uint64_t init_ticks = irq_baton->remaining * ticks_per_us;
+        if (init_ticks > 0xFFFFFFFFULL) init_ticks = 0xFFFFFFFFULL;
+        handler_thread->saved_frame.lapic_initial_ticks = static_cast<std::uint32_t>(init_ticks);
+        handler_thread->saved_frame.entry_tsc = entry_tsc;
+        handler_thread->saved_frame.irq_vector = vector;
+
+        // ネストスタックにプッシュ
+        handler_thread->next_nested_irq = oz::g_current_irq_thread;
+        oz::g_current_irq_thread = handler_thread;
+
+        // 7. irq_baton の借用バインドと LAPIC タイマーセット
+        handler_thread->borrowed_baton = irq_baton;
+        handler_thread->baton = handler_thread->get_active_baton();
+        irq_baton->thread = handler_thread;
+        irq_baton->state = oz::BatonState::RUNNING;
+
+        oz::x86_64::setLAPICOneShot(irq_baton->remaining, oz::x86_64::APIC_TIMER_VECTOR);
+
+        // 8. ハンドラを起こして専用割り込みスイッチ
+        handler_thread->is_blocked = false;
+        handler_thread->state = oz::ThreadState::Ready;
+
+        std::uint64_t now = oz::x86_64::rdtsc();
+        if (oz::g_scheduler_ptr) {
+            oz::g_scheduler_ptr->performIRQSwitchTo(handler_thread, now);
         }
     }
 
@@ -698,6 +698,11 @@ void oz::x86_64::setLAPICRemainingTicks(std::uint32_t ticks, std::uint8_t vector
 std::uint32_t oz::x86_64::getLAPICCurrentCount() {
     volatile std::uint32_t* current_count = reinterpret_cast<volatile std::uint32_t*>(oz::DIRECT_MAP_OFFSET + 0xfee00390ULL);
     return *current_count;
+}
+
+void oz::x86_64::sendLAPICIPI(std::uint8_t vector) {
+    volatile std::uint32_t* icr_low = reinterpret_cast<volatile std::uint32_t*>(oz::DIRECT_MAP_OFFSET + 0xfee00300ULL);
+    *icr_low = (vector & 0xFF) | (1 << 14) | (1 << 18);
 }
 
 static bool s_external_irq_masked = false;

@@ -633,33 +633,76 @@ OZ_PROCESS_ENTRY() {
 
     std::uint32_t drivman_cap = oz::LocalNamespace::get_cap(oz::CapRole::DRIVMAN);
     if (drivman_cap != 0) {
-        oz::IPCMessage fb_req{};
-        fb_req.data[0] = static_cast<std::uint64_t>(oz::ipc::DrivCmd::GET_DEVICE_CAP);
-        const char* dname = "fb";
-        for (int i = 0; i < 2; ++i) reinterpret_cast<char*>(&fb_req.data[1])[i] = dname[i];
-        oz::IPCMessage fb_resp{};
-        if (oz::sys_call(drivman_cap, &fb_req, &fb_resp) && fb_resp.data[0] == 0 && fb_resp.has_cap) {
-            width = static_cast<std::uint32_t>(fb_resp.data[1] >> 32);
-            height = static_cast<std::uint32_t>(fb_resp.data[1] & 0xFFFFFFFFULL);
-            size = static_cast<std::size_t>(fb_resp.data[2]);
-            oz::sys_cap_move(oz::CAP_FRAMEBUFFER, fb_resp.transferred_cap);
-            oz::sys_debug_print("[Display] Received FrameBuffer from DrivMan: w=");
-            char hbuf[17];
-            auto to_hex = [](std::uint64_t val, char* out) {
+        bool got_fb = false;
+        oz::IPCMessage sess_req{};
+        sess_req.data[0] = static_cast<std::uint64_t>(oz::ipc::DrivCmd::INIT_DEVICE_SESSION);
+        oz::IPCMessage sess_resp{};
+        if (oz::sys_call(drivman_cap, &sess_req, &sess_resp) && sess_resp.data[0] == 0) {
+            oz::IPCMessage res_req{};
+            res_req.data[0] = static_cast<std::uint64_t>(oz::ipc::DrivCmd::GET_DEVICE_RESOURCE);
+            res_req.data[1] = 3; // FRAMEBUFFER
+            res_req.data[2] = 0;
+            oz::IPCMessage res_resp{};
+            bool res_ok = oz::sys_call(drivman_cap, &res_req, &res_resp);
+            oz::sys_debug_print("[Display] GET_DEVICE_RESOURCE call=");
+            oz::sys_debug_print(res_ok ? "ok" : "fail");
+            oz::sys_debug_print(" status=");
+            char sbuf[17];
+            auto to_hex_local = [](std::uint64_t val, char* out) {
                 const char* d = "0123456789ABCDEF";
                 for (int i = 15; i >= 0; --i) { out[i] = d[val & 0xF]; val >>= 4; }
                 out[16] = '\0';
             };
-            to_hex(width, hbuf); oz::sys_debug_print(hbuf);
-            oz::sys_debug_print(" h=");
-            to_hex(height, hbuf); oz::sys_debug_print(hbuf);
-            oz::sys_debug_print(" sz=");
-            to_hex(size, hbuf); oz::sys_debug_print(hbuf);
-            oz::sys_debug_print("\n\r");
-        } else {
-            oz::sys_debug_print("[Display] ERROR: Failed to get FrameBuffer from DrivMan!\n\r");
-            oz::sys_exit(1);
+            to_hex_local(res_resp.data[0], sbuf);
+            oz::sys_debug_print(sbuf);
+            oz::sys_debug_print(" has_cap=");
+            oz::sys_debug_print(res_resp.has_cap ? "1\n\r" : "0\n\r");
+            if (res_ok && res_resp.data[0] == 0 && res_resp.has_cap) {
+                size = static_cast<std::size_t>(res_resp.data[2]);
+                width = static_cast<std::uint32_t>(res_resp.data[3] >> 32);
+                height = static_cast<std::uint32_t>(res_resp.data[3] & 0xFFFFFFFFULL);
+                oz::sys_cap_move(oz::CAP_FRAMEBUFFER, res_resp.transferred_cap);
+                got_fb = true;
+                oz::sys_debug_print("[Display] Received FrameBuffer from DrivMan via session.\n\r");
+            }
         }
+
+        if (!got_fb) {
+            oz::IPCMessage fb_req{};
+            fb_req.data[0] = static_cast<std::uint64_t>(oz::ipc::DrivCmd::GET_DEVICE_CAP);
+            const char* dname = "fb";
+            for (int i = 0; i < 2; ++i) reinterpret_cast<char*>(&fb_req.data[1])[i] = dname[i];
+            oz::IPCMessage fb_resp{};
+            if (oz::sys_call(drivman_cap, &fb_req, &fb_resp) && fb_resp.data[0] == 0 && fb_resp.has_cap) {
+                width = static_cast<std::uint32_t>(fb_resp.data[1] >> 32);
+                height = static_cast<std::uint32_t>(fb_resp.data[1] & 0xFFFFFFFFULL);
+                size = static_cast<std::size_t>(fb_resp.data[2]);
+                oz::sys_cap_move(oz::CAP_FRAMEBUFFER, fb_resp.transferred_cap);
+                got_fb = true;
+            } else {
+                oz::sys_debug_print("[Display] ERROR: Failed to get FrameBuffer from DrivMan!\n\r");
+                oz::sys_exit(1);
+            }
+        }
+
+        oz::IPCMessage online_req{};
+        online_req.data[0] = static_cast<std::uint64_t>(oz::ipc::DrivCmd::NOTIFY_DEVICE_ONLINE);
+        oz::IPCMessage online_resp{};
+        oz::sys_call(drivman_cap, &online_req, &online_resp);
+
+        oz::sys_debug_print("[Display] Received FrameBuffer from DrivMan: w=");
+        char hbuf[17];
+        auto to_hex = [](std::uint64_t val, char* out) {
+            const char* d = "0123456789ABCDEF";
+            for (int i = 15; i >= 0; --i) { out[i] = d[val & 0xF]; val >>= 4; }
+            out[16] = '\0';
+        };
+        to_hex(width, hbuf); oz::sys_debug_print(hbuf);
+        oz::sys_debug_print(" h=");
+        to_hex(height, hbuf); oz::sys_debug_print(hbuf);
+        oz::sys_debug_print(" sz=");
+        to_hex(size, hbuf); oz::sys_debug_print(hbuf);
+        oz::sys_debug_print("\n\r");
     } else {
         // Wait for configuration IPC message from init process on Channel 2
         oz::IPCMessage config_msg{};
@@ -706,7 +749,7 @@ OZ_PROCESS_ENTRY() {
     oz::sys_tcb_bind_baton(worker_tcb, worker_baton);
     oz::sys_baton_inject(worker_baton, 10000);
     oz::SchedResult w_res = oz::sys_baton_switch(worker_baton);
-    if (w_res.reason == oz::SchedReason::ORPHANED) {
+    if (w_res.reason == oz::SchedReason::ORPHANED || w_res.reason == oz::SchedReason::BLOCKED) {
         oz::sys_debug_print("[Display] Console worker initialized and passive.\n\r");
     }
     oz::sys_cap_delete(worker_baton);

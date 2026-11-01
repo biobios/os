@@ -18,7 +18,7 @@ ExecutionContext::~ExecutionContext() {
 }
 
 bool ExecutionContext::has_baton() const {
-    return baton != nullptr && baton->has_budget();
+    return baton != nullptr;
 }
 
 } // namespace oz

@@ -15,15 +15,18 @@ namespace oz {
 // When the interrupt fires, the kernel signals the Notification (pure notification,
 // no CPU time theft) and temporarily masks the IRQ line until acknowledged.
 class IRQHandler : public KernelObject {
+public:
+    std::uint8_t vector{0};
+    Thread* handler_thread{nullptr};             // Bound IRQ handler thread for Baton Model
+    Baton* assigned_irq_baton{nullptr};          // irq_baton to lend on next interrupt
+    bool is_masked{false};                       // Hardware line mask state
+    bool pending{false};                         // Pending IRQ arrived while masked
+
 private:
-    std::uint8_t irq_vector_;
     ChannelEndpoint* notification_ep_{nullptr};  // Endpoint to send notification to (legacy)
     Notification* notif_{nullptr};               // Bound Notification object
     std::uint64_t badge_{0};                     // Badge to signal on interrupt
-    ExecutionContext* handler_thread_{nullptr};  // Bound IRQ handler thread for Baton Model
     bool acknowledged_{true};                    // Whether the last interrupt was acknowledged
-    bool is_masked_{false};                      // Temporary mask to prevent interrupt storms
-    bool has_pending_{false};                    // Pending edge-triggered IRQ arrived while masked
     bool is_registered_{false};
 
     // Function pointers for interrupt management (set by Kernel.hpp)
@@ -31,35 +34,43 @@ private:
     void (*unregister_fn_)(std::uint8_t vector, IRQHandler* handler);
 
 public:
-    IRQHandler(std::uint8_t vector,
+    IRQHandler(std::uint8_t vec,
                void (*register_fn)(std::uint8_t, IRQHandler*) = nullptr,
                void (*unregister_fn)(std::uint8_t, IRQHandler*) = nullptr,
                void (*eoi_fn)() = nullptr)
         : KernelObject(ObjectType::IRQHandler),
-          irq_vector_(vector), notification_ep_(nullptr),
+          vector(vec),
+          handler_thread(nullptr), assigned_irq_baton(nullptr),
+          is_masked(false), pending(false),
+          notification_ep_(nullptr),
           notif_(nullptr), badge_(0),
-          acknowledged_(true), is_masked_(false), has_pending_(false), is_registered_(false),
+          acknowledged_(true), is_registered_(false),
           register_fn_(register_fn), unregister_fn_(unregister_fn) {
         (void)eoi_fn;
     }
 
     ~IRQHandler() override {
         unregisterHandler();
+        if (handler_thread && handler_thread->bound_irq_handler == this) {
+            handler_thread->bound_irq_handler = nullptr;
+        }
+        handler_thread = nullptr;
+        assigned_irq_baton = nullptr;
     }
 
-    std::uint8_t vector() const { return irq_vector_; }
+    std::uint8_t get_vector() const { return vector; }
     bool isRegistered() const { return is_registered_; }
-    bool isMasked() const { return is_masked_; }
-    bool hasPending() const { return has_pending_; }
-    void setPending(bool pending = true) { has_pending_ = pending; }
-    void clearPending() { has_pending_ = false; }
+    bool isMasked() const { return is_masked; }
+    bool hasPending() const { return pending; }
+    void setPending(bool p = true) { pending = p; }
+    void clearPending() { pending = false; }
 
     void mask() {
-        is_masked_ = true;
+        is_masked = true;
     }
 
     void unmask() {
-        is_masked_ = false;
+        is_masked = false;
     }
 
     // Set the notification endpoint (legacy ChannelEndpoint)
@@ -75,30 +86,30 @@ public:
         return true;
     }
 
-    void setHandlerThread(ExecutionContext* thread) {
-        handler_thread_ = thread;
+    void setHandlerThread(Thread* thread) {
+        handler_thread = thread;
     }
 
-    ExecutionContext* getHandlerThread() const {
-        return handler_thread_;
+    Thread* getHandlerThread() const {
+        return handler_thread;
     }
 
     // Called by the kernel interrupt dispatcher when this IRQ fires
     void onInterrupt() {
-        if (is_masked_) return;
-        is_masked_ = true; // Temporary mask to avoid interrupt storm
+        if (is_masked) return;
+        is_masked = true; // Temporary mask to avoid interrupt storm
         acknowledged_ = false;
 
         // 1. Scheduling Context Donation model: pure notification signal
         if (notif_) {
-            notif_->signal(badge_ ? badge_ : (1ULL << (irq_vector_ % 64)));
+            notif_->signal(badge_ ? badge_ : (1ULL << (vector % 64)));
         }
 
         // 2. ChannelEndpoint waiter support
         if (notification_ep_ && !notification_ep_->is_peer_closed()) {
             ChannelEndpoint* peer = notification_ep_->get_peer();
             if (peer) {
-                peer->set_notification(irq_vector_);
+                peer->set_notification(vector);
                 Thread* waiter = peer->pop_recv_waiter();
                 if (waiter) {
                     waiter->is_blocked = false;
@@ -117,7 +128,7 @@ public:
     // Acknowledge the interrupt (user-space calls this after handling)
     bool acknowledge() {
         acknowledged_ = true;
-        is_masked_ = false; // Unmask IRQ line
+        is_masked = false; // Unmask IRQ line
         return true;
     }
 
@@ -125,9 +136,9 @@ public:
     bool registerHandler() {
         if (is_registered_) return true;
         if (register_fn_) {
-            register_fn_(irq_vector_, this);
+            register_fn_(vector, this);
         } else {
-            oz::irq::registerHandler(irq_vector_, this);
+            oz::irq::registerHandler(vector, this);
         }
         is_registered_ = true;
         return true;
@@ -137,9 +148,9 @@ public:
     bool unregisterHandler() {
         if (!is_registered_) return false;
         if (unregister_fn_) {
-            unregister_fn_(irq_vector_, this);
+            unregister_fn_(vector, this);
         } else {
-            oz::irq::unregisterHandler(irq_vector_, this);
+            oz::irq::unregisterHandler(vector, this);
         }
         is_registered_ = false;
         return true;

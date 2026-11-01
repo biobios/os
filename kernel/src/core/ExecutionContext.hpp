@@ -53,6 +53,7 @@ constexpr std::int64_t SYS_ERR_WOULDBLOCK   = -2;
 constexpr std::int64_t SYS_ERR_CANCELLED    = -3;
 constexpr std::int64_t SYS_ERR_DEADLK       = -4;
 constexpr std::int64_t SYS_ERR_INVALID_TYPE = -5;
+constexpr std::int64_t SYS_ERR_BUSY         = -6;
 
 struct SchedResult {
     SchedReason reason{SchedReason::NONE};

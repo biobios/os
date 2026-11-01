@@ -9,6 +9,7 @@
 #include "core/IOPort.hpp"
 #include "core/IRQDispatch.hpp"
 #include "core/IRQHandler.hpp"
+#include "core/IRQBatonControl.hpp"
 #include "core/Syscall.hpp"
 #include "core/TCB.hpp"
 #include "core/UntypedMemory.hpp"
@@ -22,6 +23,7 @@
 #include "utils/utils.hpp"
 #include "core/SavedInterruptFrame.hpp"
 #include "core/Baton.hpp"
+#include "core/CartesianTreeTest.hpp"
 
 namespace oz {
 
@@ -376,14 +378,36 @@ void Kernel::setupRootServerCaps(Thread* init_thread, UntypedMemory& boot_untype
     auto* root_baton = boot_untyped.allocateObject<Baton>(true);
     if (root_baton) {
         root_baton->is_infinite = true;
-        root_baton->budget = ~0ULL;
+        root_baton->remaining = ~0ULL;
+        root_baton->quantum = ~0ULL;
         root_baton->thread = init_thread;
+        root_baton->state = BatonState::RUNNING;
         root_baton->is_active = true;
+        init_thread->own_baton = root_baton;
         init_thread->baton = root_baton;
+        Kernel::instance().getScheduler().cartesian_root = root_baton;
+        Kernel::instance().getScheduler().running_baton = root_baton;
         Capability baton_cap(root_baton, CapRights::ALL);
         init_cspace->insert(248, baton_cap);
         root_baton->release();
         dprint("[Kernel] Root Baton capability created (Slot 248).\n\r");
+
+        // 11. Setup Root IRQBatonControl capability (Slot 249)
+        auto* irq_control = boot_untyped.allocateObject<IRQBatonControl>();
+        if (irq_control) {
+            Capability irq_ctrl_cap(irq_control, CapRights::ALL);
+            init_cspace->insert(249, irq_ctrl_cap);
+            irq_control->release();
+            dprint("[Kernel] Root IRQBatonControl capability created (Slot 249).\n\r");
+        }
+        int test_res = test_cartesian_tree_algorithms();
+        if (test_res == 0) {
+            dprint("[Kernel] Cartesian Tree self-tests PASSED!\n\r");
+        } else {
+            dprint("[Kernel] Cartesian Tree self-tests FAILED at step ");
+            dprint_dec(test_res);
+            dprint("\n\r");
+        }
     }
 }
 

@@ -9,7 +9,6 @@
 #include "core/PageTableObject.hpp"
 #include "core/IRQHandler.hpp"
 #include "core/Baton.hpp"
-#include "core/InterruptThread.hpp"
 #include "memory/Address.hpp"
 #include <cstdint>
 #include <cstddef>
@@ -89,8 +88,13 @@ public:
             }
         } else if (node->objectType() == ObjectType::Baton) {
             auto* baton = static_cast<Baton*>(node);
-            if (baton->thread && baton->thread->baton == baton) {
-                baton->thread->baton = nullptr;
+            if (baton->thread) {
+                auto* t = static_cast<Thread*>(baton->thread);
+                if (t->own_baton == baton) t->own_baton = nullptr;
+                if (t->borrowed_baton == baton) t->borrowed_baton = nullptr;
+                if (baton->thread->baton == baton) {
+                    baton->thread->baton = nullptr;
+                }
             }
             baton->thread = nullptr;
             baton->bound_notif = nullptr;
@@ -232,33 +236,6 @@ public:
         TCB* tcb = new (tcb_mem) TCB(thread, true, queue_thread_fn, true);
         this->addChild(tcb);
         return tcb;
-    }
-
-    // Retype into an InterruptThread with integrated 8KB kernel stack
-    InterruptThread* retypeInterruptThread() {
-        static constexpr std::size_t BLOCK_SIZE    = 8192;
-        static constexpr std::size_t OBJ_OFFSET    = 0;
-        static constexpr std::size_t OBJ_MAX_SIZE  = 512;
-        static constexpr std::size_t STACK_OFFSET  = 512;
-        static constexpr std::size_t STACK_SIZE    = BLOCK_SIZE - STACK_OFFSET;
-
-        static_assert(sizeof(InterruptThread) <= OBJ_MAX_SIZE, "InterruptThread size exceeds allocation slot");
-
-        std::uintptr_t block_phys = 0;
-        void* block_mem = allocateBytes(BLOCK_SIZE, 4096, block_phys);
-        if (!block_mem) return nullptr;
-
-        std::uint8_t* base = reinterpret_cast<std::uint8_t*>(block_mem);
-        void* obj_mem = base + OBJ_OFFSET;
-        void* stack_base = base + STACK_OFFSET;
-
-        auto* ithread = new (obj_mem) InterruptThread(
-            s_next_user_thread_id++, stack_base, STACK_SIZE, PageBlock<>{nullptr}, 0
-        );
-        ithread->is_untyped_backed = true;
-        ithread->state = ThreadState::Blocked;
-        this->addChild(ithread);
-        return ithread;
     }
 
     // Retype into a CSpace (256 capability slots = 4096 bytes)

@@ -84,6 +84,7 @@ void setLAPICOneShot(std::uint64_t time_budget_us, std::uint8_t vector = 32);
 void setLAPICRemainingTicks(std::uint32_t ticks, std::uint8_t vector = 32);
 void stopLAPICTimer();
 std::uint32_t getLAPICCurrentCount();
+void sendLAPICIPI(std::uint8_t vector);
 void maskExternalInterrupts();
 void unmaskExternalInterrupts();
 bool isExternalInterruptsMasked();

@@ -187,11 +187,10 @@ inline SpawnedProcess spawn_process(
     result.vspace_cap = sys_vspace_create(untyped_cap);
     if (result.vspace_cap == static_cast<std::uint32_t>(-1)) return result;
 
-    // 2. Retype a TCB / InterruptThread from UntypedMemory
+    // 2. Retype a TCB from UntypedMemory
     result.tcb_cap = sys_untyped_retype(
         untyped_cap,
-        is_interrupt_thread ? static_cast<std::uint32_t>(ObjectType::InterruptThread)
-                            : static_cast<std::uint32_t>(ObjectType::TCB),
+        static_cast<std::uint32_t>(ObjectType::TCB),
         0
     );
     if (result.tcb_cap == static_cast<std::uint32_t>(-1)) return result;

@@ -52,7 +52,7 @@ inline bool cap_copy(CSpace* dest_cs, CapID dest, CSpace* src_cs, CapID src, Cap
         if ((src_cap.rights & CapRights::WRITE) != CapRights::WRITE) return false;
     }
 
-    Capability new_cap(src_cap.object, rights);
+    Capability new_cap(src_cap.object, rights, src_cap.badge);
     return dest_cs->insert(dest, new_cap); 
 }
 
@@ -64,9 +64,20 @@ inline bool cap_delete(CSpace* cspace, CapID id) {
     return cspace->remove(id);
 }
 
-// Create a channel endpoint pair with specified rights for each end
-inline bool sys_channel_create_ext(CSpace* cspace, CapID untyped_cap, CapRights rights0, CapRights rights1, CapID* out_id0, CapID* out_id1) {
+inline bool is_valid_channel_pair(ChannelMode m0, ChannelMode m1) {
+    if (static_cast<std::uint8_t>(m0) > 2 || static_cast<std::uint8_t>(m1) > 2) return false;
+    if (m0 == ChannelMode::RECV_NONBLOCK && m1 == ChannelMode::RECV_NONBLOCK) return false;
+    if (m0 == ChannelMode::SEND_NONBLOCK && m1 == ChannelMode::SEND_NONBLOCK) return false;
+    return true;
+}
+
+// Create a channel endpoint pair with specified rights and modes for each end
+inline bool sys_channel_create_ext(CSpace* cspace, CapID untyped_cap, CapRights rights0, CapRights rights1,
+                                   CapID* out_id0, CapID* out_id1,
+                                   ChannelMode mode0 = ChannelMode::BLOCKING,
+                                   ChannelMode mode1 = ChannelMode::BLOCKING) {
     if (!cspace || !out_id0 || !out_id1) return false;
+    if (!is_valid_channel_pair(mode0, mode1)) return false;
 
     Capability ut_cap = cspace->get(untyped_cap);
     if (!ut_cap.is_valid() || ut_cap.object->objectType() != ObjectType::UntypedMemory) return false;
@@ -75,6 +86,9 @@ inline bool sys_channel_create_ext(CSpace* cspace, CapID untyped_cap, CapRights 
     ChannelEndpoint* end0 = nullptr;
     ChannelEndpoint* end1 = nullptr;
     if (!untyped->retypeChannelPair(&end0, &end1)) return false;
+
+    end0->set_mode(mode0);
+    end1->set_mode(mode1);
 
     Capability cap0(end0, rights0);
     Capability cap1(end1, rights1);
@@ -95,8 +109,10 @@ inline bool sys_channel_create_ext(CSpace* cspace, CapID untyped_cap, CapRights 
 }
 
 // Syscall equivalent to create a channel and insert both ends into the CSpace
-inline bool sys_channel_create(CSpace* cspace, CapID untyped_cap, CapID* out_id0, CapID* out_id1) {
-    return sys_channel_create_ext(cspace, untyped_cap, CapRights::ALL, CapRights::ALL, out_id0, out_id1);
+inline bool sys_channel_create(CSpace* cspace, CapID untyped_cap, CapID* out_id0, CapID* out_id1,
+                               ChannelMode mode0 = ChannelMode::BLOCKING,
+                               ChannelMode mode1 = ChannelMode::BLOCKING) {
+    return sys_channel_create_ext(cspace, untyped_cap, CapRights::ALL, CapRights::ALL, out_id0, out_id1, mode0, mode1);
 }
 
 } // namespace oz

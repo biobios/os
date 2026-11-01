@@ -151,6 +151,36 @@ static void run_capability_semantics_tests() {
             oz::sys_cap_delete(ro_ep0);
             oz::sys_cap_delete(ro_ep1);
         }
+
+        // 3. sys_cap_revoke preserves caller's slot while revoking copies
+        std::uint32_t orig_notif = oz::sys_notification_create(oz::CAP_UNTYPED);
+        if (orig_notif != oz::INVALID_CAP_ID) {
+            std::uint32_t copied_notif = oz::sys_cap_mint(orig_notif, static_cast<std::uint32_t>(oz::CapRights::ALL));
+            if (copied_notif != oz::INVALID_CAP_ID) {
+                int revoke_res = oz::sys_cap_revoke(orig_notif);
+
+                // orig_notif should still be valid
+                int sig_res = oz::sys_notification_signal(orig_notif, 0xAA);
+                std::uint64_t val = 0;
+                int poll_res = oz::sys_notification_poll(orig_notif, &val);
+                bool orig_valid = (revoke_res == 0 && sig_res == 0 && poll_res == 0 && val == 0xAA);
+
+                // copied_notif should be invalidated
+                bool copied_invalid = (oz::sys_notification_signal(copied_notif, 0xBB) != 0) &&
+                                      (oz::sys_cap_delete(copied_notif) != 0);
+
+                // orig_notif deletion should succeed
+                bool orig_del_ok = (oz::sys_cap_delete(orig_notif) == 0);
+
+                TEST_REPORT("KTEST", "sys_cap_revoke preserves caller and revokes copies",
+                            orig_valid && copied_invalid && orig_del_ok);
+            } else {
+                TEST_REPORT("KTEST", "sys_cap_revoke preserves caller and revokes copies", false);
+                oz::sys_cap_delete(orig_notif);
+            }
+        } else {
+            TEST_REPORT("KTEST", "sys_cap_revoke preserves caller and revokes copies", false);
+        }
     }
 }
 
@@ -250,14 +280,231 @@ static void test_pf_client_thread() {
 
 static volatile int g_irq_replenish_step = 0;
 static std::uint32_t g_test_irq_handler_cap = 0;
+static std::uint32_t g_test_irq_baton_a = 0;
+static std::uint32_t g_test_irq_baton_b = 0;
 
 static void test_irq_replenish_handler_entry() {
     g_irq_replenish_step = 1;
-    oz::sys_irq_wait(g_test_irq_handler_cap);
+    oz::sys_irq_wait(g_test_irq_handler_cap, g_test_irq_baton_a);
     g_irq_replenish_step = 2;
-    oz::sys_irq_wait(g_test_irq_handler_cap);
+    oz::sys_irq_wait(g_test_irq_handler_cap, g_test_irq_baton_b);
     g_irq_replenish_step = 3;
     oz::sys_exit(0);
+}
+
+// Helpers for Dual Baton & Nonblocking IPC Tests
+static volatile bool g_forced_block_ran = false;
+static volatile std::uint32_t g_forced_block_ep = 0;
+static void test_forced_block_worker() {
+    g_forced_block_ran = true;
+    oz::IPCMessage msg{};
+    oz::sys_reply_and_recv(g_forced_block_ep, nullptr, &msg, oz::IPC_FLAG_BLOCK);
+    oz::sys_exit(0);
+}
+
+static volatile int g_safety_guard_exit_res = 0;
+static volatile std::uint32_t g_safety_srv_ep = 0;
+static void test_safety_guard_worker() {
+    oz::IPCMessage req{};
+    oz::IPCMessage rep{};
+    int res = oz::sys_reply_and_recv(g_safety_srv_ep, nullptr, &req, oz::IPC_FLAG_BLOCK);
+    if (res == 0) {
+        std::int64_t exit_ret = oz::syscall(60, 0, 0, 0, 0, 0, 0);
+        g_safety_guard_exit_res = static_cast<int>(exit_ret);
+        rep.data[0] = 0x7777;
+        oz::sys_reply_and_recv(g_safety_srv_ep, &rep, nullptr, 0);
+    }
+    oz::sys_exit(0);
+}
+
+static volatile bool g_safety_client_received_reply = false;
+static volatile std::uint32_t g_safety_cli_ep = 0;
+static void test_safety_guard_client() {
+    oz::IPCMessage req{};
+    oz::IPCMessage rep{};
+    req.data[0] = 0x1111;
+    if (oz::sys_call(g_safety_cli_ep, &req, &rep) && rep.data[0] == 0x7777) {
+        g_safety_client_received_reply = true;
+    }
+    oz::sys_exit(0);
+}
+
+static volatile bool g_nb_worker_ran = false;
+static volatile std::uint32_t g_nb_srv_ep = 0;
+static void test_nb_rpc_worker() {
+    oz::IPCMessage req{};
+    oz::IPCMessage rep{};
+    int res = oz::sys_reply_and_recv(g_nb_srv_ep, nullptr, &req, oz::IPC_FLAG_BLOCK);
+    if (res == 0) {
+        rep.data[0] = req.data[0] + 1;
+        int rep_res = oz::sys_reply_and_recv(g_nb_srv_ep, &rep, &req, 0);
+        if (rep_res == oz::SYS_ERR_WOULDBLOCK) {
+            g_nb_worker_ran = true;
+        }
+    }
+    oz::sys_exit(0);
+}
+
+static volatile bool g_nb_client_reply_ok = false;
+static volatile std::uint32_t g_nb_cli_ep = 0;
+static void test_nb_rpc_client() {
+    oz::IPCMessage req{};
+    oz::IPCMessage rep{};
+    req.data[0] = 41;
+    if (oz::sys_call(g_nb_cli_ep, &req, &rep) && rep.data[0] == 42) {
+        g_nb_client_reply_ok = true;
+    }
+    oz::sys_exit(0);
+}
+
+static volatile bool g_dead_cli_srv_ran = false;
+static volatile std::uint32_t g_dead_cli_srv_ep = 0;
+static void test_dead_client_nb_server() {
+    oz::IPCMessage req{};
+    oz::IPCMessage rep{};
+    int res = oz::sys_reply_and_recv(g_dead_cli_srv_ep, nullptr, &req, oz::IPC_FLAG_BLOCK);
+    if (res == 0) {
+        oz::sys_yield();
+        int res2 = oz::sys_reply_and_recv(g_dead_cli_srv_ep, &rep, &req, 0);
+        if (res2 == oz::SYS_ERR_WOULDBLOCK) {
+            g_dead_cli_srv_ran = true;
+        }
+    }
+    oz::sys_exit(0);
+}
+
+static volatile std::uint32_t g_dead_cli_ep = 0;
+static void test_dead_client_call() {
+    oz::IPCMessage req{};
+    oz::IPCMessage rep{};
+    req.data[0] = 0x9999;
+    oz::sys_call(g_dead_cli_ep, &req, &rep);
+    oz::sys_exit(0);
+}
+
+static volatile bool g_call_first_cli_ok = false;
+static volatile std::uint32_t g_call_first_cli_ep = 0;
+static void test_call_first_client() {
+    oz::IPCMessage req{};
+    oz::IPCMessage rep{};
+    req.data[0] = 100;
+    if (oz::sys_call(g_call_first_cli_ep, &req, &rep) && rep.data[0] == 200) {
+        g_call_first_cli_ok = true;
+    }
+    oz::sys_exit(0);
+}
+
+static volatile bool g_call_first_srv_ran = false;
+static volatile std::uint32_t g_call_first_srv_ep = 0;
+static void test_call_first_server() {
+    oz::IPCMessage req{};
+    oz::IPCMessage rep{};
+    int res = oz::sys_reply_and_recv(g_call_first_srv_ep, nullptr, &req, 0);
+    if (res == 0) {
+        g_call_first_srv_ran = true;
+        rep.data[0] = req.data[0] + 100;
+        oz::sys_reply_and_recv(g_call_first_srv_ep, &rep, nullptr, 0);
+    }
+    oz::sys_exit(0);
+}
+
+static volatile std::uint32_t g_nested_srv_c_ep = 0;
+static volatile std::uint32_t g_nested_call_c_ep = 0;
+static volatile std::uint32_t g_nested_srv_b_ep = 0;
+static volatile std::uint32_t g_nested_call_b_ep = 0;
+static void test_nested_server_c() {
+    oz::IPCMessage req{};
+    oz::IPCMessage rep{};
+    int res = oz::sys_reply_and_recv(g_nested_srv_c_ep, nullptr, &req, oz::IPC_FLAG_BLOCK);
+    if (res == 0) {
+        rep.data[0] = req.data[0] * 10;
+        oz::sys_reply_and_recv(g_nested_srv_c_ep, &rep, nullptr, 0);
+    }
+    oz::sys_exit(0);
+}
+
+static void test_nested_server_b() {
+    oz::IPCMessage req{};
+    oz::IPCMessage rep{};
+    int res = oz::sys_reply_and_recv(g_nested_srv_b_ep, nullptr, &req, oz::IPC_FLAG_BLOCK);
+    if (res == 0) {
+        oz::IPCMessage c_req{};
+        oz::IPCMessage c_rep{};
+        c_req.data[0] = 20;
+        oz::sys_call(g_nested_call_c_ep, &c_req, &c_rep);
+        rep.data[0] = req.data[0] + c_rep.data[0];
+        oz::sys_reply_and_recv(g_nested_srv_b_ep, &rep, nullptr, 0);
+    }
+    oz::sys_exit(0);
+}
+
+static volatile std::uint64_t g_nested_client_res = 0;
+static void test_nested_client_a() {
+    oz::IPCMessage req{};
+    oz::IPCMessage rep{};
+    req.data[0] = 10;
+    if (oz::sys_call(g_nested_call_b_ep, &req, &rep)) {
+        g_nested_client_res = rep.data[0];
+    }
+    oz::sys_exit(0);
+}
+
+// -----------------------------------------------------------------------------
+// Hierarchical Cartesian Scheduling Test Helpers
+// -----------------------------------------------------------------------------
+static volatile int g_h_explicit_counter = 0;
+static void test_h_explicit_worker() {
+    g_h_explicit_counter = 1;
+    oz::sys_baton_yield();
+    g_h_explicit_counter = 2;
+    oz::sys_baton_exit(0);
+}
+
+static volatile int g_h_deadlock_res = 0;
+static std::uint32_t g_h_parent_baton = 0;
+static void test_h_deadlock_child() {
+    oz::SchedResult res = oz::sys_baton_switch(g_h_parent_baton, 10000);
+    g_h_deadlock_res = static_cast<int>(res.reason);
+    oz::sys_baton_exit(0);
+}
+static void test_h_deadlock_parent() {
+    std::uint32_t c_tcb = oz::sys_untyped_retype(oz::CAP_UNTYPED, static_cast<std::uint32_t>(oz::ObjectType::TCB), 0);
+    std::uint32_t c_stack = oz::sys_frame_alloc(oz::CAP_UNTYPED, 4);
+    std::uint64_t c_stack_top = 0x7000d8000000ULL + 16384;
+    oz::sys_vspace_map_with_pagetables(oz::CAP_SELF_VSPACE, oz::CAP_UNTYPED, c_stack, 0x7000d8000000ULL, 0x03, 16384);
+    oz::sys_tcb_configure(c_tcb, oz::CAP_SELF_CSPACE, oz::CAP_SELF_VSPACE,
+                          reinterpret_cast<std::uint64_t>(test_h_deadlock_child), c_stack_top);
+    std::uint32_t c_baton = oz::sys_untyped_retype(oz::CAP_UNTYPED, static_cast<std::uint32_t>(oz::ObjectType::Baton), 0);
+    oz::sys_tcb_bind_baton(c_tcb, c_baton);
+
+    oz::sys_baton_switch(c_baton, 50000);
+    oz::sys_baton_exit(0);
+}
+
+static volatile bool g_h_worker_started = false;
+static volatile bool g_h_timeout_occurred = false;
+static volatile bool g_h_worker_resumed = false;
+static volatile bool g_h_subsched_finished = false;
+static std::uint32_t g_h_worker_baton = 0;
+
+static void test_h_worker_thread() {
+    g_h_worker_started = true;
+    while (!g_h_timeout_occurred) {
+        __asm__ volatile("pause");
+    }
+    g_h_worker_resumed = true;
+    oz::sys_baton_exit(0);
+}
+
+static void test_h_subsched_thread() {
+    oz::sys_baton_switch(g_h_worker_baton, 200000);
+    g_h_subsched_finished = true;
+    oz::sys_baton_exit(0);
+}
+
+static void test_h_crash_worker() {
+    *reinterpret_cast<volatile int*>(0xdead0000ULL) = 42;
+    oz::sys_baton_exit(0);
 }
 
 static void run_baton_scheduling_tests() {
@@ -435,45 +682,538 @@ static void run_baton_scheduling_tests() {
     oz::sys_cap_delete(ep_p);
     oz::sys_cap_delete(g_pf_frame_cap);
 
-    // 6. Test InterruptThread & IRQ replenishment
+    // 6. Test IRQ Handler & IRQ Baton Separation Architecture
     std::uint32_t dummy_ch_send = 0, dummy_ch_recv = 0;
     oz::sys_channel_create(oz::CAP_UNTYPED, &dummy_ch_send, &dummy_ch_recv);
     std::uint32_t dummy_irq = oz::sys_irq_handler_create(oz::CAP_UNTYPED, 0x45, dummy_ch_send);
 
-    int type_safety_res = oz::sys_irq_wait(dummy_irq);
-    bool type_safety_ok = (type_safety_res == oz::SYS_ERR_INVALID_TYPE);
-    TEST_REPORT("KTEST", "Capability Type Safety (sys_irq_wait rejected)", type_safety_ok);
+    // Test sys_baton_create_irq without IRQBatonControl -> SYS_ERR_PERM
+    std::uint32_t unpriv_irq_baton = oz::sys_baton_create_irq(dummy_irq, oz::CAP_UNTYPED, 50000);
+    TEST_REPORT("KTEST", "sys_baton_create_irq privilege enforcement", unpriv_irq_baton == oz::INVALID_CAP_ID);
 
-    std::uint32_t ithread = oz::sys_untyped_retype(oz::CAP_UNTYPED, static_cast<std::uint32_t>(oz::ObjectType::InterruptThread), 0);
+    // Create valid IRQ batons with CAP_IRQ_CONTROL
+    std::uint32_t irq_baton_a = oz::sys_baton_create_irq(oz::CAP_IRQ_CONTROL, oz::CAP_UNTYPED, 50000);
+    std::uint32_t irq_baton_b = oz::sys_baton_create_irq(oz::CAP_IRQ_CONTROL, oz::CAP_UNTYPED, 50000);
+    TEST_REPORT("KTEST", "sys_baton_create_irq with IRQBatonControl", irq_baton_a != oz::INVALID_CAP_ID && irq_baton_b != oz::INVALID_CAP_ID);
+
+    // Normal baton for type-check and invariant tests
+    std::uint32_t normal_baton = oz::sys_untyped_retype(oz::CAP_UNTYPED, static_cast<std::uint32_t>(oz::ObjectType::Baton), 0);
+
+    // Capability Type Safety: sys_irq_wait rejecting normal baton
+    int type_safety_res = oz::sys_irq_wait(dummy_irq, normal_baton);
+    TEST_REPORT("KTEST", "Capability Type Safety (sys_irq_wait rejects normal baton)", type_safety_res == oz::SYS_ERR_INVALID_TYPE);
+
+    // Invariant 1: sys_tcb_bind_baton rejects irq_baton
+    std::uint32_t ithread = oz::sys_untyped_retype(oz::CAP_UNTYPED, static_cast<std::uint32_t>(oz::ObjectType::TCB), 0);
+    int inv1_res = oz::sys_tcb_bind_baton(ithread, irq_baton_a);
+    TEST_REPORT("KTEST", "Invariant 1: sys_tcb_bind_baton rejects irq_baton", inv1_res == oz::SYS_ERR_INVALID);
+
+    // Invariant 2: sys_baton_switch rejects irq_baton
+    oz::SchedResult inv2_res = oz::sys_baton_switch(irq_baton_a);
+    TEST_REPORT("KTEST", "Invariant 2: sys_baton_switch rejects irq_baton", inv2_res.reason == oz::SYS_BATON_SWITCH_INVALID);
+
+    // sys_baton_set_budget tests
+    int set_budget_normal = oz::sys_baton_set_budget(normal_baton, 60000);
+    TEST_REPORT("KTEST", "sys_baton_set_budget rejects normal baton", set_budget_normal == oz::SYS_ERR_INVALID_TYPE);
+    int set_budget_ok = oz::sys_baton_set_budget(irq_baton_a, 60000);
+    TEST_REPORT("KTEST", "sys_baton_set_budget succeeds on irq_baton", set_budget_ok == 0);
+
+    // Configure thread with own_baton
     std::uint32_t istack = oz::sys_frame_alloc(oz::CAP_UNTYPED, 4);
     std::uint64_t istack_top = 0x700050000000ULL + 16384;
     oz::sys_vspace_map_with_pagetables(oz::CAP_SELF_VSPACE, oz::CAP_UNTYPED, istack, 0x700050000000ULL, 0x03, 16384);
     g_test_irq_handler_cap = dummy_irq;
+    g_test_irq_baton_a = irq_baton_a;
+    g_test_irq_baton_b = irq_baton_b;
     oz::sys_tcb_configure(ithread, oz::CAP_SELF_CSPACE, oz::CAP_SELF_VSPACE,
                           reinterpret_cast<std::uint64_t>(test_irq_replenish_handler_entry), istack_top);
 
-    std::uint32_t ibaton = oz::sys_untyped_retype(oz::CAP_UNTYPED, static_cast<std::uint32_t>(oz::ObjectType::Baton), 0);
+    std::uint32_t own_baton = oz::sys_untyped_retype(oz::CAP_UNTYPED, static_cast<std::uint32_t>(oz::ObjectType::Baton), 0);
     std::uint32_t inotif = oz::sys_notification_create(oz::CAP_UNTYPED);
     static constexpr std::uint64_t IRQ_BADGE = (1ULL << 12);
-    oz::sys_baton_bind_notification(ibaton, inotif, IRQ_BADGE);
-    oz::sys_tcb_bind_baton(ithread, ibaton);
+    oz::sys_thread_set_notification(ithread, inotif, IRQ_BADGE);
+    oz::sys_tcb_bind_baton(ithread, own_baton);
 
     g_irq_replenish_step = 0;
-    oz::sys_baton_inject(ibaton, 50000);
-    oz::SchedResult ires = oz::sys_baton_switch(ibaton);
+    oz::sys_baton_inject(own_baton, 50000);
+    oz::SchedResult ires = oz::sys_baton_switch(own_baton);
     bool irq_resv_ok = (g_irq_replenish_step == 1);
-    TEST_REPORT("KTEST", "InterruptThread sys_irq_wait reservation", irq_resv_ok);
+    TEST_REPORT("KTEST", "Thread sys_irq_wait initial reservation", irq_resv_ok);
 
-    oz::sys_baton_inject(ibaton, 50000);
+    oz::sys_baton_inject(own_baton, 50000);
     oz::sys_tcb_resume(ithread);
-    ires = oz::sys_baton_switch(ibaton);
+    ires = oz::sys_baton_switch(own_baton);
     bool irq_resume_ok = (g_irq_replenish_step == 2);
-    TEST_REPORT("KTEST", "InterruptThread resume and clean return", irq_resume_ok);
+    TEST_REPORT("KTEST", "Thread sys_irq_wait ping-pong reservation", irq_resume_ok);
 
-    oz::sys_baton_inject(ibaton, 0);
-    ires = oz::sys_baton_switch(ibaton);
-    bool irq_timeout_ok = (ires.reason == oz::SYS_BATON_SWITCH_TIMEOUT);
-    TEST_REPORT("KTEST", "sys_baton_switch timeout on exhausted handler", irq_timeout_ok);
+    oz::sys_baton_inject(own_baton, 50000);
+    oz::sys_tcb_resume(ithread);
+    ires = oz::sys_baton_switch(own_baton);
+    bool irq_complete_ok = (g_irq_replenish_step == 3);
+    TEST_REPORT("KTEST", "Thread handler complete & exit", irq_complete_ok);
+}
+
+// =============================================================================
+// 3. Dual Baton & Nonblocking IPC Tests
+// =============================================================================
+static void run_dual_baton_nonblocking_ipc_tests() {
+    oz::sys_debug_print("\n\r--- 3. Dual Baton & Nonblocking IPC Tests ---\n\r");
+
+    // 1. ChannelMode combination validation & rejection
+    std::uint32_t ep0 = 0, ep1 = 0;
+    bool m_bb = oz::sys_channel_create(oz::CAP_UNTYPED, &ep0, &ep1, oz::ChannelMode::BLOCKING, oz::ChannelMode::BLOCKING);
+    if (m_bb) { oz::sys_cap_delete(ep0); oz::sys_cap_delete(ep1); }
+
+    bool m_rb = oz::sys_channel_create(oz::CAP_UNTYPED, &ep0, &ep1, oz::ChannelMode::RECV_NONBLOCK, oz::ChannelMode::BLOCKING);
+    if (m_rb) { oz::sys_cap_delete(ep0); oz::sys_cap_delete(ep1); }
+
+    bool m_sb = oz::sys_channel_create(oz::CAP_UNTYPED, &ep0, &ep1, oz::ChannelMode::SEND_NONBLOCK, oz::ChannelMode::BLOCKING);
+    if (m_sb) { oz::sys_cap_delete(ep0); oz::sys_cap_delete(ep1); }
+
+    bool m_rs = oz::sys_channel_create(oz::CAP_UNTYPED, &ep0, &ep1, oz::ChannelMode::RECV_NONBLOCK, oz::ChannelMode::SEND_NONBLOCK);
+    if (m_rs) { oz::sys_cap_delete(ep0); oz::sys_cap_delete(ep1); }
+
+    bool m_rr = oz::sys_channel_create(oz::CAP_UNTYPED, &ep0, &ep1, oz::ChannelMode::RECV_NONBLOCK, oz::ChannelMode::RECV_NONBLOCK);
+    bool m_ss = oz::sys_channel_create(oz::CAP_UNTYPED, &ep0, &ep1, oz::ChannelMode::SEND_NONBLOCK, oz::ChannelMode::SEND_NONBLOCK);
+    bool m_inv = oz::sys_channel_create(oz::CAP_UNTYPED, &ep0, &ep1, static_cast<oz::ChannelMode>(99), oz::ChannelMode::BLOCKING);
+
+    bool mode_val_ok = (m_bb && m_rb && m_sb && m_rs && !m_rr && !m_ss && !m_inv);
+    TEST_REPORT("KTEST", "ChannelMode combination validation & rejection", mode_val_ok);
+
+    // 2. Clean state nonblocking receive (Matrix No. 3)
+    std::uint32_t nb_r0 = 0, nb_r1 = 0;
+    oz::sys_channel_create(oz::CAP_UNTYPED, &nb_r0, &nb_r1, oz::ChannelMode::RECV_NONBLOCK, oz::ChannelMode::BLOCKING);
+    oz::IPCMessage dummy_recv{};
+    int nb_recv_res = oz::sys_reply_and_recv(nb_r0, nullptr, &dummy_recv, 0);
+    bool nb_recv_ok = (nb_recv_res == oz::SYS_ERR_WOULDBLOCK);
+    TEST_REPORT("KTEST", "Clean state nonblocking receive (SYS_ERR_WOULDBLOCK)", nb_recv_ok);
+    oz::sys_cap_delete(nb_r0);
+    oz::sys_cap_delete(nb_r1);
+
+    // 3. Nonblocking send without receiver (SEND_NONBLOCK)
+    std::uint32_t nb_s0 = 0, nb_s1 = 0;
+    oz::sys_channel_create(oz::CAP_UNTYPED, &nb_s0, &nb_s1, oz::ChannelMode::SEND_NONBLOCK, oz::ChannelMode::BLOCKING);
+    oz::IPCMessage nb_smsg{};
+    oz::IPCMessage nb_srep{};
+    int nb_send_res = oz::sys_call_ext(nb_s0, &nb_smsg, &nb_srep, 0);
+    bool nb_send_ok = (nb_send_res == oz::SYS_ERR_WOULDBLOCK);
+    TEST_REPORT("KTEST", "Nonblocking send without receiver (SYS_ERR_WOULDBLOCK)", nb_send_ok);
+    oz::sys_cap_delete(nb_s0);
+    oz::sys_cap_delete(nb_s1);
+
+    // 4. Forced blocking with IPC_FLAG_BLOCK on nonblocking endpoint
+    std::uint32_t fb_ep0 = 0, fb_ep1 = 0;
+    oz::sys_channel_create(oz::CAP_UNTYPED, &fb_ep0, &fb_ep1, oz::ChannelMode::RECV_NONBLOCK, oz::ChannelMode::BLOCKING);
+    g_forced_block_ep = fb_ep0;
+
+    std::uint32_t fb_tcb = oz::sys_untyped_retype(oz::CAP_UNTYPED, static_cast<std::uint32_t>(oz::ObjectType::TCB), 0);
+    std::uint32_t fb_stack = oz::sys_frame_alloc(oz::CAP_UNTYPED, 4);
+    std::uint64_t fb_stack_top = 0x700070000000ULL + 16384;
+    oz::sys_vspace_map_with_pagetables(oz::CAP_SELF_VSPACE, oz::CAP_UNTYPED, fb_stack, 0x700070000000ULL, 0x03, 16384);
+    oz::sys_tcb_configure(fb_tcb, oz::CAP_SELF_CSPACE, oz::CAP_SELF_VSPACE,
+                          reinterpret_cast<std::uint64_t>(test_forced_block_worker), fb_stack_top);
+
+    std::uint32_t fb_baton = oz::sys_untyped_retype(oz::CAP_UNTYPED, static_cast<std::uint32_t>(oz::ObjectType::Baton), 0);
+    oz::sys_baton_inject(fb_baton, 50000);
+    oz::sys_tcb_bind_baton(fb_tcb, fb_baton);
+
+    g_forced_block_ran = false;
+    oz::SchedResult fb_res = oz::sys_baton_switch(fb_baton);
+    bool fb_ok = (g_forced_block_ran && fb_res.reason == oz::SchedReason::BLOCKED);
+    TEST_REPORT("KTEST", "Forced blocking with IPC_FLAG_BLOCK on nonblocking endpoint", fb_ok);
+
+    oz::sys_cap_delete(fb_ep0);
+    oz::sys_cap_delete(fb_ep1);
+    oz::sys_cap_delete(fb_tcb);
+    oz::sys_cap_delete(fb_baton);
+
+    // 5. Safety guard: sys_exit rejected while holding borrowed_baton
+    std::uint32_t sg_ep0 = 0, sg_ep1 = 0;
+    oz::sys_channel_create(oz::CAP_UNTYPED, &sg_ep0, &sg_ep1);
+    g_safety_srv_ep = sg_ep0;
+
+    std::uint32_t sg_srv_tcb = oz::sys_untyped_retype(oz::CAP_UNTYPED, static_cast<std::uint32_t>(oz::ObjectType::TCB), 0);
+    std::uint32_t sg_srv_stack = oz::sys_frame_alloc(oz::CAP_UNTYPED, 4);
+    std::uint64_t sg_srv_stack_top = 0x700078000000ULL + 16384;
+    oz::sys_vspace_map_with_pagetables(oz::CAP_SELF_VSPACE, oz::CAP_UNTYPED, sg_srv_stack, 0x700078000000ULL, 0x03, 16384);
+    oz::sys_tcb_configure(sg_srv_tcb, oz::CAP_SELF_CSPACE, oz::CAP_SELF_VSPACE,
+                          reinterpret_cast<std::uint64_t>(test_safety_guard_worker), sg_srv_stack_top);
+
+    std::uint32_t sg_init_baton = oz::sys_untyped_retype(oz::CAP_UNTYPED, static_cast<std::uint32_t>(oz::ObjectType::Baton), 0);
+    oz::sys_baton_inject(sg_init_baton, 50000);
+    oz::sys_tcb_bind_baton(sg_srv_tcb, sg_init_baton);
+    oz::sys_baton_switch(sg_init_baton);
+    oz::sys_tcb_unbind_baton(sg_srv_tcb);
+    oz::sys_cap_delete(sg_init_baton);
+
+    g_safety_cli_ep = sg_ep1;
+    std::uint32_t sg_cli_tcb = oz::sys_untyped_retype(oz::CAP_UNTYPED, static_cast<std::uint32_t>(oz::ObjectType::TCB), 0);
+    std::uint32_t sg_cli_stack = oz::sys_frame_alloc(oz::CAP_UNTYPED, 4);
+    std::uint64_t sg_cli_stack_top = 0x700080000000ULL + 16384;
+    oz::sys_vspace_map_with_pagetables(oz::CAP_SELF_VSPACE, oz::CAP_UNTYPED, sg_cli_stack, 0x700080000000ULL, 0x03, 16384);
+    oz::sys_tcb_configure(sg_cli_tcb, oz::CAP_SELF_CSPACE, oz::CAP_SELF_VSPACE,
+                          reinterpret_cast<std::uint64_t>(test_safety_guard_client), sg_cli_stack_top);
+
+    std::uint32_t sg_cli_baton = oz::sys_untyped_retype(oz::CAP_UNTYPED, static_cast<std::uint32_t>(oz::ObjectType::Baton), 0);
+    oz::sys_baton_inject(sg_cli_baton, 100000);
+    oz::sys_tcb_bind_baton(sg_cli_tcb, sg_cli_baton);
+
+    g_safety_guard_exit_res = 0;
+    g_safety_client_received_reply = false;
+    oz::sys_baton_switch(sg_cli_baton);
+    bool sg_ok = (g_safety_guard_exit_res == oz::SYS_ERR_BUSY && g_safety_client_received_reply);
+    TEST_REPORT("KTEST", "Safety guard: sys_exit rejected while holding borrowed_baton", sg_ok);
+
+    oz::sys_cap_delete(sg_ep0);
+    oz::sys_cap_delete(sg_ep1);
+    oz::sys_cap_delete(sg_srv_tcb);
+    oz::sys_cap_delete(sg_cli_tcb);
+    oz::sys_cap_delete(sg_cli_baton);
+
+    // 6. Dual Baton RPC completion & Notification (Matrix No. 6 / Section 5.1)
+    std::uint32_t nb6_s = 0, nb6_c = 0;
+    oz::sys_channel_create(oz::CAP_UNTYPED, &nb6_s, &nb6_c, oz::ChannelMode::RECV_NONBLOCK, oz::ChannelMode::BLOCKING);
+    g_nb_srv_ep = nb6_s;
+
+    std::uint32_t nb6_srv_tcb = oz::sys_untyped_retype(oz::CAP_UNTYPED, static_cast<std::uint32_t>(oz::ObjectType::TCB), 0);
+    std::uint32_t nb6_srv_stack = oz::sys_frame_alloc(oz::CAP_UNTYPED, 4);
+    std::uint64_t nb6_srv_stack_top = 0x700088000000ULL + 16384;
+    oz::sys_vspace_map_with_pagetables(oz::CAP_SELF_VSPACE, oz::CAP_UNTYPED, nb6_srv_stack, 0x700088000000ULL, 0x03, 16384);
+    oz::sys_tcb_configure(nb6_srv_tcb, oz::CAP_SELF_CSPACE, oz::CAP_SELF_VSPACE,
+                          reinterpret_cast<std::uint64_t>(test_nb_rpc_worker), nb6_srv_stack_top);
+
+    std::uint32_t nb6_own_baton = oz::sys_untyped_retype(oz::CAP_UNTYPED, static_cast<std::uint32_t>(oz::ObjectType::Baton), 0);
+    std::uint32_t nb6_notif = oz::sys_notification_create(oz::CAP_UNTYPED);
+    static constexpr std::uint64_t BADGE_NB6 = 0xBEEF;
+    oz::sys_baton_bind_notification(nb6_own_baton, nb6_notif, BADGE_NB6);
+    oz::sys_tcb_bind_baton(nb6_srv_tcb, nb6_own_baton);
+
+    oz::sys_baton_inject(nb6_own_baton, 50000);
+    oz::SchedResult nb6_init_res = oz::sys_baton_switch(nb6_own_baton);
+    bool srv_blocked = (nb6_init_res.reason == oz::SchedReason::BLOCKED);
+
+    g_nb_cli_ep = nb6_c;
+    std::uint32_t nb6_cli_tcb = oz::sys_untyped_retype(oz::CAP_UNTYPED, static_cast<std::uint32_t>(oz::ObjectType::TCB), 0);
+    std::uint32_t nb6_cli_stack = oz::sys_frame_alloc(oz::CAP_UNTYPED, 4);
+    std::uint64_t nb6_cli_stack_top = 0x700090000000ULL + 16384;
+    oz::sys_vspace_map_with_pagetables(oz::CAP_SELF_VSPACE, oz::CAP_UNTYPED, nb6_cli_stack, 0x700090000000ULL, 0x03, 16384);
+    oz::sys_tcb_configure(nb6_cli_tcb, oz::CAP_SELF_CSPACE, oz::CAP_SELF_VSPACE,
+                          reinterpret_cast<std::uint64_t>(test_nb_rpc_client), nb6_cli_stack_top);
+
+    std::uint32_t nb6_cli_baton = oz::sys_untyped_retype(oz::CAP_UNTYPED, static_cast<std::uint32_t>(oz::ObjectType::Baton), 0);
+    oz::sys_baton_inject(nb6_cli_baton, 100000);
+    oz::sys_tcb_bind_baton(nb6_cli_tcb, nb6_cli_baton);
+
+    g_nb_client_reply_ok = false;
+    oz::sys_baton_switch(nb6_cli_baton);
+
+    std::uint64_t notif_val = 0;
+    bool notif_ok = (oz::sys_notification_poll(nb6_notif, &notif_val) == 0 && notif_val == BADGE_NB6);
+
+    oz::sys_baton_inject(nb6_own_baton, 50000);
+    oz::SchedResult nb6_srv_res = oz::sys_baton_switch(nb6_own_baton);
+
+    bool test6_ok = (srv_blocked && g_nb_client_reply_ok && notif_ok && (nb6_srv_res.reason == oz::SchedReason::EXIT || nb6_srv_res.reason == oz::SchedReason::ORPHANED));
+    TEST_REPORT("KTEST", "Dual Baton RPC completion Notification & resume (SYS_ERR_WOULDBLOCK)", test6_ok);
+
+    oz::sys_cap_delete(nb6_s);
+    oz::sys_cap_delete(nb6_c);
+    oz::sys_cap_delete(nb6_srv_tcb);
+    oz::sys_cap_delete(nb6_cli_tcb);
+    oz::sys_cap_delete(nb6_own_baton);
+    oz::sys_cap_delete(nb6_cli_baton);
+    oz::sys_cap_delete(nb6_notif);
+
+    // 7. Dead client with Dual Baton & Notification wakeup (Matrix No. 10-D / Section 5.2)
+    std::uint32_t dead_s = 0, dead_c = 0;
+    oz::sys_channel_create(oz::CAP_UNTYPED, &dead_s, &dead_c, oz::ChannelMode::RECV_NONBLOCK, oz::ChannelMode::BLOCKING);
+    g_dead_cli_srv_ep = dead_s;
+
+    std::uint32_t dead_srv_tcb = oz::sys_untyped_retype(oz::CAP_UNTYPED, static_cast<std::uint32_t>(oz::ObjectType::TCB), 0);
+    std::uint32_t dead_srv_stack = oz::sys_frame_alloc(oz::CAP_UNTYPED, 4);
+    std::uint64_t dead_srv_stack_top = 0x700098000000ULL + 16384;
+    oz::sys_vspace_map_with_pagetables(oz::CAP_SELF_VSPACE, oz::CAP_UNTYPED, dead_srv_stack, 0x700098000000ULL, 0x03, 16384);
+    oz::sys_tcb_configure(dead_srv_tcb, oz::CAP_SELF_CSPACE, oz::CAP_SELF_VSPACE,
+                          reinterpret_cast<std::uint64_t>(test_dead_client_nb_server), dead_srv_stack_top);
+
+    std::uint32_t dead_own_baton = oz::sys_untyped_retype(oz::CAP_UNTYPED, static_cast<std::uint32_t>(oz::ObjectType::Baton), 0);
+    std::uint32_t dead_notif = oz::sys_notification_create(oz::CAP_UNTYPED);
+    static constexpr std::uint64_t BADGE_DEAD = 0xDEAD;
+    oz::sys_baton_bind_notification(dead_own_baton, dead_notif, BADGE_DEAD);
+    oz::sys_tcb_bind_baton(dead_srv_tcb, dead_own_baton);
+
+    oz::sys_baton_inject(dead_own_baton, 50000);
+    oz::sys_baton_switch(dead_own_baton);
+
+    g_dead_cli_ep = dead_c;
+    std::uint32_t dead_cli_tcb = oz::sys_untyped_retype(oz::CAP_UNTYPED, static_cast<std::uint32_t>(oz::ObjectType::TCB), 0);
+    std::uint32_t dead_cli_stack = oz::sys_frame_alloc(oz::CAP_UNTYPED, 4);
+    std::uint64_t dead_cli_stack_top = 0x7000A0000000ULL + 16384;
+    oz::sys_vspace_map_with_pagetables(oz::CAP_SELF_VSPACE, oz::CAP_UNTYPED, dead_cli_stack, 0x7000A0000000ULL, 0x03, 16384);
+    oz::sys_tcb_configure(dead_cli_tcb, oz::CAP_SELF_CSPACE, oz::CAP_SELF_VSPACE,
+                          reinterpret_cast<std::uint64_t>(test_dead_client_call), dead_cli_stack_top);
+
+    std::uint32_t dead_cli_baton = oz::sys_untyped_retype(oz::CAP_UNTYPED, static_cast<std::uint32_t>(oz::ObjectType::Baton), 0);
+    oz::sys_baton_inject(dead_cli_baton, 100000);
+    oz::sys_tcb_bind_baton(dead_cli_tcb, dead_cli_baton);
+
+    oz::SchedResult d_res1 = oz::sys_baton_switch(dead_cli_baton);
+    bool srv_yielded = (d_res1.reason == oz::SchedReason::YIELD);
+
+    oz::sys_cap_delete(dead_cli_tcb);
+
+    oz::SchedResult d_res2 = oz::sys_baton_switch(dead_cli_baton);
+    bool orphaned_detected = (d_res2.reason == oz::SchedReason::ORPHANED);
+
+    std::uint64_t dead_notif_val = 0;
+    bool dead_notif_ok = (oz::sys_notification_poll(dead_notif, &dead_notif_val) == 0 && dead_notif_val == BADGE_DEAD);
+
+    g_dead_cli_srv_ran = false;
+    oz::sys_baton_inject(dead_own_baton, 50000);
+    oz::sys_baton_switch(dead_own_baton);
+
+    bool test7_ok = (srv_yielded && orphaned_detected && dead_notif_ok && g_dead_cli_srv_ran);
+    TEST_REPORT("KTEST", "Dead client ORPHANED detection & own_baton Notification recovery", test7_ok);
+
+    oz::sys_cap_delete(dead_s);
+    oz::sys_cap_delete(dead_c);
+    oz::sys_cap_delete(dead_srv_tcb);
+    oz::sys_cap_delete(dead_own_baton);
+    oz::sys_cap_delete(dead_cli_baton);
+    oz::sys_cap_delete(dead_notif);
+
+    // 8. Nested RPC (多段呼び出し / Section 2.4)
+    std::uint32_t n_c_s = 0, n_c_c = 0;
+    oz::sys_channel_create(oz::CAP_UNTYPED, &n_c_s, &n_c_c);
+    g_nested_srv_c_ep = n_c_s;
+    g_nested_call_c_ep = n_c_c;
+
+    std::uint32_t n_b_s = 0, n_b_c = 0;
+    oz::sys_channel_create(oz::CAP_UNTYPED, &n_b_s, &n_b_c);
+    g_nested_srv_b_ep = n_b_s;
+    g_nested_call_b_ep = n_b_c;
+
+    std::uint32_t srv_c_tcb = oz::sys_untyped_retype(oz::CAP_UNTYPED, static_cast<std::uint32_t>(oz::ObjectType::TCB), 0);
+    std::uint32_t srv_c_stack = oz::sys_frame_alloc(oz::CAP_UNTYPED, 4);
+    std::uint64_t srv_c_stack_top = 0x7000A8000000ULL + 16384;
+    oz::sys_vspace_map_with_pagetables(oz::CAP_SELF_VSPACE, oz::CAP_UNTYPED, srv_c_stack, 0x7000A8000000ULL, 0x03, 16384);
+    oz::sys_tcb_configure(srv_c_tcb, oz::CAP_SELF_CSPACE, oz::CAP_SELF_VSPACE,
+                          reinterpret_cast<std::uint64_t>(test_nested_server_c), srv_c_stack_top);
+
+    std::uint32_t srv_c_baton = oz::sys_untyped_retype(oz::CAP_UNTYPED, static_cast<std::uint32_t>(oz::ObjectType::Baton), 0);
+    oz::sys_baton_inject(srv_c_baton, 50000);
+    oz::sys_tcb_bind_baton(srv_c_tcb, srv_c_baton);
+    oz::sys_baton_switch(srv_c_baton);
+    oz::sys_tcb_unbind_baton(srv_c_tcb);
+    oz::sys_cap_delete(srv_c_baton);
+
+    std::uint32_t srv_b_tcb = oz::sys_untyped_retype(oz::CAP_UNTYPED, static_cast<std::uint32_t>(oz::ObjectType::TCB), 0);
+    std::uint32_t srv_b_stack = oz::sys_frame_alloc(oz::CAP_UNTYPED, 4);
+    std::uint64_t srv_b_stack_top = 0x7000B0000000ULL + 16384;
+    oz::sys_vspace_map_with_pagetables(oz::CAP_SELF_VSPACE, oz::CAP_UNTYPED, srv_b_stack, 0x7000B0000000ULL, 0x03, 16384);
+    oz::sys_tcb_configure(srv_b_tcb, oz::CAP_SELF_CSPACE, oz::CAP_SELF_VSPACE,
+                          reinterpret_cast<std::uint64_t>(test_nested_server_b), srv_b_stack_top);
+
+    std::uint32_t srv_b_baton = oz::sys_untyped_retype(oz::CAP_UNTYPED, static_cast<std::uint32_t>(oz::ObjectType::Baton), 0);
+    oz::sys_baton_inject(srv_b_baton, 50000);
+    oz::sys_tcb_bind_baton(srv_b_tcb, srv_b_baton);
+    oz::sys_baton_switch(srv_b_baton);
+    oz::sys_tcb_unbind_baton(srv_b_tcb);
+    oz::sys_cap_delete(srv_b_baton);
+
+    std::uint32_t cli_a_tcb = oz::sys_untyped_retype(oz::CAP_UNTYPED, static_cast<std::uint32_t>(oz::ObjectType::TCB), 0);
+    std::uint32_t cli_a_stack = oz::sys_frame_alloc(oz::CAP_UNTYPED, 4);
+    std::uint64_t cli_a_stack_top = 0x7000B8000000ULL + 16384;
+    oz::sys_vspace_map_with_pagetables(oz::CAP_SELF_VSPACE, oz::CAP_UNTYPED, cli_a_stack, 0x7000B8000000ULL, 0x03, 16384);
+    oz::sys_tcb_configure(cli_a_tcb, oz::CAP_SELF_CSPACE, oz::CAP_SELF_VSPACE,
+                          reinterpret_cast<std::uint64_t>(test_nested_client_a), cli_a_stack_top);
+
+    std::uint32_t cli_a_baton = oz::sys_untyped_retype(oz::CAP_UNTYPED, static_cast<std::uint32_t>(oz::ObjectType::Baton), 0);
+    oz::sys_baton_inject(cli_a_baton, 100000);
+    oz::sys_tcb_bind_baton(cli_a_tcb, cli_a_baton);
+
+    g_nested_client_res = 0;
+    oz::sys_baton_switch(cli_a_baton);
+    bool nested_ok = (g_nested_client_res == 210);
+    TEST_REPORT("KTEST", "Nested RPC multi-hop baton propagation & distributed unwinding", nested_ok);
+
+    oz::sys_cap_delete(n_c_s);
+    oz::sys_cap_delete(n_c_c);
+    oz::sys_cap_delete(n_b_s);
+    oz::sys_cap_delete(n_b_c);
+    oz::sys_cap_delete(srv_c_tcb);
+    oz::sys_cap_delete(srv_b_tcb);
+    oz::sys_cap_delete(cli_a_tcb);
+    oz::sys_cap_delete(cli_a_baton);
+
+    // 9. Call 先行受信 & スケジューラ協調ディスパッチ (Matrix No. 1 / Section 3.1, 4.3)
+    std::uint32_t cf_s = 0, cf_c = 0;
+    oz::sys_channel_create(oz::CAP_UNTYPED, &cf_s, &cf_c, oz::ChannelMode::BLOCKING, oz::ChannelMode::BLOCKING);
+    g_call_first_srv_ep = cf_s;
+    g_call_first_cli_ep = cf_c;
+
+    std::uint32_t cf_cli_tcb = oz::sys_untyped_retype(oz::CAP_UNTYPED, static_cast<std::uint32_t>(oz::ObjectType::TCB), 0);
+    std::uint32_t cf_cli_stack = oz::sys_frame_alloc(oz::CAP_UNTYPED, 4);
+    std::uint64_t cf_cli_stack_top = 0x7000C0000000ULL + 16384;
+    oz::sys_vspace_map_with_pagetables(oz::CAP_SELF_VSPACE, oz::CAP_UNTYPED, cf_cli_stack, 0x7000C0000000ULL, 0x03, 16384);
+    oz::sys_tcb_configure(cf_cli_tcb, oz::CAP_SELF_CSPACE, oz::CAP_SELF_VSPACE,
+                          reinterpret_cast<std::uint64_t>(test_call_first_client), cf_cli_stack_top);
+
+    std::uint32_t cf_cli_baton = oz::sys_untyped_retype(oz::CAP_UNTYPED, static_cast<std::uint32_t>(oz::ObjectType::Baton), 0);
+    std::uint32_t cf_cli_notif = oz::sys_notification_create(oz::CAP_UNTYPED);
+    static constexpr std::uint64_t BADGE_CF_CLI = 0xCA11;
+    oz::sys_baton_bind_notification(cf_cli_baton, cf_cli_notif, BADGE_CF_CLI);
+    oz::sys_baton_inject(cf_cli_baton, 100000);
+    oz::sys_tcb_bind_baton(cf_cli_tcb, cf_cli_baton);
+
+    // Client runs FIRST: blocks on Call 先行 (C-3)
+    oz::SchedResult c_res = oz::sys_baton_switch(cf_cli_baton);
+    bool cli_blocked = (c_res.reason == oz::SchedReason::BLOCKED);
+
+    std::uint32_t cf_srv_tcb = oz::sys_untyped_retype(oz::CAP_UNTYPED, static_cast<std::uint32_t>(oz::ObjectType::TCB), 0);
+    std::uint32_t cf_srv_stack = oz::sys_frame_alloc(oz::CAP_UNTYPED, 4);
+    std::uint64_t cf_srv_stack_top = 0x7000C8000000ULL + 16384;
+    oz::sys_vspace_map_with_pagetables(oz::CAP_SELF_VSPACE, oz::CAP_UNTYPED, cf_srv_stack, 0x7000C8000000ULL, 0x03, 16384);
+    oz::sys_tcb_configure(cf_srv_tcb, oz::CAP_SELF_CSPACE, oz::CAP_SELF_VSPACE,
+                          reinterpret_cast<std::uint64_t>(test_call_first_server), cf_srv_stack_top);
+
+    std::uint32_t cf_srv_baton = oz::sys_untyped_retype(oz::CAP_UNTYPED, static_cast<std::uint32_t>(oz::ObjectType::Baton), 0);
+    oz::sys_baton_inject(cf_srv_baton, 50000);
+    oz::sys_tcb_bind_baton(cf_srv_tcb, cf_srv_baton);
+
+    // Server runs on own_baton, receives message (Matrix No. 1),
+    // borrows client's baton, fires client baton notification, and yields own_baton BLOCKED!
+    oz::SchedResult s_res = oz::sys_baton_switch(cf_srv_baton);
+    bool srv_yielded_blocked = (s_res.reason == oz::SchedReason::BLOCKED);
+
+    // Check client baton notification fired
+    std::uint64_t cli_notif_val = 0;
+    bool cli_notified = (oz::sys_notification_poll(cf_cli_notif, &cli_notif_val) == 0 && cli_notif_val == BADGE_CF_CLI);
+
+    // Sched dispatches client baton (now driving server)
+    oz::sys_baton_inject(cf_cli_baton, 100000);
+    oz::SchedResult c_res2 = oz::sys_baton_switch(cf_cli_baton);
+    // Server completes, direct switches to client, client gets reply and exits!
+    bool cli_completed = ((c_res2.reason == oz::SchedReason::EXIT || c_res2.reason == oz::SchedReason::ORPHANED) &&
+                          g_call_first_cli_ok && g_call_first_srv_ran);
+
+    bool test9_ok = (cli_blocked && srv_yielded_blocked && cli_notified && cli_completed);
+    TEST_REPORT("KTEST", "Call-first receive: own_baton yield & client baton dispatch (Matrix No. 1)", test9_ok);
+
+    oz::sys_cap_delete(cf_s);
+    oz::sys_cap_delete(cf_c);
+    oz::sys_cap_delete(cf_cli_tcb);
+    oz::sys_cap_delete(cf_cli_baton);
+    oz::sys_cap_delete(cf_cli_notif);
+    oz::sys_cap_delete(cf_srv_tcb);
+    oz::sys_cap_delete(cf_srv_baton);
+}
+
+// =============================================================================
+// 4. Hierarchical Cartesian Scheduling Tests
+// =============================================================================
+static void run_hierarchical_cartesian_scheduling_tests() {
+    oz::sys_debug_print("\n\r--- 4. Hierarchical Cartesian Scheduling Tests ---\n\r");
+
+    // 1. Explicit quantum specification on sys_baton_switch(baton, quantum)
+    std::uint32_t ex_tcb = oz::sys_untyped_retype(oz::CAP_UNTYPED, static_cast<std::uint32_t>(oz::ObjectType::TCB), 0);
+    std::uint32_t ex_stack = oz::sys_frame_alloc(oz::CAP_UNTYPED, 4);
+    std::uint64_t ex_stack_top = 0x7000d0000000ULL + 16384;
+    oz::sys_vspace_map_with_pagetables(oz::CAP_SELF_VSPACE, oz::CAP_UNTYPED, ex_stack, 0x7000d0000000ULL, 0x03, 16384);
+    oz::sys_tcb_configure(ex_tcb, oz::CAP_SELF_CSPACE, oz::CAP_SELF_VSPACE,
+                          reinterpret_cast<std::uint64_t>(test_h_explicit_worker), ex_stack_top);
+    std::uint32_t ex_baton = oz::sys_untyped_retype(oz::CAP_UNTYPED, static_cast<std::uint32_t>(oz::ObjectType::Baton), 0);
+    oz::sys_tcb_bind_baton(ex_tcb, ex_baton);
+
+    g_h_explicit_counter = 0;
+    // Note: No sys_baton_inject! Direct switch with explicit quantum 50000 us
+    oz::SchedResult res = oz::sys_baton_switch(ex_baton, 50000);
+    bool step1_ok = (g_h_explicit_counter == 1 && res.reason == oz::SchedReason::YIELD);
+
+    // Resume to complete
+    res = oz::sys_baton_switch(ex_baton);
+    bool step2_ok = (g_h_explicit_counter == 2 && (res.reason == oz::SchedReason::EXIT || res.reason == oz::SchedReason::ORPHANED));
+    TEST_REPORT("KTEST", "Explicit quantum switch & cooperative yield", step1_ok && step2_ok);
+
+    oz::sys_cap_delete(ex_tcb);
+    oz::sys_cap_delete(ex_baton);
+
+    // 2. Deadlock prevention on WAIT_RETURN (SYS_ERR_DEADLK)
+    std::uint32_t p_tcb = oz::sys_untyped_retype(oz::CAP_UNTYPED, static_cast<std::uint32_t>(oz::ObjectType::TCB), 0);
+    std::uint32_t p_stack = oz::sys_frame_alloc(oz::CAP_UNTYPED, 4);
+    std::uint64_t p_stack_top = 0x7000dc000000ULL + 16384;
+    oz::sys_vspace_map_with_pagetables(oz::CAP_SELF_VSPACE, oz::CAP_UNTYPED, p_stack, 0x7000dc000000ULL, 0x03, 16384);
+    oz::sys_tcb_configure(p_tcb, oz::CAP_SELF_CSPACE, oz::CAP_SELF_VSPACE,
+                          reinterpret_cast<std::uint64_t>(test_h_deadlock_parent), p_stack_top);
+    g_h_parent_baton = oz::sys_untyped_retype(oz::CAP_UNTYPED, static_cast<std::uint32_t>(oz::ObjectType::Baton), 0);
+    oz::sys_tcb_bind_baton(p_tcb, g_h_parent_baton);
+
+    g_h_deadlock_res = 0;
+    res = oz::sys_baton_switch(g_h_parent_baton, 100000);
+    bool deadlk_ok = (g_h_deadlock_res == oz::SYS_ERR_DEADLK);
+    TEST_REPORT("KTEST", "Deadlock loop prevention on WAIT_RETURN (SYS_ERR_DEADLK)", deadlk_ok);
+
+    oz::sys_cap_delete(p_tcb);
+    oz::sys_cap_delete(g_h_parent_baton);
+
+    // 3. Hierarchical Upper Timeout & Direct Forwarding
+    std::uint32_t w_tcb = oz::sys_untyped_retype(oz::CAP_UNTYPED, static_cast<std::uint32_t>(oz::ObjectType::TCB), 0);
+    std::uint32_t w_stack = oz::sys_frame_alloc(oz::CAP_UNTYPED, 4);
+    std::uint64_t w_stack_top = 0x7000e8000000ULL + 16384;
+    oz::sys_vspace_map_with_pagetables(oz::CAP_SELF_VSPACE, oz::CAP_UNTYPED, w_stack, 0x7000e8000000ULL, 0x03, 16384);
+    oz::sys_tcb_configure(w_tcb, oz::CAP_SELF_CSPACE, oz::CAP_SELF_VSPACE,
+                          reinterpret_cast<std::uint64_t>(test_h_worker_thread), w_stack_top);
+    g_h_worker_baton = oz::sys_untyped_retype(oz::CAP_UNTYPED, static_cast<std::uint32_t>(oz::ObjectType::Baton), 0);
+    oz::sys_tcb_bind_baton(w_tcb, g_h_worker_baton);
+
+    std::uint32_t sub_tcb = oz::sys_untyped_retype(oz::CAP_UNTYPED, static_cast<std::uint32_t>(oz::ObjectType::TCB), 0);
+    std::uint32_t sub_stack = oz::sys_frame_alloc(oz::CAP_UNTYPED, 4);
+    std::uint64_t sub_stack_top = 0x7000e0000000ULL + 16384;
+    oz::sys_vspace_map_with_pagetables(oz::CAP_SELF_VSPACE, oz::CAP_UNTYPED, sub_stack, 0x7000e0000000ULL, 0x03, 16384);
+    oz::sys_tcb_configure(sub_tcb, oz::CAP_SELF_CSPACE, oz::CAP_SELF_VSPACE,
+                          reinterpret_cast<std::uint64_t>(test_h_subsched_thread), sub_stack_top);
+    std::uint32_t sub_baton = oz::sys_untyped_retype(oz::CAP_UNTYPED, static_cast<std::uint32_t>(oz::ObjectType::Baton), 0);
+    oz::sys_tcb_bind_baton(sub_tcb, sub_baton);
+
+    g_h_worker_started = false;
+    g_h_timeout_occurred = false;
+    g_h_worker_resumed = false;
+    g_h_subsched_finished = false;
+
+    // Give sub-scheduler only 5000 us (5 ms). Worker has 200000 us (200 ms).
+    // Sub-scheduler should expire first -> Upper Timeout!
+    res = oz::sys_baton_switch(sub_baton, 5000);
+    bool upper_timeout_ok = (g_h_worker_started && !g_h_worker_resumed && res.reason == oz::SchedReason::TIMEOUT);
+    TEST_REPORT("KTEST", "Hierarchical Upper Timeout preemption (O(1) SplitAt)", upper_timeout_ok);
+
+    // Now resume continuation with 50000 us quantum -> Direct Forwarding to Worker!
+    g_h_timeout_occurred = true;
+    res = oz::sys_baton_switch(sub_baton, 50000);
+    bool direct_forward_ok = (g_h_worker_resumed && g_h_subsched_finished &&
+                              (res.reason == oz::SchedReason::EXIT || res.reason == oz::SchedReason::ORPHANED));
+    TEST_REPORT("KTEST", "Continuation resumption & Direct Forwarding (ZipMerge)", direct_forward_ok);
+
+    oz::sys_cap_delete(w_tcb);
+    oz::sys_cap_delete(g_h_worker_baton);
+    oz::sys_cap_delete(sub_tcb);
+    oz::sys_cap_delete(sub_baton);
+
+    // 4. Unhandled exception / crash safe unwinding (SchedReason::FAULT)
+    std::uint32_t cr_tcb = oz::sys_untyped_retype(oz::CAP_UNTYPED, static_cast<std::uint32_t>(oz::ObjectType::TCB), 0);
+    std::uint32_t cr_stack = oz::sys_frame_alloc(oz::CAP_UNTYPED, 4);
+    std::uint64_t cr_stack_top = 0x7000f0000000ULL + 16384;
+    oz::sys_vspace_map_with_pagetables(oz::CAP_SELF_VSPACE, oz::CAP_UNTYPED, cr_stack, 0x7000f0000000ULL, 0x03, 16384);
+    oz::sys_tcb_configure(cr_tcb, oz::CAP_SELF_CSPACE, oz::CAP_SELF_VSPACE,
+                          reinterpret_cast<std::uint64_t>(test_h_crash_worker), cr_stack_top);
+    std::uint32_t cr_baton = oz::sys_untyped_retype(oz::CAP_UNTYPED, static_cast<std::uint32_t>(oz::ObjectType::Baton), 0);
+    oz::sys_tcb_bind_baton(cr_tcb, cr_baton);
+
+    res = oz::sys_baton_switch(cr_baton, 50000);
+    bool fault_ok = (res.reason == oz::SchedReason::FAULT);
+    TEST_REPORT("KTEST", "Unhandled exception returns SchedReason::FAULT", fault_ok);
+
+    oz::sys_cap_delete(cr_tcb);
+    oz::sys_cap_delete(cr_baton);
 }
 
 } // namespace oz::ktest
@@ -485,6 +1225,8 @@ extern "C" void _start() {
 
     oz::ktest::run_capability_semantics_tests();
     oz::ktest::run_baton_scheduling_tests();
+    oz::ktest::run_dual_baton_nonblocking_ipc_tests();
+    oz::ktest::run_hierarchical_cartesian_scheduling_tests();
 
     oz::test::print_summary("KTEST");
     oz::test::exit_qemu();

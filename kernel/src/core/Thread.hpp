@@ -2,11 +2,14 @@
 #include <cstdint>
 #include "core/ExecutionContext.hpp"
 #include "core/Channel.hpp"
+#include "core/SavedInterruptFrame.hpp"
+#include "core/Baton.hpp"
 
 namespace oz {
 
 class ChannelEndpoint;
 class Notification;
+class IRQHandler;
 
 class Thread : public ExecutionContext {
 public:
@@ -32,12 +35,32 @@ public:
     Notification* sched_notif{nullptr};
     std::uint64_t sched_badge{0};
 
+    // --- 割り込みハンドラ情報 ---
+    IRQHandler* bound_irq_handler{nullptr};    // バインドされている IRQHandler (任意)
+    Notification* bound_notification{nullptr}; // タイムアウト等を受け取る通知先
+    SavedInterruptFrame saved_frame{};          // 割り込み時の被プリエンプト退避フレーム
+    Thread* next_nested_irq{nullptr};           // ネスト割り込み時のスタックリンク
+
+    // Baton Scheduling Context (Dual Baton Model)
+    Baton* own_baton{nullptr};          // スレッド固有のバトン (sys_tcb_bind_baton で設定)
+    Baton* borrowed_baton{nullptr};     // sys_call またはハードウェアIRQから借用したバトン
+
+    Thread* reply_target{nullptr};      // 返信先スレッド (borrowed_baton の持主)
+    Thread* pending_server{nullptr};    // 自身が sys_call 待機している相手サーバー
+
+    // 現在ディスパッチされているアクティブバトン
+    Baton* get_active_baton() const {
+        return borrowed_baton ? borrowed_baton : own_baton;
+    }
+
+    inline bool is_irq_handling() const {
+        return borrowed_baton && borrowed_baton->is_irq_baton;
+    }
+
     // User-space scheduling and cancellation support
     ChannelEndpoint* blocking_ep{nullptr};
     bool ipc_cancelled{false};
     std::uint64_t current_reply_token{0};
-
-    bool is_irq_handler{false}; // 後方互換用（InterruptThread 移行）
 
     bool cancel_ipc();
 
@@ -45,7 +68,7 @@ public:
            PhysicalAddress<PageTable> pml4_phys = PhysicalAddressProvider::nullPhysicalAddress<PageTable>());
     ~Thread() override;
 
-    bool isInterruptThread() const override { return is_irq_handler; }
+    bool isInterruptThread() const override { return false; }
 };
 
 void register_thread(Thread* t);

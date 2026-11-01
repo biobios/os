@@ -14,7 +14,8 @@ enum class CapRights : std::uint32_t {
     GRANT     = 1 << 3,
     DUPLICATE = 1 << 4,
     ONCE      = 1 << 5,
-    ALL       = (1 << 0) | (1 << 1) | (1 << 2) | (1 << 3) | (1 << 4)
+    USE       = 1 << 6,
+    ALL       = (1 << 0) | (1 << 1) | (1 << 2) | (1 << 3) | (1 << 4) | (1 << 6)
 };
 
 inline CapRights operator|(CapRights a, CapRights b) {
@@ -47,7 +48,7 @@ enum class ObjectType : std::uint8_t {
     PageTable,
     Notification,
     Baton,
-    InterruptThread,
+    IRQBatonControl,
 };
 
 struct Capability;
@@ -130,6 +131,7 @@ public:
     void attachCapability(Capability* cap);
     void detachCapability(Capability* cap);
     void invalidateAllCapabilities();
+    void invalidateOtherCapabilities(Capability* keep_cap);
 
     void add_ref() { ref_count++; }
 
@@ -155,13 +157,14 @@ public:
 struct Capability {
     KernelObject* object{nullptr};
     CapRights rights{CapRights::NONE};
+    std::uint64_t badge{0};
     Capability* next_cap_{nullptr};
     Capability* prev_cap_{nullptr};
 
-    Capability() : object(nullptr), rights(CapRights::NONE), next_cap_(nullptr), prev_cap_(nullptr) {}
+    Capability() : object(nullptr), rights(CapRights::NONE), badge(0), next_cap_(nullptr), prev_cap_(nullptr) {}
 
-    Capability(KernelObject* obj, CapRights r)
-        : object(obj), rights(r), next_cap_(nullptr), prev_cap_(nullptr) {
+    Capability(KernelObject* obj, CapRights r, std::uint64_t b = 0)
+        : object(obj), rights(r), badge(b), next_cap_(nullptr), prev_cap_(nullptr) {
         if (object) {
             object->add_ref();
             object->attachCapability(this);
@@ -170,7 +173,7 @@ struct Capability {
 
     // Copy constructor
     Capability(const Capability& other)
-        : object(other.object), rights(other.rights), next_cap_(nullptr), prev_cap_(nullptr) {
+        : object(other.object), rights(other.rights), badge(other.badge), next_cap_(nullptr), prev_cap_(nullptr) {
         if (object) {
             object->add_ref();
             object->attachCapability(this);
@@ -179,13 +182,14 @@ struct Capability {
 
     // Move constructor
     Capability(Capability&& other) noexcept
-        : object(other.object), rights(other.rights), next_cap_(nullptr), prev_cap_(nullptr) {
+        : object(other.object), rights(other.rights), badge(other.badge), next_cap_(nullptr), prev_cap_(nullptr) {
         if (object) {
             other.object->detachCapability(&other);
             object->attachCapability(this);
         }
         other.object = nullptr;
         other.rights = CapRights::NONE;
+        other.badge = 0;
         other.next_cap_ = nullptr;
         other.prev_cap_ = nullptr;
     }
@@ -199,6 +203,7 @@ struct Capability {
             }
             object = other.object;
             rights = other.rights;
+            badge = other.badge;
             next_cap_ = nullptr;
             prev_cap_ = nullptr;
             if (object) {
@@ -218,6 +223,7 @@ struct Capability {
             }
             object = other.object;
             rights = other.rights;
+            badge = other.badge;
             next_cap_ = nullptr;
             prev_cap_ = nullptr;
             if (object) {
@@ -226,6 +232,7 @@ struct Capability {
             }
             other.object = nullptr;
             other.rights = CapRights::NONE;
+            other.badge = 0;
             other.next_cap_ = nullptr;
             other.prev_cap_ = nullptr;
         }
@@ -290,6 +297,7 @@ inline void KernelObject::invalidateAllCapabilities() {
         Capability* next = curr->next_cap_;
         curr->object = nullptr;
         curr->rights = CapRights::NONE;
+        curr->badge = 0;
         curr->next_cap_ = nullptr;
         curr->prev_cap_ = nullptr;
         revoked_refs++;
@@ -297,6 +305,21 @@ inline void KernelObject::invalidateAllCapabilities() {
     }
     for (std::size_t i = 0; i < revoked_refs; ++i) {
         this->release();
+    }
+}
+
+inline void KernelObject::invalidateOtherCapabilities(Capability* keep_cap) {
+    Capability* curr = cap_list_head_;
+    while (curr) {
+        Capability* next = curr->next_cap_;
+        if (curr != keep_cap) {
+            detachCapability(curr);
+            curr->object = nullptr;
+            curr->rights = CapRights::NONE;
+            curr->badge = 0;
+            this->release();
+        }
+        curr = next;
     }
 }
 
@@ -328,6 +351,14 @@ public:
             return slots[id];
         }
         return Capability();
+    }
+
+    bool revoke(CapID id) {
+        if (id < MAX_CAPS && slots[id].is_valid()) {
+            slots[id].object->invalidateOtherCapabilities(&slots[id]);
+            return true;
+        }
+        return false;
     }
 
     bool insert(CapID id, const Capability& cap) {

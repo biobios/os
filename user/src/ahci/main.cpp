@@ -15,6 +15,15 @@ OZ_MANIFEST((oz::ProcessManifest{
     .default_data_dir = {}
 }));
 
+static void to_hex_str(std::uint64_t val, char* out) {
+    const char* hex = "0123456789ABCDEF";
+    for (int i = 15; i >= 0; --i) {
+        out[i] = hex[val & 0xF];
+        val >>= 4;
+    }
+    out[16] = '\0';
+}
+
 OZ_PROCESS_ENTRY() {
     oz::LocalNamespace::init(info);
     oz::sys_write("AHCI Server started!\n\r");
@@ -26,19 +35,46 @@ OZ_PROCESS_ENTRY() {
     oz::ReplyToken init_tok = oz::INVALID_REPLY_TOKEN;
     oz::IPCMessage init_ack{};
 
+    std::uint64_t reconnect_token = 0;
+    std::uint16_t instance_id = 0;
+
     if (drivman_cap != 0) {
-        // Broker model: request AHCI MMIO from DrivMan
-        oz::IPCMessage req{};
-        req.data[0] = static_cast<std::uint64_t>(oz::ipc::DrivCmd::GET_DEVICE_CAP);
-        const char* dname = "ahci";
-        for (int i = 0; i < 4; ++i) reinterpret_cast<char*>(&req.data[1])[i] = dname[i];
-        oz::IPCMessage resp{};
-        if (oz::sys_call(drivman_cap, &req, &resp) && resp.data[0] == 0 && resp.has_cap) {
-            mmio_cap = resp.transferred_cap;
-            oz::sys_write("[AHCI] Obtained MMIO frame from DrivMan.\n\r");
+        // Phase 2: Driver Session Handshake
+        oz::IPCMessage sess_req{};
+        sess_req.data[0] = static_cast<std::uint64_t>(oz::ipc::DrivCmd::INIT_DEVICE_SESSION);
+        oz::IPCMessage sess_resp{};
+        if (oz::sys_call(drivman_cap, &sess_req, &sess_resp) && sess_resp.data[0] == 0) {
+            instance_id = static_cast<std::uint16_t>((sess_resp.data[1] >> 16) & 0xFFFF);
+            reconnect_token = sess_resp.data[3];
+            oz::sys_write("[AHCI] Initialized device session with DrivMan.\n\r");
+
+            // Request MMIO resource (res_type = 1, res_idx = 0)
+            oz::IPCMessage res_req{};
+            res_req.data[0] = static_cast<std::uint64_t>(oz::ipc::DrivCmd::GET_DEVICE_RESOURCE);
+            res_req.data[1] = 1; // MMIO_BAR
+            res_req.data[2] = 0; // ABAR
+            oz::IPCMessage res_resp{};
+            if (oz::sys_call(drivman_cap, &res_req, &res_resp) && res_resp.data[0] == 0 && res_resp.has_cap) {
+                mmio_cap = res_resp.transferred_cap;
+                oz::sys_write("[AHCI] Obtained ABAR MMIO frame from DrivMan.\n\r");
+            } else {
+                oz::sys_write("[AHCI] Failed to obtain ABAR MMIO from DrivMan!\n\r");
+                oz::sys_exit(1);
+            }
         } else {
-            oz::sys_write("[AHCI] Failed to obtain MMIO from DrivMan!\n\r");
-            oz::sys_exit(1);
+            // Fallback to legacy GET_DEVICE_CAP
+            oz::IPCMessage req{};
+            req.data[0] = static_cast<std::uint64_t>(oz::ipc::DrivCmd::GET_DEVICE_CAP);
+            const char* dname = "ahci";
+            for (int i = 0; i < 4; ++i) reinterpret_cast<char*>(&req.data[1])[i] = dname[i];
+            oz::IPCMessage resp{};
+            if (oz::sys_call(drivman_cap, &req, &resp) && resp.data[0] == 0 && resp.has_cap) {
+                mmio_cap = resp.transferred_cap;
+                oz::sys_write("[AHCI] Obtained MMIO frame from DrivMan (legacy).\n\r");
+            } else {
+                oz::sys_write("[AHCI] Failed to obtain MMIO from DrivMan!\n\r");
+                oz::sys_exit(1);
+            }
         }
     } else {
         // Standalone test fallback: wait for start signal from init
@@ -104,6 +140,8 @@ OZ_PROCESS_ENTRY() {
             reg_req.data[0] = static_cast<std::uint64_t>(oz::ipc::VfsCmd::REGISTER_BLOCK_DEV);
             const char* sname = "sata0";
             for (int i = 0; i < 5; ++i) reinterpret_cast<char*>(&reg_req.data[1])[i] = sname[i];
+            reg_req.data[2] = dev ? dev->getSectorSize() : 512;
+            reg_req.data[3] = reconnect_token;
             reg_req.has_cap = true;
             reg_req.transferred_cap = blk_send;
             oz::IPCMessage reg_resp{};
@@ -111,6 +149,13 @@ OZ_PROCESS_ENTRY() {
                 oz::sys_write("[AHCI] Registered block device 'sata0' with VFS.\n\r");
             } else {
                 oz::sys_write("[AHCI] WARNING: REGISTER_BLOCK_DEV returned non-zero.\n\r");
+            }
+
+            if (drivman_cap != 0) {
+                oz::IPCMessage on_req{};
+                on_req.data[0] = static_cast<std::uint64_t>(oz::ipc::DrivCmd::NOTIFY_DEVICE_ONLINE);
+                oz::IPCMessage on_resp{};
+                oz::sys_call(drivman_cap, &on_req, &on_resp);
             }
         }
     }

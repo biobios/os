@@ -262,8 +262,8 @@ static void sched_ipc_worker() {
                     g_irq_handlers[h_idx].badge = badge;
                     g_irq_handlers[h_idx].consecutive_timeouts = 0;
 
-                    // Bind Root Notification and badge to baton for exhaustion notification
-                    oz::sys_baton_bind_notification(baton, CAP_SCHED_NOTIF, badge);
+                    // Bind Root Notification and badge to thread for exhaustion notification
+                    oz::sys_thread_set_notification(req.transferred_cap, CAP_SCHED_NOTIF, badge);
                 }
 
                 int inj_res = oz::sys_baton_inject(baton, budget_us);
@@ -286,7 +286,7 @@ static void process_woken_mask(std::uint64_t woken_mask) {
         if (g_irq_handlers[i].in_use && (woken_mask & g_irq_handlers[i].badge)) {
             woken_mask &= ~g_irq_handlers[i].badge;
 
-            oz::sys_debug_print("[Sched] IRQ Handler budget exhausted. Replenishing budget...\n\r");
+            oz::sys_debug_print("[Sched] IRQ Handler budget exhausted. Resuming handler on own_baton...\n\r");
             oz::sys_baton_inject(g_irq_handlers[i].baton_cap, g_irq_handlers[i].budget_us);
 
             // Resume interrupted IRQ handler from its interrupted rip
@@ -350,7 +350,7 @@ OZ_PROCESS_ENTRY() {
                 std::uint32_t baton = alloc_baton();
                 if (baton != oz::INVALID_CAP_ID) {
                     oz::sys_tcb_bind_baton(cap.slot, baton);
-                    add_baton(baton, 1, 10000, cap.slot);
+                    add_baton(baton, 1, 50000, cap.slot);
                     oz::sys_tcb_resume(cap.slot);
                     oz::sys_debug_print("[Sched] Pre-wired Core 5 TCB registered: ");
                     oz::sys_debug_print(cap.name);
@@ -374,7 +374,7 @@ OZ_PROCESS_ENTRY() {
     oz::sys_tcb_bind_baton(worker_tcb, worker_baton);
     oz::sys_baton_inject(worker_baton, 10000);
     oz::SchedResult w_res = oz::sys_baton_switch(worker_baton);
-    if (w_res.reason == oz::SchedReason::ORPHANED) {
+    if (w_res.reason == oz::SchedReason::ORPHANED || w_res.reason == oz::SchedReason::BLOCKED) {
         oz::sys_debug_print("[Sched] IPC worker initialized and passive.\n\r");
     }
     free_baton(worker_baton);
