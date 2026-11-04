@@ -1,15 +1,37 @@
 #include "core/Notification.hpp"
 #include "core/Thread.hpp"
 #include "core/Baton.hpp"
+#include "core/Channel.hpp"
+#include "core/IRQHandler.hpp"
 
 namespace oz {
 
 extern void (*g_unblock_thread_func)(Thread*);
 
+static Notification* s_notification_list_head = nullptr;
+
 Notification::Notification(bool untyped)
-    : KernelObject(ObjectType::Notification, untyped) {}
+    : KernelObject(ObjectType::Notification, untyped) {
+    reg_prev_ = nullptr;
+    reg_next_ = s_notification_list_head;
+    if (s_notification_list_head) {
+        s_notification_list_head->reg_prev_ = this;
+    }
+    s_notification_list_head = this;
+}
 
 Notification::~Notification() {
+    if (reg_prev_) {
+        reg_prev_->reg_next_ = reg_next_;
+    } else if (s_notification_list_head == this) {
+        s_notification_list_head = reg_next_;
+    }
+    if (reg_next_) {
+        reg_next_->reg_prev_ = reg_prev_;
+    }
+    reg_prev_ = nullptr;
+    reg_next_ = nullptr;
+
     teardown();
     last_waiter_ = nullptr;
     // Wake up all waiters on destruction
@@ -17,6 +39,40 @@ Notification::~Notification() {
         t->state = ThreadState::Ready;
         if (g_unblock_thread_func) {
             g_unblock_thread_func(t);
+        }
+    }
+
+    // 逆引き強制アンバインド
+    for_each_registered_thread([this](Thread* t) {
+        if (!t) return;
+        if (t->exit_notif == this) {
+            t->exit_notif = nullptr;
+            t->exit_badge = 0;
+        }
+        if (t->sched_notif == this) {
+            t->sched_notif = nullptr;
+            t->sched_badge = 0;
+        }
+        if (t->bound_notification == this) {
+            t->bound_notification = nullptr;
+        }
+        if (t->own_baton && t->own_baton->bound_notif == this) {
+            t->own_baton->bound_notif = nullptr;
+            t->own_baton->bound_badge = 0;
+        }
+        if (t->borrowed_baton && t->borrowed_baton->bound_notif == this) {
+            t->borrowed_baton->bound_notif = nullptr;
+            t->borrowed_baton->bound_badge = 0;
+        }
+    });
+
+    unbind_notification_from_all_channels(this);
+    unbind_notification_from_all_batons(this);
+
+    for (std::size_t i = 0; i < 256; ++i) {
+        if (g_irq_handlers[i].notif_ == this) {
+            g_irq_handlers[i].notif_ = nullptr;
+            g_irq_handlers[i].badge_ = 0;
         }
     }
 }
@@ -197,6 +253,40 @@ Thread* Notification::pop_waiter() {
     if (!waiter_head_) waiter_tail_ = nullptr;
     t->next_waiter = nullptr;
     return t;
+}
+
+bool Notification::remove_waiter(Thread* t) {
+    if (!t) return false;
+    if (last_waiter_ == t) {
+        last_waiter_ = nullptr;
+    }
+    if (!waiter_head_) return false;
+    if (waiter_head_ == t) {
+        waiter_head_ = t->next_waiter;
+        if (!waiter_head_) waiter_tail_ = nullptr;
+        t->next_waiter = nullptr;
+        return true;
+    }
+    Thread* curr = waiter_head_;
+    while (curr->next_waiter && curr->next_waiter != t) {
+        curr = curr->next_waiter;
+    }
+    if (curr->next_waiter == t) {
+        curr->next_waiter = t->next_waiter;
+        if (waiter_tail_ == t) {
+            waiter_tail_ = curr;
+        }
+        t->next_waiter = nullptr;
+        return true;
+    }
+    return false;
+}
+
+void remove_thread_from_all_notifications(Thread* t) {
+    if (!t) return;
+    for (Notification* n = s_notification_list_head; n != nullptr; n = n->reg_next_) {
+        n->remove_waiter(t);
+    }
 }
 
 } // namespace oz

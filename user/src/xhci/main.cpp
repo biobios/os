@@ -124,7 +124,7 @@ OZ_PROCESS_ENTRY() {
             res_req.data[1] = 1; // MMIO_BAR
             res_req.data[2] = 0; // BAR 0
             oz::IPCMessage res_resp{};
-            if (oz::sys_call(drivman_cap, &res_req, &res_resp) && res_resp.data[0] == 0 && res_resp.has_cap) {
+            if (oz::sys_call_recv_cap(drivman_cap, &res_req, &res_resp) && res_resp.data[0] == 0 && res_resp.has_cap) {
                 mmio_cap = res_resp.transferred_cap;
                 oz::sys_debug_print("[xHCI] Obtained MMIO frame cap from DrivMan.\n\r");
             } else {
@@ -142,7 +142,7 @@ OZ_PROCESS_ENTRY() {
             irq_req.has_cap = true;
             irq_req.transferred_cap = irq_send;
             oz::IPCMessage irq_resp{};
-            if (oz::sys_call(drivman_cap, &irq_req, &irq_resp) && irq_resp.data[0] == 0 && irq_resp.has_cap) {
+            if (oz::sys_call_recv_cap(drivman_cap, &irq_req, &irq_resp) && irq_resp.data[0] == 0 && irq_resp.has_cap) {
                 g_irq_handler_cap = irq_resp.transferred_cap;
                 oz::sys_debug_print("[xHCI] Obtained IRQ Handler cap from DrivMan.\n\r");
             } else {

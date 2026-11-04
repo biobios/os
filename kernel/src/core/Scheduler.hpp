@@ -18,6 +18,8 @@ void dprint_dec(std::uint64_t);
 
 namespace oz {
 
+PageTable* getMasterPML4();
+
 class Scheduler {
 public:
 
@@ -291,11 +293,15 @@ public:
         // Restore the user RSP for the next thread
         g_syscall_context.user_rsp = next_thread->syscall_user_rsp;
         
-        if (next_thread->pml4_phys.get() != 0) {
+        std::uint64_t target_cr3 = next_thread->pml4_phys.get();
+        if (target_cr3 == 0 && getMasterPML4()) {
+            target_cr3 = reinterpret_cast<std::uintptr_t>(getMasterPML4()) - oz::KERNEL_VIRT_OFFSET;
+        }
+        if (target_cr3 != 0) {
             std::uint64_t current_cr3;
             __asm__ volatile("mov %%cr3, %0" : "=r"(current_cr3));
-            if (current_cr3 != static_cast<std::uint64_t>(next_thread->pml4_phys.get())) {
-                __asm__ volatile("mov %0, %%cr3" :: "r"(static_cast<std::uint64_t>(next_thread->pml4_phys.get())));
+            if ((current_cr3 & ~0xFFFULL) != (target_cr3 & ~0xFFFULL)) {
+                __asm__ volatile("mov %0, %%cr3" :: "r"(target_cr3) : "memory");
             }
         }
         
@@ -307,6 +313,46 @@ public:
             void* dummy_rsp;
             switch_context(&dummy_rsp, next_thread->rsp);
         }
+    }
+
+    [[noreturn]] void abandonCurrentContextTo(ExecutionContext* next_thread, std::uint64_t now) {
+        if (!next_thread || next_thread->is_dead) {
+            next_thread = main_thread;
+        }
+
+        next_thread->state = ThreadState::Running;
+        next_thread->last_switched_in = now;
+        current_thread = next_thread;
+
+        if (next_thread->gs_base != 0 || next_thread->kernel_gs_base != 0) {
+            oz::x86_64::writeMSR(0xC0000101, next_thread->gs_base);
+            oz::x86_64::writeMSR(0xC0000102, next_thread->kernel_gs_base);
+        }
+
+        std::uint64_t kernel_stack_top = reinterpret_cast<std::uint64_t>(next_thread->stack_base) + next_thread->stack_size;
+        setSyscallKernelStack(kernel_stack_top);
+        x86_64::setKernelStack(kernel_stack_top);
+        g_syscall_context.user_rsp = next_thread->syscall_user_rsp;
+
+        std::uint64_t target_cr3 = next_thread->pml4_phys.get();
+        if (target_cr3 == 0 && getMasterPML4()) {
+            target_cr3 = reinterpret_cast<std::uintptr_t>(getMasterPML4()) - oz::KERNEL_VIRT_OFFSET;
+        }
+        if (target_cr3 != 0) {
+            std::uint64_t current_cr3;
+            __asm__ volatile("mov %%cr3, %0" : "=r"(current_cr3));
+            if ((current_cr3 & ~0xFFFULL) != (target_cr3 & ~0xFFFULL)) {
+                __asm__ volatile("mov %0, %%cr3" :: "r"(target_cr3) : "memory");
+            }
+        }
+
+        if (cartesian_root && !cartesian_root->is_infinite) {
+            oz::x86_64::setLAPICOneShot(cartesian_root->get_effective_remaining(), oz::x86_64::APIC_TIMER_VECTOR);
+        } else {
+            oz::x86_64::stopLAPICTimer();
+        }
+
+        load_context_noreturn(next_thread->rsp);
     }
 
     void performIRQSwitchTo(Thread* handler_thread, std::uint64_t now) {

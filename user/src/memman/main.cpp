@@ -25,10 +25,16 @@ extern "C" void _start() {
     oz::IPCMessage resp{};
     oz::IPCMessage req{};
 
+    std::uint32_t recv_slot = oz::g_slot_allocator.allocate_one();
+
     while (true) {
-        token = oz::sys_reply_recv(token, CAP_MEMMAN_RECV, (token != oz::INVALID_REPLY_TOKEN) ? &resp : nullptr, &req);
+        token = oz::sys_reply_recv(token, CAP_MEMMAN_RECV, (token != oz::INVALID_REPLY_TOKEN) ? &resp : nullptr, &req, recv_slot);
         if (token == oz::INVALID_REPLY_TOKEN) {
             continue;
+        }
+
+        if (req.has_cap) {
+            recv_slot = oz::g_slot_allocator.allocate_one();
         }
 
         auto cmd = static_cast<oz::ipc::MemCmd>(req.data[0]);

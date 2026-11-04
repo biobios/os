@@ -66,6 +66,17 @@ extern "C" void _start() {
         oz::sys_exit(1);
     }
 
+    // Retype 2MB for VFS (file system buffers and objects)
+    std::uint32_t vfs_untyped = oz::sys_untyped_retype(
+        oz::CAP_UNTYPED,
+        static_cast<std::uint32_t>(oz::ObjectType::UntypedMemory),
+        2 * 1024 * 1024
+    );
+    if (vfs_untyped == oz::INVALID_CAP_ID) {
+        oz::sys_debug_print("[Init] ERROR: Failed to slice VFS UntypedMemory!\n\r");
+        oz::sys_exit(1);
+    }
+
     // =========================================================================
     // Core 5 Component 1: MemMan (Memory Manager)
     // =========================================================================
@@ -85,15 +96,9 @@ extern "C" void _start() {
     std::uint32_t memman_reply_send = 0, memman_reply_recv = 0;
     oz::sys_channel_create(oz::CAP_UNTYPED, &memman_reply_send, &memman_reply_recv);
 
-    oz::sys_cspace_cap_insert(mem_proc.cspace_cap, 2, memman_req_recv, static_cast<std::uint32_t>(oz::CapRights::READ));
+    oz::sys_cspace_cap_insert(mem_proc.cspace_cap, 2, memman_req_recv, static_cast<std::uint32_t>(oz::CapRights::READ | oz::CapRights::GRANT_REPLY));
     oz::sys_cspace_cap_insert(mem_proc.cspace_cap, 3, memman_reply_send, static_cast<std::uint32_t>(oz::CapRights::WRITE | oz::CapRights::GRANT));
-    // Delegate primary UntypedMemory (Slot 240) to MemMan
-    oz::sys_cspace_cap_insert(mem_proc.cspace_cap, oz::CAP_UNTYPED, oz::CAP_UNTYPED, static_cast<std::uint32_t>(oz::CapRights::ALL));
-    // Delegate all remaining physical memory blocks (slots 200..) to MemMan
-    for (std::uint32_t i = 0; i < boot_info->untyped_cap_count && (200 + i) < 240; ++i) {
-        oz::sys_cspace_cap_insert(mem_proc.cspace_cap, 200 + i, 200 + i, static_cast<std::uint32_t>(oz::CapRights::ALL));
-    }
-    oz::sys_debug_print("[Init] MemMan configured.\n\r");
+    oz::sys_debug_print("[Init] MemMan pre-configured.\n\r");
 
     // =========================================================================
     // Core 5 Component 2: VFS (Virtual File System)
@@ -103,7 +108,9 @@ extern "C" void _start() {
         oz::sys_debug_print("[Init] ERROR: vfs not found in initrd!\n\r");
         oz::sys_exit(1);
     }
-    auto vfs_proc = oz::loader::spawn_process(oz::CAP_UNTYPED, oz::CAP_SELF_VSPACE, vfs_file.data, vfs_file.size);
+    oz::ProcessStartupInfo vfs_startup_info{};
+    vfs_startup_info.initrd_size = initrd_size;
+    auto vfs_proc = oz::loader::spawn_process(oz::CAP_UNTYPED, oz::CAP_SELF_VSPACE, vfs_file.data, vfs_file.size, &vfs_startup_info);
     if (!vfs_proc.success) {
         oz::sys_debug_print("[Init] ERROR: Failed to spawn vfs!\n\r");
         oz::sys_exit(1);
@@ -114,16 +121,16 @@ extern "C" void _start() {
     std::uint32_t vfs_procman_reply_send = 0, procman_vfs_reply_recv = 0;
     oz::sys_channel_create(oz::CAP_UNTYPED, &vfs_procman_reply_send, &procman_vfs_reply_recv);
 
-    // Shared buffers for Shell (Client 0) and ProcMan (Client 1)
-    std::uint32_t shell_client_frame = oz::sys_frame_alloc(oz::CAP_UNTYPED, 16);
-    std::uint32_t procman_client_frame = oz::sys_frame_alloc(oz::CAP_UNTYPED, 16);
+    // Shared buffers for Shell (Client 0) and ProcMan (Client 1) as shared Level 1 PageTable
+    std::uint32_t shell_client_pt_cap = oz::sys_alloc_shared_pt(oz::CAP_UNTYPED, 16, 0x01);
+    std::uint32_t procman_client_pt_cap = oz::sys_alloc_shared_pt(oz::CAP_UNTYPED, 16, 0x01);
 
-    oz::sys_cspace_cap_insert(vfs_proc.cspace_cap, 4, vfs_req_recv, static_cast<std::uint32_t>(oz::CapRights::READ));
+    oz::sys_cspace_cap_insert(vfs_proc.cspace_cap, 4, vfs_req_recv, static_cast<std::uint32_t>(oz::CapRights::READ | oz::CapRights::GRANT_REPLY));
     oz::sys_cspace_cap_insert(vfs_proc.cspace_cap, 6, vfs_procman_reply_send, static_cast<std::uint32_t>(oz::CapRights::WRITE | oz::CapRights::GRANT));
-    oz::sys_cspace_cap_insert(vfs_proc.cspace_cap, 231, shell_client_frame, static_cast<std::uint32_t>(oz::CapRights::ALL));
-    oz::sys_cspace_cap_insert(vfs_proc.cspace_cap, oz::CAP_UNTYPED, oz::CAP_UNTYPED, static_cast<std::uint32_t>(oz::CapRights::ALL));
+    oz::sys_cspace_cap_insert(vfs_proc.cspace_cap, 231, shell_client_pt_cap, static_cast<std::uint32_t>(oz::CapRights::ALL));
+    oz::sys_cspace_cap_move(vfs_proc.cspace_cap, oz::CAP_UNTYPED, vfs_untyped);
     oz::sys_cspace_cap_insert(vfs_proc.cspace_cap, oz::CAP_INITRD, oz::CAP_INITRD, static_cast<std::uint32_t>(oz::CapRights::ALL));
-    oz::sys_cspace_cap_insert(vfs_proc.cspace_cap, 245, procman_client_frame, static_cast<std::uint32_t>(oz::CapRights::ALL));
+    oz::sys_cspace_cap_insert(vfs_proc.cspace_cap, 232, procman_client_pt_cap, static_cast<std::uint32_t>(oz::CapRights::ALL));
     oz::sys_debug_print("[Init] VFS configured.\n\r");
 
     // =========================================================================
@@ -143,9 +150,9 @@ extern "C" void _start() {
     std::uint32_t drivman_send = 0, drivman_recv = 0;
     oz::sys_channel_create(oz::CAP_UNTYPED, &drivman_send, &drivman_recv);
 
-    oz::sys_cspace_cap_insert(drivman_proc.cspace_cap, 2, drivman_recv, static_cast<std::uint32_t>(oz::CapRights::READ));
+    oz::sys_cspace_cap_insert(drivman_proc.cspace_cap, 2, drivman_recv, static_cast<std::uint32_t>(oz::CapRights::READ | oz::CapRights::GRANT_REPLY));
     oz::sys_cspace_cap_insert(drivman_proc.cspace_cap, 3, drivman_send, static_cast<std::uint32_t>(oz::CapRights::ALL));
-    oz::sys_cspace_cap_insert(drivman_proc.cspace_cap, oz::CAP_UNTYPED, drivman_untyped, static_cast<std::uint32_t>(oz::CapRights::ALL));
+    oz::sys_cspace_cap_move(drivman_proc.cspace_cap, oz::CAP_UNTYPED, drivman_untyped);
     if (ahci_abar_phys != 0) {
         oz::sys_cspace_cap_insert(drivman_proc.cspace_cap, 241, oz::CAP_AHCI_MMIO, static_cast<std::uint32_t>(oz::CapRights::ALL));
     }
@@ -194,16 +201,16 @@ extern "C" void _start() {
     std::uint32_t procman_reply_send = 0, procman_reply_recv = 0;
     oz::sys_channel_create(oz::CAP_UNTYPED, &procman_reply_send, &procman_reply_recv);
 
-    oz::sys_cspace_cap_insert(procman_proc.cspace_cap, 2, procman_req_recv, static_cast<std::uint32_t>(oz::CapRights::READ));
+    oz::sys_cspace_cap_insert(procman_proc.cspace_cap, 2, procman_req_recv, static_cast<std::uint32_t>(oz::CapRights::READ | oz::CapRights::GRANT_REPLY));
     oz::sys_cspace_cap_insert(procman_proc.cspace_cap, 3, procman_reply_send, static_cast<std::uint32_t>(oz::CapRights::WRITE | oz::CapRights::GRANT));
     oz::sys_cspace_cap_insert(procman_proc.cspace_cap, 4, memman_req_send, static_cast<std::uint32_t>(oz::CapRights::WRITE | oz::CapRights::GRANT));
     oz::sys_cspace_cap_insert(procman_proc.cspace_cap, 5, memman_reply_recv, static_cast<std::uint32_t>(oz::CapRights::READ));
     oz::sys_cspace_cap_insert(procman_proc.cspace_cap, 6, vfs_req_send, static_cast<std::uint32_t>(oz::CapRights::ALL));
     oz::sys_cspace_cap_insert(procman_proc.cspace_cap, 7, procman_vfs_reply_recv, static_cast<std::uint32_t>(oz::CapRights::READ));
-    oz::sys_cspace_cap_insert(procman_proc.cspace_cap, 8, procman_client_frame, static_cast<std::uint32_t>(oz::CapRights::ALL));
+    oz::sys_cspace_cap_insert(procman_proc.cspace_cap, 8, procman_client_pt_cap, static_cast<std::uint32_t>(oz::CapRights::ALL));
     oz::sys_cspace_cap_insert(procman_proc.cspace_cap, 11, drivman_send, static_cast<std::uint32_t>(oz::CapRights::ALL));
     oz::sys_cspace_cap_insert(procman_proc.cspace_cap, 12, sched_send, static_cast<std::uint32_t>(oz::CapRights::ALL));
-    oz::sys_cspace_cap_insert(procman_proc.cspace_cap, 13, shell_client_frame, static_cast<std::uint32_t>(oz::CapRights::ALL));
+    oz::sys_cspace_cap_insert(procman_proc.cspace_cap, 13, shell_client_pt_cap, static_cast<std::uint32_t>(oz::CapRights::ALL));
     oz::sys_cspace_cap_insert(procman_proc.cspace_cap, oz::CAP_IRQ_CONTROL, oz::CAP_IRQ_CONTROL, static_cast<std::uint32_t>(oz::CapRights::ALL));
     oz::sys_cspace_cap_insert(drivman_proc.cspace_cap, 4, procman_req_send, static_cast<std::uint32_t>(oz::CapRights::ALL));
     oz::sys_cspace_cap_insert(drivman_proc.cspace_cap, 6, vfs_req_send, static_cast<std::uint32_t>(oz::CapRights::ALL));
@@ -219,10 +226,10 @@ extern "C" void _start() {
     }
 
     oz::ProcessStartupInfo sched_startup_info{};
-    sched_startup_info.add_cap(10, oz::CapRole::CUSTOM, "tcb:memman");
-    sched_startup_info.add_cap(11, oz::CapRole::CUSTOM, "tcb:vfs");
-    sched_startup_info.add_cap(12, oz::CapRole::CUSTOM, "tcb:drivman");
-    sched_startup_info.add_cap(13, oz::CapRole::CUSTOM, "tcb:procman");
+    std::uint32_t tcb_mem_slot = sched_startup_info.alloc_and_add_cap(oz::CapRole::CUSTOM, "tcb:memman");
+    std::uint32_t tcb_vfs_slot = sched_startup_info.alloc_and_add_cap(oz::CapRole::CUSTOM, "tcb:vfs");
+    std::uint32_t tcb_dm_slot  = sched_startup_info.alloc_and_add_cap(oz::CapRole::CUSTOM, "tcb:drivman");
+    std::uint32_t tcb_pm_slot  = sched_startup_info.alloc_and_add_cap(oz::CapRole::CUSTOM, "tcb:procman");
 
     auto sched_proc = oz::loader::spawn_process(
         oz::CAP_UNTYPED, oz::CAP_SELF_VSPACE,
@@ -233,15 +240,23 @@ extern "C" void _start() {
         oz::sys_exit(1);
     }
 
-    oz::sys_cspace_cap_insert(sched_proc.cspace_cap, 2, sched_recv, static_cast<std::uint32_t>(oz::CapRights::READ));
+    oz::sys_cspace_cap_insert(sched_proc.cspace_cap, 2, sched_recv, static_cast<std::uint32_t>(oz::CapRights::READ | oz::CapRights::GRANT_REPLY));
     oz::sys_cspace_cap_insert(sched_proc.cspace_cap, 3, sched_notif, static_cast<std::uint32_t>(oz::CapRights::ALL));
-    oz::sys_cspace_cap_insert(sched_proc.cspace_cap, 10, mem_proc.tcb_cap, static_cast<std::uint32_t>(oz::CapRights::ALL));
-    oz::sys_cspace_cap_insert(sched_proc.cspace_cap, 11, vfs_proc.tcb_cap, static_cast<std::uint32_t>(oz::CapRights::ALL));
-    oz::sys_cspace_cap_insert(sched_proc.cspace_cap, 12, drivman_proc.tcb_cap, static_cast<std::uint32_t>(oz::CapRights::ALL));
-    oz::sys_cspace_cap_insert(sched_proc.cspace_cap, 13, procman_proc.tcb_cap, static_cast<std::uint32_t>(oz::CapRights::ALL));
-    oz::sys_cspace_cap_insert(sched_proc.cspace_cap, oz::CAP_UNTYPED, sched_untyped, static_cast<std::uint32_t>(oz::CapRights::ALL));
+    oz::sys_cspace_cap_insert(sched_proc.cspace_cap, tcb_mem_slot, mem_proc.tcb_cap, static_cast<std::uint32_t>(oz::CapRights::ALL));
+    oz::sys_cspace_cap_insert(sched_proc.cspace_cap, tcb_vfs_slot, vfs_proc.tcb_cap, static_cast<std::uint32_t>(oz::CapRights::ALL));
+    oz::sys_cspace_cap_insert(sched_proc.cspace_cap, tcb_dm_slot, drivman_proc.tcb_cap, static_cast<std::uint32_t>(oz::CapRights::ALL));
+    oz::sys_cspace_cap_insert(sched_proc.cspace_cap, tcb_pm_slot, procman_proc.tcb_cap, static_cast<std::uint32_t>(oz::CapRights::ALL));
+    oz::sys_cspace_cap_move(sched_proc.cspace_cap, oz::CAP_UNTYPED, sched_untyped);
     oz::sys_cspace_cap_insert(sched_proc.cspace_cap, oz::CAP_IRQ_CONTROL, oz::CAP_IRQ_CONTROL, static_cast<std::uint32_t>(oz::CapRights::ALL));
     oz::sys_debug_print("[Init] Sched configured with pre-wired Core 5 TCBs.\n\r");
+
+    // Delegate remaining primary UntypedMemory (Slot 240) to MemMan
+    oz::sys_cspace_cap_move(mem_proc.cspace_cap, oz::CAP_UNTYPED, oz::CAP_UNTYPED);
+    // Delegate all remaining physical memory blocks (slots 200..) to MemMan
+    for (std::uint32_t i = 0; i < boot_info->untyped_cap_count && (200 + i) < 240; ++i) {
+        oz::sys_cspace_cap_move(mem_proc.cspace_cap, 200 + i, 200 + i);
+    }
+    oz::sys_debug_print("[Init] MemMan untyped memory delegated.\n\r");
 
     // =========================================================================
     // Handover & Early Retirement: Rebind-and-Switch to Sched

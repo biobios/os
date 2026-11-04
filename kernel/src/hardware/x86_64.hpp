@@ -32,6 +32,16 @@ inline std::uint64_t rdtsc() {
     return (static_cast<std::uint64_t>(high) << 32) | low;
 }
 
+inline std::uint64_t readCR3() {
+    std::uint64_t val;
+    __asm__ volatile("movq %%cr3, %0" : "=r"(val));
+    return val;
+}
+
+inline void writeCR3(std::uint64_t val) {
+    __asm__ volatile("movq %0, %%cr3" : : "r"(val) : "memory");
+}
+
 #pragma pack(push, 1)
 struct TaskStateSegment {
     std::uint32_t reserved1;

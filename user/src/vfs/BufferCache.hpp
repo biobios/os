@@ -7,7 +7,7 @@ namespace oz {
 
 constexpr std::size_t CACHE_BLOCK_SIZE = 4096; // 4KB page size
 constexpr std::size_t HASH_TABLE_SIZE = 256;
-constexpr std::size_t MAX_CACHE_BLOCKS = 1024; // 4MB cache
+constexpr std::size_t MAX_CACHE_BLOCKS = 64; // 256KB cache
 
 struct BufferHead {
     BlockDevice* device;

@@ -2,15 +2,16 @@
 #include "loader.hpp"
 #include "../common/test_harness.hpp"
 #include "../../src/common/ipc/Protocol.hpp"
+#include "../../src/common/ipc/StartupInfo.hpp"
 #include "../../src/common/utils/BootInfo.hpp"
 
 namespace oz::vtest {
 
 static constexpr std::uint64_t BOOTINFO_VADDR = 0x600000000000ULL;
 static constexpr std::uint64_t INITRD_VADDR   = 0x500000000000ULL;
-static constexpr std::uint32_t CAP_AHCI_SEND   = 2;
-static constexpr std::uint32_t CAP_VFS_SEND    = 3;
-static constexpr std::uint32_t CAP_VFS_RECV    = 4;
+static std::uint32_t CAP_AHCI_SEND   = 0;
+static std::uint32_t CAP_VFS_SEND    = 0;
+static std::uint32_t CAP_VFS_RECV    = 0;
 static constexpr std::uint64_t CLIENT_SHARED_BUF_VIRT = 0x300000000000ULL;
 static char* g_shared_buf = nullptr;
 
@@ -36,7 +37,7 @@ static VfsOpenAtResult vfs_openat(std::uint32_t dir_send_cap, std::uint32_t dir_
     dst[i] = '\0';
 
     oz::IPCMessage resp{};
-    if (!oz::sys_call(dir_send_cap, &req, &resp)) return res;
+    if (!oz::sys_call_recv_cap(dir_send_cap, &req, &resp)) return res;
 
     res.status = static_cast<oz::ipc::VfsStatus>(resp.data[0]);
     if (res.status == oz::ipc::VfsStatus::OK) {
@@ -168,7 +169,7 @@ extern "C" void _start() {
 
     std::uint32_t init_ahci_send = 0, ahci_init_recv = 0;
     oz::sys_channel_create(oz::CAP_UNTYPED, &init_ahci_send, &ahci_init_recv);
-    oz::sys_cspace_cap_insert(oz::CAP_SELF_CSPACE, oz::vtest::CAP_AHCI_SEND, init_ahci_send, static_cast<std::uint32_t>(oz::CapRights::WRITE | oz::CapRights::GRANT));
+    oz::vtest::CAP_AHCI_SEND = init_ahci_send;
 
     std::uint32_t vfs_ahci_send = 0, ahci_vfs_recv = 0;
     oz::sys_channel_create(oz::CAP_UNTYPED, &vfs_ahci_send, &ahci_vfs_recv);
@@ -176,17 +177,18 @@ extern "C" void _start() {
     std::uint32_t ahci_vfs_send = 0, vfs_ahci_recv = 0;
     oz::sys_channel_create(oz::CAP_UNTYPED, &ahci_vfs_send, &vfs_ahci_recv);
 
-    std::uint32_t shared_buf_frame = oz::sys_frame_alloc(oz::CAP_UNTYPED, 16);
+    std::uint32_t shared_buf_frame = oz::sys_alloc_shared_pt(oz::CAP_UNTYPED, 16, 0x01);
     std::uint32_t notif_ahci = oz::sys_notification_create(oz::CAP_UNTYPED);
     std::uint32_t notif_vfs = oz::sys_notification_create(oz::CAP_UNTYPED);
 
     oz::sys_cspace_cap_insert(ahci_proc.cspace_cap, 1, cons_send, static_cast<std::uint32_t>(oz::CapRights::WRITE | oz::CapRights::GRANT));
     oz::sys_cspace_cap_insert(ahci_proc.cspace_cap, 2, ahci_init_recv, static_cast<std::uint32_t>(oz::CapRights::READ));
-    oz::sys_cspace_cap_insert(ahci_proc.cspace_cap, 3, ahci_vfs_recv, static_cast<std::uint32_t>(oz::CapRights::READ));
+    oz::sys_cspace_cap_insert(ahci_proc.cspace_cap, 3, ahci_vfs_recv, static_cast<std::uint32_t>(oz::CapRights::READ | oz::CapRights::GRANT_REPLY));
     oz::sys_cspace_cap_insert(ahci_proc.cspace_cap, 4, ahci_vfs_send, static_cast<std::uint32_t>(oz::CapRights::WRITE | oz::CapRights::GRANT));
     oz::sys_cspace_cap_insert(ahci_proc.cspace_cap, 5, notif_ahci, static_cast<std::uint32_t>(oz::CapRights::ALL));
     oz::sys_cspace_cap_insert(ahci_proc.cspace_cap, 6, notif_vfs, static_cast<std::uint32_t>(oz::CapRights::WRITE | oz::CapRights::GRANT));
-    oz::sys_cspace_cap_insert(ahci_proc.cspace_cap, oz::CAP_UNTYPED, oz::CAP_UNTYPED, static_cast<std::uint32_t>(oz::CapRights::ALL));
+    std::uint32_t ahci_ut = oz::sys_untyped_retype(oz::CAP_UNTYPED, static_cast<std::uint32_t>(oz::ObjectType::UntypedMemory), 4 * 1024 * 1024);
+    oz::sys_cspace_cap_move(ahci_proc.cspace_cap, oz::CAP_UNTYPED, ahci_ut);
     if (ahci_abar_phys != 0) {
         oz::sys_cspace_cap_insert(ahci_proc.cspace_cap, 241, oz::CAP_AHCI_MMIO, static_cast<std::uint32_t>(oz::CapRights::ALL));
     }
@@ -207,7 +209,9 @@ extern "C" void _start() {
         oz::test::report("VTEST", "Find vfs in initrd", false);
         oz::test::exit_qemu();
     }
-    auto vfs_proc = oz::loader::spawn_process(oz::CAP_UNTYPED, oz::CAP_SELF_VSPACE, vfs_file.data, vfs_file.size);
+    oz::ProcessStartupInfo vfs_startup_info{};
+    vfs_startup_info.initrd_size = initrd_size;
+    auto vfs_proc = oz::loader::spawn_process(oz::CAP_UNTYPED, oz::CAP_SELF_VSPACE, vfs_file.data, vfs_file.size, &vfs_startup_info);
     if (!vfs_proc.success) {
         oz::test::report("VTEST", "Spawn vfs", false);
         oz::test::exit_qemu();
@@ -215,24 +219,24 @@ extern "C" void _start() {
 
     std::uint32_t vfs_req_send = 0, vfs_req_recv = 0;
     oz::sys_channel_create(oz::CAP_UNTYPED, &vfs_req_send, &vfs_req_recv);
+    oz::vtest::CAP_VFS_SEND = vfs_req_send;
 
     std::uint32_t vfs_init_reply_send = 0, init_reply_recv = 0;
     oz::sys_channel_create(oz::CAP_UNTYPED, &vfs_init_reply_send, &init_reply_recv);
-
-    oz::sys_cspace_cap_insert(oz::CAP_SELF_CSPACE, oz::vtest::CAP_VFS_SEND, vfs_req_send, static_cast<std::uint32_t>(oz::CapRights::WRITE | oz::CapRights::GRANT));
-    oz::sys_cspace_cap_insert(oz::CAP_SELF_CSPACE, oz::vtest::CAP_VFS_RECV, init_reply_recv, static_cast<std::uint32_t>(oz::CapRights::READ));
+    oz::vtest::CAP_VFS_RECV = init_reply_recv;
 
     oz::sys_cspace_cap_insert(vfs_proc.cspace_cap, 1, cons_send, static_cast<std::uint32_t>(oz::CapRights::WRITE | oz::CapRights::GRANT));
-    oz::sys_cspace_cap_insert(vfs_proc.cspace_cap, 4, vfs_req_recv, static_cast<std::uint32_t>(oz::CapRights::READ));
+    oz::sys_cspace_cap_insert(vfs_proc.cspace_cap, 4, vfs_req_recv, static_cast<std::uint32_t>(oz::CapRights::READ | oz::CapRights::GRANT_REPLY));
     oz::sys_cspace_cap_insert(vfs_proc.cspace_cap, 5, vfs_init_reply_send, static_cast<std::uint32_t>(oz::CapRights::WRITE | oz::CapRights::GRANT));
-    oz::sys_cspace_cap_insert(vfs_proc.cspace_cap, oz::CAP_UNTYPED, oz::CAP_UNTYPED, static_cast<std::uint32_t>(oz::CapRights::ALL));
+    std::uint32_t vfs_ut = oz::sys_untyped_retype(oz::CAP_UNTYPED, static_cast<std::uint32_t>(oz::ObjectType::UntypedMemory), 16 * 1024 * 1024);
+    oz::sys_cspace_cap_move(vfs_proc.cspace_cap, oz::CAP_UNTYPED, vfs_ut);
     oz::sys_cspace_cap_insert(vfs_proc.cspace_cap, oz::CAP_INITRD, oz::CAP_INITRD, static_cast<std::uint32_t>(oz::CapRights::ALL));
 
-    std::uint32_t init_client_frame = oz::sys_frame_alloc(oz::CAP_UNTYPED, 16);
+    std::uint32_t init_client_frame = oz::sys_alloc_shared_pt(oz::CAP_UNTYPED, 16, 0x01);
     oz::sys_cspace_cap_insert(vfs_proc.cspace_cap, 231, init_client_frame, static_cast<std::uint32_t>(oz::CapRights::ALL));
 
-    std::uint32_t dummy_procman_frame = oz::sys_frame_alloc(oz::CAP_UNTYPED, 16);
-    oz::sys_cspace_cap_insert(vfs_proc.cspace_cap, 245, dummy_procman_frame, static_cast<std::uint32_t>(oz::CapRights::ALL));
+    std::uint32_t dummy_procman_frame = oz::sys_alloc_shared_pt(oz::CAP_UNTYPED, 16, 0x01);
+    oz::sys_cspace_cap_insert(vfs_proc.cspace_cap, 232, dummy_procman_frame, static_cast<std::uint32_t>(oz::CapRights::ALL));
 
     oz::sys_vspace_map_with_pagetables(oz::CAP_SELF_VSPACE, oz::CAP_UNTYPED, init_client_frame,
                                        oz::vtest::CLIENT_SHARED_BUF_VIRT, 0x03, 64 * 1024);

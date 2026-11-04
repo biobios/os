@@ -86,6 +86,55 @@ public:
         return false;
     }
 
+    bool uninstallPageTable(std::uintptr_t virt_addr, std::uintptr_t expected_pt_phys, std::uint8_t level) {
+        if (!pml4_table) return false;
+
+        std::size_t pml4_idx = paging::pml4Index(virt_addr);
+        std::size_t pdpt_idx = paging::pdptIndex(virt_addr);
+        std::size_t pd_idx   = paging::pdIndex(virt_addr);
+
+        bool uninstalled = false;
+        if (level == 3) {
+            if (!(*pml4_table)[pml4_idx].isPresent()) return false;
+            if ((*pml4_table)[pml4_idx].getAddress() == expected_pt_phys) {
+                (*pml4_table)[pml4_idx].clear();
+                uninstalled = true;
+            }
+        } else if (level == 2) {
+            if (!(*pml4_table)[pml4_idx].isPresent()) return false;
+            PageTable* pdpt = phys_to_virt(createPhysicalAddress<PageTable>((*pml4_table)[pml4_idx].getAddress()));
+            if (!(*pdpt)[pdpt_idx].isPresent()) return false;
+            if ((*pdpt)[pdpt_idx].getAddress() == expected_pt_phys) {
+                (*pdpt)[pdpt_idx].clear();
+                uninstalled = true;
+            }
+        } else if (level == 1) {
+            if (!(*pml4_table)[pml4_idx].isPresent()) return false;
+            PageTable* pdpt = phys_to_virt(createPhysicalAddress<PageTable>((*pml4_table)[pml4_idx].getAddress()));
+            if (!(*pdpt)[pdpt_idx].isPresent()) return false;
+            PageTable* pd = phys_to_virt(createPhysicalAddress<PageTable>((*pdpt)[pdpt_idx].getAddress()));
+            if (!(*pd)[pd_idx].isPresent()) return false;
+            if ((*pd)[pd_idx].getAddress() == expected_pt_phys) {
+                (*pd)[pd_idx].clear();
+                uninstalled = true;
+            }
+        }
+        if (uninstalled) {
+            __asm__ volatile("invlpg (%0)" :: "r"(virt_addr) : "memory");
+            std::uint64_t cr3 = 0;
+            __asm__ volatile("mov %%cr3, %0" : "=r"(cr3));
+            std::uintptr_t pml4_virt_addr = reinterpret_cast<std::uintptr_t>(pml4_table);
+            if (pml4_virt_addr >= DIRECT_MAP_OFFSET) {
+                std::uintptr_t pml4_phys = pml4_virt_addr - DIRECT_MAP_OFFSET;
+                if ((cr3 & ~0xFFFULL) == (pml4_phys & ~0xFFFULL)) {
+                    __asm__ volatile("mov %0, %%cr3" :: "r"(cr3) : "memory");
+                }
+            }
+            return true;
+        }
+        return false;
+    }
+
     bool mapPage(std::uintptr_t virt_addr, PhysicalAddress<void> phys_addr, PageFlags flags) {
         if (!pml4_table) return false;
 
@@ -130,6 +179,7 @@ public:
         if (!(*pd)[pd_idx].isPresent()) return false;
         PageTable* pt = phys_to_virt(createPhysicalAddress<PageTable>((*pd)[pd_idx].getAddress()));
 
+        if (!(*pt)[pt_idx].isPresent()) return false;
         (*pt)[pt_idx].clear();
         __asm__ volatile("invlpg (%0)" :: "r"(virt_addr) : "memory");
         return true;

@@ -63,9 +63,10 @@ extern "C" void _start() {
     oz::sys_channel_create(oz::CAP_UNTYPED, &mem_reply_send, &mem_reply_recv);
 
     oz::sys_cspace_cap_insert(mem_proc.cspace_cap, 1, cons_send, static_cast<std::uint32_t>(oz::CapRights::WRITE | oz::CapRights::GRANT));
-    oz::sys_cspace_cap_insert(mem_proc.cspace_cap, 2, mem_req_recv, static_cast<std::uint32_t>(oz::CapRights::READ));
+    oz::sys_cspace_cap_insert(mem_proc.cspace_cap, 2, mem_req_recv, static_cast<std::uint32_t>(oz::CapRights::READ | oz::CapRights::GRANT_REPLY));
     oz::sys_cspace_cap_insert(mem_proc.cspace_cap, 3, mem_reply_send, static_cast<std::uint32_t>(oz::CapRights::WRITE | oz::CapRights::GRANT));
-    oz::sys_cspace_cap_insert(mem_proc.cspace_cap, oz::CAP_UNTYPED, oz::CAP_UNTYPED, static_cast<std::uint32_t>(oz::CapRights::ALL));
+    std::uint32_t mem_ut = oz::sys_untyped_retype(oz::CAP_UNTYPED, static_cast<std::uint32_t>(oz::ObjectType::UntypedMemory), 16 * 1024 * 1024);
+    oz::sys_cspace_cap_move(mem_proc.cspace_cap, oz::CAP_UNTYPED, mem_ut);
 
     oz::sys_tcb_resume(mem_proc.tcb_cap);
     init_coroutine(mem_proc.tcb_cap);
@@ -82,7 +83,7 @@ extern "C" void _start() {
     alloc_req.data[0] = static_cast<std::uint64_t>(oz::ipc::MemCmd::ALLOC_UNTYPED);
     alloc_req.data[1] = 2 * 1024 * 1024; // 2MB
     oz::IPCMessage alloc_resp{};
-    bool alloc_ok = oz::sys_call(mem_req_send, &alloc_req, &alloc_resp) && (alloc_resp.data[0] == 0) && alloc_resp.has_cap;
+    bool alloc_ok = oz::sys_call_recv_cap(mem_req_send, &alloc_req, &alloc_resp) && (alloc_resp.data[0] == 0) && alloc_resp.has_cap;
     TEST_REPORT("PTEST", "MemMan ALLOC_UNTYPED cap transfer", alloc_ok && alloc_resp.transferred_cap != oz::INVALID_CAP_ID);
 
     std::uint32_t child_untyped = alloc_resp.transferred_cap;
@@ -127,7 +128,7 @@ extern "C" void _start() {
             // ProcMan CSpace layout:
             // 1: Console, 2: ProcReq Recv, 3: ProcReply Send, 4: MemSend, 5: MemRecv, 6: VFSSend, 7: VFSRecv, 8: VFS SharedBuf
             oz::sys_cspace_cap_insert(procman_proc.cspace_cap, 1, cons_send, static_cast<std::uint32_t>(oz::CapRights::WRITE | oz::CapRights::GRANT | oz::CapRights::DUPLICATE));
-            oz::sys_cspace_cap_insert(procman_proc.cspace_cap, 2, proc_req_recv, static_cast<std::uint32_t>(oz::CapRights::READ));
+            oz::sys_cspace_cap_insert(procman_proc.cspace_cap, 2, proc_req_recv, static_cast<std::uint32_t>(oz::CapRights::READ | oz::CapRights::GRANT_REPLY));
             oz::sys_cspace_cap_insert(procman_proc.cspace_cap, 3, proc_reply_send, static_cast<std::uint32_t>(oz::CapRights::WRITE | oz::CapRights::GRANT));
             oz::sys_cspace_cap_insert(procman_proc.cspace_cap, 4, mem_req_send, static_cast<std::uint32_t>(oz::CapRights::WRITE | oz::CapRights::GRANT));
             oz::sys_cspace_cap_insert(procman_proc.cspace_cap, 5, mem_reply_recv, static_cast<std::uint32_t>(oz::CapRights::READ));
@@ -142,7 +143,7 @@ extern "C" void _start() {
             oz::IPCMessage pipe_req{};
             pipe_req.data[0] = static_cast<std::uint64_t>(oz::ipc::ProcCmd::CREATE_PIPE);
             oz::IPCMessage pipe_resp{};
-            bool pipe_ok = oz::sys_call(proc_req_send, &pipe_req, &pipe_resp) &&
+            bool pipe_ok = oz::sys_call_recv_cap(proc_req_send, &pipe_req, &pipe_resp) &&
                            (pipe_resp.data[0] == 0) && pipe_resp.has_cap;
             TEST_REPORT("PTEST", "ProcMan CREATE_PIPE IPC", pipe_ok && pipe_resp.transferred_cap != oz::INVALID_CAP_ID);
 

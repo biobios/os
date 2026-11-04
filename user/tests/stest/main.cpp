@@ -116,9 +116,10 @@ static void run_sched_daemon_tests(const std::uint8_t* initrd_ptr, std::uint64_t
     oz::sys_channel_bind_notification(sched_recv, sched_notif, BADGE_SCHED_IPC);
 
     // Slot 2: sched IPC recv, Slot 3: sched notif, Slot 240: untyped
-    oz::sys_cspace_cap_insert(sched_proc.cspace_cap, 2, sched_recv, static_cast<std::uint32_t>(oz::CapRights::READ));
+    oz::sys_cspace_cap_insert(sched_proc.cspace_cap, 2, sched_recv, static_cast<std::uint32_t>(oz::CapRights::READ | oz::CapRights::GRANT_REPLY));
     oz::sys_cspace_cap_insert(sched_proc.cspace_cap, 3, sched_notif, static_cast<std::uint32_t>(oz::CapRights::ALL));
-    oz::sys_cspace_cap_insert(sched_proc.cspace_cap, oz::CAP_UNTYPED, oz::CAP_UNTYPED, static_cast<std::uint32_t>(oz::CapRights::ALL));
+    std::uint32_t child_ut = oz::sys_untyped_retype(oz::CAP_UNTYPED, static_cast<std::uint32_t>(oz::ObjectType::UntypedMemory), 1024 * 1024);
+    oz::sys_cspace_cap_move(sched_proc.cspace_cap, oz::CAP_UNTYPED, child_ut);
 
     std::uint32_t sched_baton = oz::sys_untyped_retype(oz::CAP_UNTYPED, static_cast<std::uint32_t>(oz::ObjectType::Baton), 0);
     oz::sys_tcb_bind_baton(sched_proc.tcb_cap, sched_baton);

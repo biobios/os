@@ -4,21 +4,22 @@
 #include "VFS.hpp"
 #include "TarFS.hpp"
 #include "../common/ipc/Protocol.hpp"
+#include "../common/ipc/StartupInfo.hpp"
 #include "../common/utils/utils.hpp"
 
 // Cap slot assignments:
 //   1: write to console (sys_write uses this)
 //   4: recv file operation requests from all clients (shared request channel)
-//   231: shared buffer frame for client 0 (shell) (64KB)
-//   245: shared buffer frame for client 1 (procman) (64KB)
+//   231: shared buffer frame for client 0 (shell) (64KB in Level 1 PT)
+//   232: shared buffer frame for client 1 (procman) (64KB in Level 1 PT)
 
 static constexpr std::uint32_t CAP_CLIENT_RECV = 4;
 static constexpr std::uint32_t CAP_CLIENT_REPLY_BASE = 5;
 static constexpr std::uint32_t MAX_CLIENTS = 2;
 
-static constexpr std::uint32_t CLIENT_BUF_SLOTS[MAX_CLIENTS] = {231, 245};
+static constexpr std::uint32_t CLIENT_BUF_SLOTS[MAX_CLIENTS] = {231, 232};
 static constexpr std::uint64_t CLIENT_BUF_BASE_VIRT = 0x300000000000ULL;
-static constexpr std::uint64_t CLIENT_BUF_SIZE = 64 * 1024;
+static constexpr std::uint64_t CLIENT_BUF_SIZE = 0x200000ULL; // 2MB stride aligned to Level 1 PT
 
 // Simple handle table for open files
 static constexpr int MAX_OPEN_FILES = 16;
@@ -203,7 +204,7 @@ static void print_dec(std::uint64_t val) {
     oz::sys_debug_print(buf);
 }
 
-extern "C" void _start() {
+OZ_PROCESS_ENTRY() {
     oz::sys_write("VFS Server started!\n\r");
     
     oz::VFS vfs;
@@ -211,7 +212,7 @@ extern "C" void _start() {
 
     // 1. Map InitRD Frame (slot 244) and mount TarFS as initial root
     static constexpr std::uint64_t INITRD_VADDR = 0x500000000000ULL;
-    std::size_t initrd_sz = oz::sys_frame_size(oz::CAP_INITRD);
+    std::size_t initrd_sz = (info ? info->initrd_size : 0);
     if (initrd_sz > 0) {
         if (oz::sys_vspace_map_with_pagetables(oz::CAP_SELF_VSPACE, oz::CAP_UNTYPED, oz::CAP_INITRD, INITRD_VADDR, 0x00, initrd_sz) == 0) {
             tar_fs = new oz::TarFileSystem(reinterpret_cast<const std::uint8_t*>(INITRD_VADDR), initrd_sz);
@@ -279,11 +280,17 @@ extern "C" void _start() {
     oz::IPCMessage req{};
     oz::IPCMessage resp{};
 
+    std::uint32_t recv_slot = oz::g_slot_allocator.allocate_one();
+
     while (true) {
-        cli_tok = oz::sys_reply_recv(cli_tok, CAP_CLIENT_RECV, (cli_tok != oz::INVALID_REPLY_TOKEN) ? &resp : nullptr, &req);
+        cli_tok = oz::sys_reply_recv(cli_tok, CAP_CLIENT_RECV, (cli_tok != oz::INVALID_REPLY_TOKEN) ? &resp : nullptr, &req, recv_slot);
 
         if (cli_tok == oz::INVALID_REPLY_TOKEN) {
             continue;
+        }
+
+        if (req.has_cap) {
+            recv_slot = oz::g_slot_allocator.allocate_one();
         }
 
         std::uint32_t client_id = oz::ipc::vfs_get_client_id(req.data[0]);

@@ -5,13 +5,11 @@
 
 #include "../../user/src/common/utils/BootInfo.hpp"
 #include "core/Channel.hpp"
-#include "core/Frame.hpp"
-#include "core/IOPort.hpp"
 #include "core/IRQDispatch.hpp"
 #include "core/IRQHandler.hpp"
-#include "core/IRQBatonControl.hpp"
 #include "core/Syscall.hpp"
 #include "core/TCB.hpp"
+#include "core/CSpaceCap.hpp"
 #include "core/UntypedMemory.hpp"
 #include "core/VSpace.hpp"
 #include "drivers/pci/PCIUtils.hpp"
@@ -24,6 +22,7 @@
 #include "core/SavedInterruptFrame.hpp"
 #include "core/Baton.hpp"
 #include "core/CartesianTreeTest.hpp"
+#include "core/CapabilityLifecycleTest.hpp"
 
 namespace oz {
 
@@ -248,22 +247,67 @@ Thread* Kernel::loadRootServerFromInitrd(UntypedMemory& boot_untyped, const oz_b
     return nullptr;
 }
 
+// 16 ページの 4KB MMIO ページをマップした Level 1 PT
+static PageTableObject* create_mmio_pt(UntypedMemory& ut, std::uintptr_t phys_base, std::size_t num_pages) {
+    std::uintptr_t pt_frame_phys = 0;
+    void* pt_mem = ut.allocateBytes(4096, 4096, pt_frame_phys);
+    if (!pt_mem) return nullptr;
+    auto* pt_obj = ut.allocateObject<PageTableObject>(1);
+    if (!pt_obj) return nullptr;
+    pt_obj->bind_direct_phys(pt_frame_phys, 1);
+    PageTable* hw = pt_obj->hw_table();
+    hw->clear();
+
+    for (std::size_t i = 0; i < num_pages && i < 512; ++i) {
+        PageFlags pflags = PageFlags::Present | PageFlags::User | PageFlags::Writable | PageFlags::CacheDisable;
+        (*hw)[i].set(phys_base + i * 4096, pflags);
+    }
+    return pt_obj;
+}
+
+// 物理ページ群をマップした Level 2 PD
+static PageTableObject* create_shared_pd(UntypedMemory& ut, std::uintptr_t phys_base, std::size_t num_pages, bool writable, bool nocache) {
+    std::uintptr_t pd_frame_phys = 0;
+    void* pd_mem = ut.allocateBytes(4096, 4096, pd_frame_phys);
+    if (!pd_mem) return nullptr;
+    auto* pd_obj = ut.allocateObject<PageTableObject>(2);
+    if (!pd_obj) return nullptr;
+    pd_obj->bind_direct_phys(pd_frame_phys, 2);
+    PageTable* hw_pd = pd_obj->hw_table();
+    hw_pd->clear();
+
+    std::size_t pages_mapped = 0;
+    for (std::size_t pd_idx = 0; pages_mapped < num_pages && pd_idx < 512; ++pd_idx) {
+        std::uintptr_t pt_frame_phys = 0;
+        void* pt_mem = ut.allocateBytes(4096, 4096, pt_frame_phys);
+        if (!pt_mem) break;
+        auto* pt_obj = ut.allocateObject<PageTableObject>(1);
+        if (!pt_obj) break;
+        pt_obj->bind_direct_phys(pt_frame_phys, 1);
+        PageTable* hw_pt = pt_obj->hw_table();
+        hw_pt->clear();
+
+        for (std::size_t pt_idx = 0; pt_idx < 512 && pages_mapped < num_pages; ++pt_idx, ++pages_mapped) {
+            PageFlags pflags = PageFlags::Present | PageFlags::User;
+            if (writable) pflags = pflags | PageFlags::Writable;
+            if (nocache)  pflags = pflags | PageFlags::CacheDisable;
+            (*hw_pt)[pt_idx].set(phys_base + pages_mapped * 4096, pflags);
+        }
+
+        PageFlags pd_flags = PageFlags::Present | PageFlags::User;
+        if (writable) pd_flags = pd_flags | PageFlags::Writable;
+        (*hw_pd)[pd_idx].set(pt_frame_phys, pd_flags);
+    }
+    return pd_obj;
+}
+
 void Kernel::setupRootServerCaps(Thread* init_thread, UntypedMemory& boot_untyped, const BootDevices& devices, const oz_boot::BootModuleInfo* initrd_file) {
     CSpace* init_cspace = init_thread->cspace;
-    
-    auto free_fn = [](void* cleanup_data) {
-        auto& fm = Kernel::instance().fm;
-        fm.freeBlock(static_cast<PageFrameDescriptor*>(cleanup_data));
-    };
 
     // 2. Setup 64MB UntypedMemory for Init (Slot 240, for backwards compatibility)
     auto ut_block = fm.allocateBlock(14); // 16384 pages = 64MB
     std::uintptr_t ut_phys = fm.getPhysicalAddress(ut_block).get();
-    auto* untyped = boot_untyped.allocateObject<UntypedMemory>(
-        ut_phys, 16384 * 4096, nullptr, nullptr, false, true);
-    Capability untyped_cap(untyped, CapRights::ALL);
-    init_cspace->insert(240, untyped_cap);
-    untyped->release();
+    init_untyped_slot(init_cspace->getSlot(240), ut_phys, 16384 * 4096, false);
 
     // 2.1 Allocate BootInfo frame BEFORE harvesting remaining physical memory
     std::uint64_t initrd_offset = 0;
@@ -293,14 +337,8 @@ void Kernel::setupRootServerCaps(Thread* init_thread, UntypedMemory& boot_untype
     fm.forEachRemainingRegion([&](std::uintptr_t base, std::size_t size) {
         if (size < 64 * 1024) return;
         if (untyped_start_slot + untyped_count >= 240) return;
-        auto* ut_obj = boot_untyped.allocateObject<UntypedMemory>(
-            base, size, nullptr, nullptr, false, true);
-        if (ut_obj) {
-            Capability ut_c(ut_obj, CapRights::ALL);
-            init_cspace->insert(untyped_start_slot + untyped_count, ut_c);
-            ut_obj->release();
-            untyped_count++;
-        }
+        init_untyped_slot(init_cspace->getSlot(untyped_start_slot + untyped_count), base, size, false);
+        untyped_count++;
     });
     dprint("[Kernel] Transferred system physical memory to Init as UntypedMemory caps.\n\r");
 
@@ -308,71 +346,55 @@ void Kernel::setupRootServerCaps(Thread* init_thread, UntypedMemory& boot_untype
         bootinfo_virt->untyped_cap_start = untyped_start_slot;
         bootinfo_virt->untyped_cap_count = untyped_count;
 
-        auto* bootinfo_frame = boot_untyped.allocateObject<Frame>(bootinfo_phys, 4096, false, pfd, free_fn);
-        Capability bootinfo_cap(bootinfo_frame, CapRights::ALL);
-        init_cspace->insert(243, bootinfo_cap);
-        bootinfo_frame->release();
+        init_frame_slot(init_cspace->getSlot(243), bootinfo_phys, 4096, CapRights::ALL);
         dprint("[Kernel] BootInfo capability created.\n\r");
     }
 
     // 3. AHCI MMIO Frame (Slot 241)
     if (devices.ahci_abar_phys != 0) {
-        auto* abar_frame = boot_untyped.allocateObject<Frame>(devices.ahci_abar_phys, 4096, true);
-        Capability abar_cap(abar_frame, CapRights::ALL);
-        init_cspace->insert(241, abar_cap);
-        abar_frame->release();
+        init_frame_slot(init_cspace->getSlot(241), devices.ahci_abar_phys, 4096, CapRights::ALL, true);
     }
 
-    // 4. xHCI MMIO Frame (Slot 242)
+    // 4. xHCI MMIO PageTable (Slot 242, 64KB = 16 pages)
     if (devices.xhci_bar_phys != 0) {
-        auto* xhci_mmio_frame = boot_untyped.allocateObject<Frame>(devices.xhci_bar_phys, 16 * 4096, true);
-        Capability mmio_cap(xhci_mmio_frame, CapRights::ALL);
-        init_cspace->insert(242, mmio_cap);
-        xhci_mmio_frame->release();
+        auto* xhci_pt = create_mmio_pt(boot_untyped, devices.xhci_bar_phys, 16);
+        if (xhci_pt) {
+            init_pagetable_object_slot(init_cspace->getSlot(242), xhci_pt, 1, CapRights::ALL);
+            dprint("[Kernel] xHCI MMIO PageTable capability created (Slot 242).\n\r");
+        }
     }
 
-
-    // 6. Setup InitRD Frame capability (Slot 244)
+    // 6. Setup InitRD Level 2 PD capability (Slot 244)
     if (initrd_file && initrd_file->base_address) {
         std::uintptr_t initrd_raw_phys = initrd_file->base_address - oz::DIRECT_MAP_OFFSET;
         std::uintptr_t initrd_aligned_phys = initrd_raw_phys & ~0xFFFULL;
         std::size_t initrd_pages = (initrd_file->size + initrd_offset + 4095) / 4096;
-        auto* initrd_frame = boot_untyped.allocateObject<Frame>(initrd_aligned_phys, initrd_pages * 4096, true);
-        Capability initrd_cap(initrd_frame, CapRights::ALL);
-        init_cspace->insert(244, initrd_cap);
-        initrd_frame->release();
-        dprint("[Kernel] InitRD Frame capability created.\n\r");
+        auto* initrd_pd = create_shared_pd(boot_untyped, initrd_aligned_phys, initrd_pages, /*writable=*/false, /*nocache=*/false);
+        if (initrd_pd) {
+            init_pagetable_object_slot(init_cspace->getSlot(244), initrd_pd, 2, CapRights::ALL);
+            dprint("[Kernel] InitRD PD capability created (Slot 244).\n\r");
+        }
     }
 
     // 7. Setup Self CSpace capability (Slot 245)
     auto* cs_cap_obj = boot_untyped.allocateObject<CSpaceCap>(init_cspace, false);
-    Capability cs_cap(cs_cap_obj, CapRights::ALL);
-    init_cspace->insert(245, cs_cap);
-    cs_cap_obj->release();
+    init_kernel_object_slot(init_cspace->getSlot(245), cs_cap_obj, CapRights::ALL);
 
-    // 8. Setup FrameBuffer capability (Slot 246)
+    // 8. Setup FrameBuffer Level 2 PD capability (Slot 246)
     std::uintptr_t fb_phys = reinterpret_cast<std::uintptr_t>(platform_info_->frame_buffer_base) - oz::DIRECT_MAP_OFFSET;
     std::uint64_t fb_size = platform_info_->frame_buffer_size;
     if (fb_phys != 0 && fb_size != 0) {
-        auto* fb_frame = boot_untyped.allocateObject<Frame>(fb_phys, fb_size, true);
-        Capability fb_cap(fb_frame, CapRights::ALL);
-        init_cspace->insert(246, fb_cap);
-        fb_frame->release();
-        dprint("[Kernel] FrameBuffer capability created.\n\r");
+        std::size_t fb_pages = (fb_size + 4095) / 4096;
+        auto* fb_pd = create_shared_pd(boot_untyped, fb_phys, fb_pages, /*writable=*/true, /*nocache=*/true);
+        if (fb_pd) {
+            init_pagetable_object_slot(init_cspace->getSlot(246), fb_pd, 2, CapRights::ALL);
+            dprint("[Kernel] FrameBuffer PD capability created (Slot 246).\n\r");
+        }
     }
 
     // 9. Setup Root IOPort capability (Slot 247)
-    auto* root_ioport = boot_untyped.allocateObject<IOPort>(
-        0x0000, 0x10000,
-        g_read_io8_fn, g_read_io16_fn, g_read_io32_fn,
-        g_write_io8_fn, g_write_io16_fn, g_write_io32_fn
-    );
-    if (root_ioport) {
-        Capability ioport_cap(root_ioport, CapRights::ALL);
-        init_cspace->insert(247, ioport_cap);
-        root_ioport->release();
-        dprint("[Kernel] Root IOPort capability created (Slot 247).\n\r");
-    }
+    init_ioport_slot(init_cspace->getSlot(247), 0x0000, 0x10000);
+    dprint("[Kernel] Root IOPort capability created (Slot 247).\n\r");
 
     // 10. Setup Root Baton capability (Slot 248)
     auto* root_baton = boot_untyped.allocateObject<Baton>(true);
@@ -387,25 +409,28 @@ void Kernel::setupRootServerCaps(Thread* init_thread, UntypedMemory& boot_untype
         init_thread->baton = root_baton;
         Kernel::instance().getScheduler().cartesian_root = root_baton;
         Kernel::instance().getScheduler().running_baton = root_baton;
-        Capability baton_cap(root_baton, CapRights::ALL);
-        init_cspace->insert(248, baton_cap);
-        root_baton->release();
+        init_kernel_object_slot(init_cspace->getSlot(248), root_baton, CapRights::ALL);
         dprint("[Kernel] Root Baton capability created (Slot 248).\n\r");
 
         // 11. Setup Root IRQBatonControl capability (Slot 249)
-        auto* irq_control = boot_untyped.allocateObject<IRQBatonControl>();
-        if (irq_control) {
-            Capability irq_ctrl_cap(irq_control, CapRights::ALL);
-            init_cspace->insert(249, irq_ctrl_cap);
-            irq_control->release();
-            dprint("[Kernel] Root IRQBatonControl capability created (Slot 249).\n\r");
-        }
+        init_irq_control_slot(init_cspace->getSlot(249));
+        dprint("[Kernel] Root IRQBatonControl capability created (Slot 249).\n\r");
+
         int test_res = test_cartesian_tree_algorithms();
         if (test_res == 0) {
             dprint("[Kernel] Cartesian Tree self-tests PASSED!\n\r");
         } else {
             dprint("[Kernel] Cartesian Tree self-tests FAILED at step ");
             dprint_dec(test_res);
+            dprint("\n\r");
+        }
+
+        int cap_test_res = test_capability_lifecycle_algorithms();
+        if (cap_test_res == 0) {
+            dprint("[Kernel] Capability Lifecycle self-tests PASSED!\n\r");
+        } else {
+            dprint("[Kernel] Capability Lifecycle self-tests FAILED at step ");
+            dprint_dec(cap_test_res);
             dprint("\n\r");
         }
     }
@@ -538,16 +563,13 @@ Thread* Kernel::loadProcessFromElfBuffer(UntypedMemory& boot_untyped, const std:
     auto* init_cspace = boot_untyped.allocateObject<CSpace>();
     if (!init_cspace) return nullptr;
 
-    // Slot 0: VSpace
-    auto* vspace = boot_untyped.allocateObject<VSpace>(
-        as_obj,
-        as_obj->getArchContext().getPhysicalPML4().get()
-    );
-    Capability vspace_cap(vspace, CapRights::ALL);
-    init_cspace->insert(0, vspace_cap);
-    vspace->release();
+    // Slot 0: VSpace (Level 4 PageTableObject)
+    auto* vspace = boot_untyped.allocateObject<VSpace>(4);
+    if (!vspace) return nullptr;
+    vspace->bind_direct_phys(init_pml4_phys, 4);
+    init_pagetable_object_slot(init_cspace->getSlot(0), vspace, 4, CapRights::ALL);
 
-    TCB* user_tcb = boot_untyped.retypeTCB();
+    TCB* user_tcb = boot_untyped.retypeTCB(g_queue_thread_func);
     if (!user_tcb) return nullptr;
     Thread* user_thread = user_tcb->getThread();
 

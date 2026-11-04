@@ -22,4 +22,14 @@ void operator delete(void*) noexcept {}
 void operator delete[](void*) noexcept {}
 void operator delete(void*, std::size_t) noexcept {}
 void operator delete[](void*, std::size_t) noexcept {}
+void operator delete(void*, std::align_val_t) noexcept {}
+void operator delete[](void*, std::align_val_t) noexcept {}
+void operator delete(void*, std::size_t, std::align_val_t) noexcept {}
+void operator delete[](void*, std::size_t, std::align_val_t) noexcept {}
+
+extern "C" {
+int atexit(void (*)(void)) noexcept { return 0; }
+int __cxa_atexit(void (*)(void*), void*, void*) noexcept { return 0; }
+void* __dso_handle = nullptr;
+}
 

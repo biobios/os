@@ -57,7 +57,11 @@ public:
     bool is_irq_baton{false};                    // 割り込みハンドラ専用バトンの印
     IRQHandler* bound_irq_handler{nullptr};      // 次回割り込み待機中の IRQHandler
 
-    explicit Baton(bool untyped = false) : KernelObject(ObjectType::Baton, untyped) {}
+    // Global registry intrusive list
+    Baton* reg_prev_{nullptr};
+    Baton* reg_next_{nullptr};
+
+    explicit Baton(bool untyped = false);
     ~Baton() override;
 
     inline void resetCartesian() {
@@ -82,5 +86,8 @@ public:
 
     void notify_if_runnable();
 };
+
+void unbind_notification_from_all_batons(Notification* notif);
+void unbind_thread_from_all_batons(ExecutionContext* ctx);
 
 } // namespace oz

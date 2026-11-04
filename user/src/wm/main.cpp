@@ -49,7 +49,7 @@ static std::uint32_t g_screen_height = 600;
 
 // Helper: send IPC to Display Server and wait for response
 bool display_send_sync(oz::IPCMessage* req, oz::IPCMessage* resp) {
-    if (!oz::sys_call(CAP_DISPLAY_SEND, req, resp)) {
+    if (!oz::sys_call_recv_cap(CAP_DISPLAY_SEND, req, resp)) {
         oz::sys_debug_print("[WM] display_send_sync: sys_call FAILED!\n\r");
         return false;
     }
@@ -436,10 +436,15 @@ static void wm_cmd_worker() {
     oz::ReplyToken tok = oz::INVALID_REPLY_TOKEN;
     oz::IPCMessage req{};
     oz::IPCMessage resp{};
+    std::uint32_t recv_slot = oz::g_slot_allocator.allocate_one();
     while (true) {
-        tok = oz::sys_reply_recv(tok, CAP_WM_RECV, (tok != oz::INVALID_REPLY_TOKEN) ? &resp : nullptr, &req);
+        tok = oz::sys_reply_recv(tok, CAP_WM_RECV, (tok != oz::INVALID_REPLY_TOKEN) ? &resp : nullptr, &req, recv_slot);
         if (tok == oz::INVALID_REPLY_TOKEN) {
             continue;
+        }
+
+        if (req.has_cap) {
+            recv_slot = oz::g_slot_allocator.allocate_one();
         }
 
         // Distinguish between Keyboard Event from xHCI/Init vs WM IPC Command

@@ -3,19 +3,15 @@
 #include "core/CapOperations.hpp"
 #include "core/Thread.hpp"
 #include "utils/utils.hpp"
-#include "core/Frame.hpp"
 #include "core/VSpace.hpp"
 #include "core/UntypedMemory.hpp"
 #include "core/TCB.hpp"
 #include "core/CSpaceCap.hpp"
-#include "core/PageTableObject.hpp"
 #include "core/IRQHandler.hpp"
 #include "core/IRQDispatch.hpp"
-#include "core/IOPort.hpp"
 #include "core/Notification.hpp"
 #include "core/Baton.hpp"
 #include "core/CartesianTree.hpp"
-#include "core/IRQBatonControl.hpp"
 
 #include "core/Kernel.hpp"
 #include "core/SavedInterruptFrame.hpp"
@@ -25,6 +21,7 @@ constexpr int ERR_WOULDBLOCK = -2;
 constexpr int ERR_CANCELLED = -3;
 constexpr int SYS_ERR_INVALID_STATE = -7;
 constexpr int SYS_ERR_PERM          = -8;
+constexpr int SYS_ERR_NO_MEMORY     = -9;
 
 void (*g_exit_thread_func)() = nullptr;
 CSpace* (*g_get_current_cspace_func)() = nullptr;
@@ -73,50 +70,119 @@ static bool is_user_buffer(std::uintptr_t addr, std::size_t size) {
 // Type-safe capability extraction: returns typed pointer or nullptr
 template <typename T>
 static T* get_cap_typed(CSpace* cspace, CapID id, ObjectType expected, CapRights required) {
-    Capability cap = cspace->get(id);
-    if (!cap.is_valid()) return nullptr;
-    if ((cap.rights & required) != required) return nullptr;
-    if (cap.object->objectType() != expected) return nullptr;
-    return static_cast<T*>(cap.object);
+    if (!cspace) return nullptr;
+    Capability* slot = cspace->getSlot(id);
+    if (!slot || slot->is_null()) return nullptr;
+    if (!slot->has_rights(required)) return nullptr;
+    if (slot->type() != to_cap_type(expected)) return nullptr;
+    return static_cast<T*>(slot->object());
 }
 
-// Capability システムにおけるポリモーフィックな型解決ヘルパー (設計書 2.1(5))
+// Capability システムにおけるポリモーフィックな型解決ヘルパー
 static inline ExecutionContext* get_cap_execution_context(CSpace* cspace, CapID cap_id, CapRights rights) {
     if (!cspace) return nullptr;
-    Capability cap = cspace->get(cap_id);
-    if (!cap.is_valid() || !cap.object) return nullptr;
-    if ((cap.rights & rights) != rights) return nullptr;
-    if (cap.object->objectType() == ObjectType::TCB) {
-        TCB* tcb = static_cast<TCB*>(cap.object);
+    Capability* slot = cspace->getSlot(cap_id);
+    if (!slot || slot->is_null() || !slot->object()) return nullptr;
+    if (!slot->has_rights(rights)) return nullptr;
+    if (slot->type() == CapType::TCB) {
+        TCB* tcb = static_cast<TCB*>(slot->object());
         return tcb->getThread();
     }
     return nullptr;
 }
 
-static inline bool configure_execution_context(ExecutionContext* ctx, CSpace* cspace, VSpace* vspace, std::uint64_t rip, std::uint64_t user_rsp) {
-    if (!ctx) return false;
-    ctx->cspace = cspace;
-    if (vspace && vspace->getPhysicalPML4() != 0) {
-        ctx->pml4_phys = VSpace::createPhysicalAddress<PageTable>(vspace->getPhysicalPML4());
+inline void handleSelfDestructionIfNeeded(Thread* current) {
+    if (!current) return;
+    std::uint64_t now = oz::x86_64::rdtsc();
+    Scheduler& sched = Kernel::instance().getScheduler();
+
+    // ケース ① current->is_dead == true（自身の TCB が破棄された場合）
+    if (current->is_dead || current->state == ThreadState::Dead) {
+        ExecutionContext* next_ctx = nullptr;
+        if (current->saved_frame.interrupted_context &&
+            current->saved_frame.interrupted_context != current &&
+            !current->saved_frame.interrupted_context->is_dead) {
+            next_ctx = current->saved_frame.interrupted_context;
+        } else if (g_current_irq_thread && g_current_irq_thread != current && !g_current_irq_thread->is_dead) {
+            next_ctx = g_current_irq_thread;
+        } else if (sched.running_baton && sched.running_baton->thread &&
+                   sched.running_baton->thread != current && !sched.running_baton->thread->is_dead) {
+            next_ctx = sched.running_baton->thread;
+        } else {
+            next_ctx = sched.main_thread;
+        }
+        sched.abandonCurrentContextTo(next_ctx, now);
     }
-    ctx->user_rip = rip;
-    ctx->user_rsp = user_rsp;
-    ctx->state = ThreadState::Blocked;
 
-    std::uint64_t rsp = reinterpret_cast<std::uint64_t>(ctx->stack_base) + ctx->stack_size;
-    rsp &= ~15ULL;
-    rsp -= sizeof(ThreadContext);
-    ctx->rsp = reinterpret_cast<void*>(rsp);
+    // ケース ② !current->has_baton()（実行中の Baton が破棄され、TCB は生存している場合）
+    if (!current->get_active_baton()) {
+        current->state = ThreadState::Ready;
+        ExecutionContext* next_ctx = nullptr;
+        if (sched.running_baton && sched.running_baton->thread &&
+            sched.running_baton->thread != current && !sched.running_baton->thread->is_dead) {
+            next_ctx = sched.running_baton->thread;
+        } else {
+            next_ctx = sched.main_thread;
+        }
+        if (sched.cartesian_root && !sched.cartesian_root->is_infinite) {
+            oz::x86_64::setLAPICOneShot(sched.cartesian_root->get_effective_remaining(), oz::x86_64::APIC_TIMER_VECTOR);
+        } else {
+            oz::x86_64::stopLAPICTimer();
+        }
+        if (next_ctx) {
+            sched.performContextSwitch(current, next_ctx, now);
+        }
+        return;
+    }
 
-    ThreadContext* tctx = reinterpret_cast<ThreadContext*>(rsp);
-    tctx->rip = reinterpret_cast<std::uint64_t>(&thread_stub);
-    tctx->r12 = reinterpret_cast<std::uint64_t>(&user_thread_entry);
-    tctx->rbx = reinterpret_cast<std::uint64_t>(ctx);
-    tctx->r13 = 0;
-    tctx->r14 = 0;
-    tctx->r15 = 0;
-    tctx->rbp = 0;
-    return true;
+    // ケース ③ 委譲チェーン中間の親 Baton が破棄された場合: そのまま正常復帰
+
+    // ケース ④ current->pml4_phys == 0（自身の VSpace が破棄された場合）
+    if (current->pml4_phys.get() == 0) {
+        current->state = ThreadState::Blocked;
+        current->is_blocked = true;
+        current->sched_reason = SchedReason::FAULT;
+
+        Baton* b = current->get_active_baton();
+        if (!b) b = sched.running_baton;
+        ExecutionContext* next_ctx = nullptr;
+        if (b) {
+            cartesianPopLeaf(sched.cartesian_root, b);
+            b->state = BatonState::BLOCKED;
+            b->is_active = false;
+            Baton* caller_b = b->caller_baton;
+            ExecutionContext* caller = b->caller_context;
+            b->caller_baton = nullptr;
+            b->caller_context = nullptr;
+            if (caller_b) {
+                caller_b->callee_baton = nullptr;
+                caller_b->state = BatonState::RUNNING;
+                cartesianPushDown(caller_b);
+                sched.running_baton = caller_b;
+                if (!caller) caller = caller_b->thread;
+            } else if (sched.running_baton == b) {
+                sched.running_baton = nullptr;
+            }
+            if (caller && caller != current && !caller->is_dead) {
+                caller->sched_reason = SchedReason::FAULT;
+                next_ctx = caller;
+            }
+        }
+        if (!next_ctx) {
+            next_ctx = sched.main_thread;
+        }
+        if (sched.cartesian_root && !sched.cartesian_root->is_infinite) {
+            oz::x86_64::setLAPICOneShot(sched.cartesian_root->get_effective_remaining(), oz::x86_64::APIC_TIMER_VECTOR);
+        } else {
+            oz::x86_64::stopLAPICTimer();
+        }
+        if (next_ctx) {
+            sched.performContextSwitch(current, next_ctx, now);
+        }
+        return;
+    }
+
+    // ケース ⑤ current->cspace == nullptr（自身の CSpaceCap のみが破棄された場合）: そのまま正常復帰
 }
 
 // Get current CSpace (common pattern)
@@ -126,117 +192,10 @@ static CSpace* get_cspace() {
 }
 
 // ===========================================================================
+// Channel IPC helpers & Bulk Allocation
 // ===========================================================================
-// Channel IPC helpers
-// ===========================================================================
 
-
-
-static int do_channel_recv(CSpace* cspace, CapID ep_id, IPCMessage* msg, bool nonblock = false) {
-    if (!cspace || !msg) return -1;
-    ExecutionContext* current_ctx = g_get_current_context_func ? g_get_current_context_func() : nullptr;
-    Thread* current_t = current_ctx ? static_cast<Thread*>(current_ctx) : nullptr;
-    if (current_t && current_t->is_irq_handling() && !nonblock) {
-        return SYS_ERR_INVALID_STATE;
-    }
-
-    ChannelEndpoint* ep = get_cap_typed<ChannelEndpoint>(
-        cspace, ep_id, ObjectType::ChannelEndpoint, CapRights::READ);
-    if (!ep) return -1;
-
-    // 1. Check for pending asynchronous notifications (e.g. IRQ)
-    std::uint64_t notif_data = 0;
-    if (ep->check_and_clear_notification(notif_data)) {
-        msg->data[0] = notif_data;
-        msg->data[1] = 0;
-        msg->data[2] = 0;
-        msg->data[3] = 0;
-        msg->has_cap = false;
-        return 0;
-    }
-
-    ChannelEndpoint* peer = ep->get_peer();
-
-    // 2. Synchronous rendezvous: check if a sender is already waiting on peer
-    Thread* sender = peer ? peer->pop_send_waiter() : nullptr;
-    if (sender) {
-        *msg = sender->send_msg.user_msg;
-        if (sender->send_msg.attached_cap.is_valid()) {
-            CapID new_id = cspace->add(sender->send_msg.attached_cap);
-            if (new_id == INVALID_CAP_ID) {
-                // Failed to add to receiver CSpace: rollback to sender's CSpace!
-                if (sender->cspace) {
-                    sender->cspace->insert(sender->send_msg.user_msg.transferred_cap, sender->send_msg.attached_cap);
-                }
-                msg->has_cap = false;
-            } else {
-                msg->transferred_cap = new_id;
-                msg->has_cap = true;
-            }
-            sender->send_msg.attached_cap = Capability();
-        }
-        sender->state = ThreadState::Ready;
-        sender->is_blocked = false;
-        if (g_unblock_thread_func) {
-            g_unblock_thread_func(sender);
-        }
-
-        // Re-signal bound notification if more senders are waiting on peer
-        if (peer->has_send_waiters() && ep->get_bound_notification()) {
-            ep->get_bound_notification()->signal(ep->get_bound_badge());
-        }
-
-        return 0;
-    }
-
-    Thread* current = g_get_current_thread_func ? g_get_current_thread_func() : nullptr;
-
-    // No sender is waiting:
-    bool effective_nonblock = nonblock || (ep->get_mode() == ChannelMode::RECV_NONBLOCK);
-    if (effective_nonblock) {
-        return ERR_WOULDBLOCK; // Would block
-    }
-
-    // Receiver must block
-    if (!g_get_current_thread_func || !g_block_thread_func) return -1;
-    if (!current) return -1;
-
-    current->state = ThreadState::BlockedOnRecv;
-    current->is_blocked = true;
-    current->blocking_ep = ep;
-    ep->add_recv_waiter(current);
-
-    while (current->is_blocked) {
-        g_block_thread_func();
-        if (current->ipc_cancelled || ep->is_peer_closed()) break;
-    }
-
-    current->blocking_ep = nullptr;
-    current->is_blocked = false;
-    if (current->ipc_cancelled) {
-        current->ipc_cancelled = false;
-        return ERR_CANCELLED;
-    }
-
-    // Woken up by sender or notification
-    if (ep->check_and_clear_notification(notif_data)) {
-        msg->data[0] = notif_data;
-        msg->data[1] = 0;
-        msg->data[2] = 0;
-        msg->data[3] = 0;
-        msg->has_cap = false;
-        return 0;
-    }
-
-    InternalIPCMessage internal;
-    if (ep->pop_rendezvous_msg(internal)) {
-        *msg = internal.user_msg;
-        return 0;
-    }
-
-    if (ep->is_peer_closed()) return -1;
-    return -1;
-}
+constexpr CapID CAP_SELF_CSPACE = 245;
 
 struct SyscallResult {
     std::uint64_t rax{0};
@@ -246,6 +205,276 @@ struct SyscallResult {
     SyscallResult(std::int64_t rax) : rax(static_cast<std::uint64_t>(rax)), rdx(0) {}
     SyscallResult(int rax) : rax(static_cast<std::uint64_t>(static_cast<std::int64_t>(rax))), rdx(0) {}
 };
+
+static inline void transfer_or_drop_ipc_cap(
+    CSpace* dst_cs, CapID dst_slot,
+    CSpace* src_cs, CapID src_id,
+    bool& out_has_cap, CapID& out_cap_id
+) {
+    out_has_cap = false;
+    out_cap_id = 0;
+    if (!src_cs || !dst_cs) return;
+
+    // 1. 送信側 Cap の妥当性検証 (不正な Cap の場合は破棄も転送もしない)
+    if (src_id == 0 || src_id >= CSpace::MAX_CAPS || is_reserved_system_slot(src_id)) {
+        return;
+    }
+    Capability* src = src_cs->getSlot(src_id);
+    if (!src || src->is_null() || !src->has_rights(CapRights::TRANSFER)) {
+        return;
+    }
+
+    // 2. 受信側スロットの検証
+    bool dst_slot_valid = (dst_slot != 0 && dst_slot < CSpace::MAX_CAPS &&
+                           !is_reserved_system_slot(dst_slot));
+    Capability* dest = dst_slot_valid ? dst_cs->getSlot(dst_slot) : nullptr;
+
+    if (dest && dest->is_null()) {
+        // 正常転送
+        if (cdt_move_slot(dest, src)) {
+            out_has_cap = true;
+            out_cap_id = dst_slot;
+            return;
+        }
+    }
+
+    // 3. 受信側が受取不能 (0, 衝突, 予約領域等) の場合のみ送信元 Cap を Drop
+    src_cs->remove(src_id);
+}
+
+static inline CSpace* resolve_target_cspace(CSpace* current_cs, CapID target_cs_id, CapRights rights = CapRights::WRITE) {
+    if (!current_cs) return nullptr;
+    if (target_cs_id == 0 || target_cs_id == CAP_SELF_CSPACE) {
+        return current_cs;
+    }
+    CSpaceCap* cs_cap = get_cap_typed<CSpaceCap>(current_cs, target_cs_id, ObjectType::CSpaceCap, rights);
+    if (!cs_cap) return nullptr;
+    return cs_cap->getCSpace();
+}
+
+// -----------------------------------------------------------------
+// 事前容量シミュレーションヘルパー (アライメント考慮の容量充足性検証)
+// -----------------------------------------------------------------
+static inline bool untyped_can_allocate_bulk(
+    const Capability* ut_slot,
+    ObjectType        target_type,
+    std::uint64_t     size_or_arg,
+    std::size_t       count
+) {
+    std::uint64_t current_watermark = ut_slot->untyped_watermark();
+    std::uint64_t total_size = ut_slot->untyped_size();
+    std::uint64_t simulated_wm = current_watermark;
+
+    auto align_up = [](std::uint64_t val, std::uint64_t align) -> std::uint64_t {
+        return (val + align - 1) & ~(align - 1);
+    };
+
+    for (std::size_t i = 0; i < count; ++i) {
+        switch (target_type) {
+            case ObjectType::Frame: {
+                simulated_wm = align_up(simulated_wm, 4096);
+                if (simulated_wm + 4096 > total_size || simulated_wm + 4096 < simulated_wm) return false;
+                simulated_wm += 4096;
+                break;
+            }
+            case ObjectType::UntypedMemory: {
+                simulated_wm = align_up(simulated_wm, 4096);
+                if (simulated_wm + size_or_arg > total_size || simulated_wm + size_or_arg < simulated_wm) return false;
+                simulated_wm += size_or_arg;
+                break;
+            }
+            case ObjectType::TCB: {
+                simulated_wm = align_up(simulated_wm, 4096);
+                if (simulated_wm + 8192 > total_size || simulated_wm + 8192 < simulated_wm) return false;
+                simulated_wm += 8192;
+                break;
+            }
+            case ObjectType::ChannelEndpoint: {
+                constexpr std::size_t sz = sizeof(ChannelEndpoint);
+                constexpr std::size_t al = alignof(ChannelEndpoint);
+                simulated_wm = align_up(simulated_wm, al);
+                if (simulated_wm + sz > total_size || simulated_wm + sz < simulated_wm) return false;
+                simulated_wm += sz;
+                break;
+            }
+            case ObjectType::Notification: {
+                constexpr std::size_t sz = sizeof(Notification);
+                constexpr std::size_t al = alignof(Notification);
+                simulated_wm = align_up(simulated_wm, al);
+                if (simulated_wm + sz > total_size || simulated_wm + sz < simulated_wm) return false;
+                simulated_wm += sz;
+                break;
+            }
+            case ObjectType::Baton: {
+                constexpr std::size_t sz = sizeof(Baton);
+                constexpr std::size_t al = alignof(Baton);
+                simulated_wm = align_up(simulated_wm, al);
+                if (simulated_wm + sz > total_size || simulated_wm + sz < simulated_wm) return false;
+                simulated_wm += sz;
+                break;
+            }
+            case ObjectType::CSpaceCap: {
+                simulated_wm = align_up(simulated_wm, alignof(CSpace));
+                if (simulated_wm + sizeof(CSpace) > total_size || simulated_wm + sizeof(CSpace) < simulated_wm) return false;
+                simulated_wm += sizeof(CSpace);
+
+                simulated_wm = align_up(simulated_wm, alignof(CSpaceCap));
+                if (simulated_wm + sizeof(CSpaceCap) > total_size || simulated_wm + sizeof(CSpaceCap) < simulated_wm) return false;
+                simulated_wm += sizeof(CSpaceCap);
+                break;
+            }
+            default:
+                return false;
+        }
+    }
+
+    return true;
+}
+
+// syscall 59: sys_untyped_retype_bulk
+SyscallResult handle_untyped_retype_bulk(
+    CapID         ut_cap_id,
+    ObjectType    target_type,
+    std::uint64_t size_or_arg,
+    CapID         target_cspace_id,
+    CapID         start_slot,
+    std::size_t   count
+) {
+    CSpace* current_cs = get_cspace();
+    if (!current_cs) return SyscallResult(SYS_ERR_INVALID, 0);
+
+    // -------------------------------------------------------------
+    // Phase 1: 事前全数検証 (Dry-Run Validation)
+    // -------------------------------------------------------------
+    if (count == 0 || count > CSpace::MAX_CAPS) return SyscallResult(SYS_ERR_INVALID, 0);
+    if (start_slot == 0 || start_slot >= CSpace::MAX_CAPS) return SyscallResult(SYS_ERR_INVALID, 0);
+    if (count > CSpace::MAX_CAPS - start_slot) return SyscallResult(SYS_ERR_INVALID, 0);
+
+    std::uint32_t end_slot = start_slot + count - 1;
+    if (!(end_slot < CAP_RESERVED_SYSTEM_START || start_slot > CAP_RESERVED_SYSTEM_END)) {
+        return SyscallResult(SYS_ERR_INVALID, 0);
+    }
+
+    if (target_type != ObjectType::Frame &&
+        target_type != ObjectType::UntypedMemory &&
+        target_type != ObjectType::TCB &&
+        target_type != ObjectType::ChannelEndpoint &&
+        target_type != ObjectType::Notification &&
+        target_type != ObjectType::Baton &&
+        target_type != ObjectType::CSpaceCap) {
+        return SyscallResult(SYS_ERR_INVALID, 0);
+    }
+
+    if (target_type == ObjectType::ChannelEndpoint && (count % 2) != 0) {
+        return SyscallResult(SYS_ERR_INVALID, 0);
+    }
+
+    if (target_type == ObjectType::UntypedMemory) {
+        if (size_or_arg == 0 || (size_or_arg % 4096) != 0) {
+            return SyscallResult(SYS_ERR_INVALID, 0);
+        }
+    } else if (target_type == ObjectType::Frame) {
+        if (size_or_arg != 0 && size_or_arg != 4096) {
+            return SyscallResult(SYS_ERR_INVALID, 0);
+        }
+    }
+
+    Capability* ut_slot = current_cs->getSlot(ut_cap_id);
+    if (!ut_slot || ut_slot->type() != CapType::UntypedMemory ||
+        (!ut_slot->has_rights(CapRights::WRITE) && !ut_slot->has_rights(CapRights::DERIVE))) {
+        return SyscallResult(SYS_ERR_PERM, 0);
+    }
+
+    if (ut_slot->untyped_is_device()) {
+        if (target_type != ObjectType::Frame && target_type != ObjectType::UntypedMemory) {
+            return SyscallResult(SYS_ERR_INVALID, 0);
+        }
+    }
+
+    CSpace* target_cs = resolve_target_cspace(current_cs, target_cspace_id);
+    if (!target_cs) {
+        return SyscallResult(SYS_ERR_PERM, 0);
+    }
+
+    if (!target_cs->is_range_null(start_slot, count)) {
+        return SyscallResult(SYS_ERR_BUSY, 0);
+    }
+
+    if (!untyped_can_allocate_bulk(ut_slot, target_type, size_or_arg, count)) {
+        return SyscallResult(SYS_ERR_NO_MEMORY, 0);
+    }
+
+    // -------------------------------------------------------------
+    // Phase 2: 一括確定 (No-fail Commit)
+    // -------------------------------------------------------------
+    if (target_type == ObjectType::Frame) {
+        std::uintptr_t phys_base = 0;
+        void* mem = untyped_allocate_bytes(ut_slot, count * 4096, 4096, phys_base);
+        (void)mem;
+        for (std::size_t i = 0; i < count; ++i) {
+            Capability* s = target_cs->getSlot(start_slot + i);
+            init_frame_slot(s, phys_base + i * 4096, CapRights::ALL, true);
+            cdt_insert_child(ut_slot, s);
+        }
+    } else if (target_type == ObjectType::ChannelEndpoint) {
+        for (std::size_t i = 0; i < count; i += 2) {
+            ChannelEndpoint* end0 = untyped_allocate_object<ChannelEndpoint>(ut_slot, true);
+            ChannelEndpoint* end1 = untyped_allocate_object<ChannelEndpoint>(ut_slot, true);
+            end0->set_peer(end1);
+            end1->set_peer(end0);
+
+            Capability* s0 = target_cs->getSlot(start_slot + i);
+            Capability* s1 = target_cs->getSlot(start_slot + i + 1);
+            init_kernel_object_slot(s0, end0, CapRights::ALL);
+            init_kernel_object_slot(s1, end1, CapRights::ALL);
+            cdt_insert_child(ut_slot, s0);
+            cdt_insert_child(ut_slot, s1);
+        }
+    } else if (target_type == ObjectType::CSpaceCap) {
+        for (std::size_t i = 0; i < count; ++i) {
+            std::uintptr_t cs_phys = 0;
+            void* cs_mem = untyped_allocate_bytes(ut_slot, sizeof(CSpace), alignof(CSpace), cs_phys);
+            CSpace* child_cspace = new (cs_mem) CSpace();
+            CSpaceCap* cs_cap_obj = untyped_allocate_object<CSpaceCap>(ut_slot, child_cspace, false, true);
+
+            Capability* s = target_cs->getSlot(start_slot + i);
+            init_kernel_object_slot(s, cs_cap_obj, CapRights::ALL);
+            cdt_insert_child(ut_slot, s);
+        }
+    } else if (target_type == ObjectType::UntypedMemory) {
+        for (std::size_t i = 0; i < count; ++i) {
+            std::uintptr_t sub_phys = 0;
+            void* sub_mem = untyped_allocate_bytes(ut_slot, size_or_arg, 4096, sub_phys);
+            (void)sub_mem;
+            Capability* s = target_cs->getSlot(start_slot + i);
+            init_untyped_slot(s, sub_phys, size_or_arg, ut_slot->untyped_is_device());
+            cdt_insert_child(ut_slot, s);
+        }
+    } else if (target_type == ObjectType::TCB) {
+        for (std::size_t i = 0; i < count; ++i) {
+            TCB* tcb = untyped_retype_tcb(ut_slot, g_queue_thread_func);
+            Capability* s = target_cs->getSlot(start_slot + i);
+            init_kernel_object_slot(s, tcb, CapRights::ALL);
+            cdt_insert_child(ut_slot, s);
+        }
+    } else if (target_type == ObjectType::Notification) {
+        for (std::size_t i = 0; i < count; ++i) {
+            Notification* notif = untyped_allocate_object<Notification>(ut_slot, true);
+            Capability* s = target_cs->getSlot(start_slot + i);
+            init_kernel_object_slot(s, notif, CapRights::ALL);
+            cdt_insert_child(ut_slot, s);
+        }
+    } else if (target_type == ObjectType::Baton) {
+        for (std::size_t i = 0; i < count; ++i) {
+            Baton* baton = untyped_allocate_object<Baton>(ut_slot, true);
+            Capability* s = target_cs->getSlot(start_slot + i);
+            init_kernel_object_slot(s, baton, CapRights::ALL);
+            cdt_insert_child(ut_slot, s);
+        }
+    }
+
+    return SyscallResult(0, 0);
+}
 
 // ===========================================================================
 // Syscall handlers
@@ -257,88 +486,103 @@ extern "C" SyscallResult handleSyscall(std::uint64_t rdi, std::uint64_t rsi, std
                                        std::uint64_t r10, std::uint64_t r8, std::uint64_t r9,
                                        std::uint64_t syscall_number) {
 #pragma GCC diagnostic pop
-    (void)r9;
+
+    struct ScopeTlbFlusher {
+        ~ScopeTlbFlusher() {
+            flush_tlb_if_pending();
+        }
+    } tlb_flusher;
+
     if (syscall_number == 1) {
         // channel_send is removed in Baton Scheduling v2 (use sys_call / sys_reply_recv)
         return -1;
     } else if (syscall_number == 2) {
-        // channel_recv
-        CSpace* cspace = get_cspace();
-        if (!cspace) return -1;
-        if (!is_user_buffer(rsi, sizeof(IPCMessage))) return -1;
-        IPCMessage* msg = reinterpret_cast<IPCMessage*>(rsi);
-        bool nonblock = (rdx & 1) != 0;
-        return do_channel_recv(cspace, static_cast<CapID>(rdi), msg, nonblock);
+        // channel_recv (abolished)
+        return SyscallResult(SYS_ERR_INVALID, 0);
     } else if (syscall_number == 3) {
-        // channel_create(untyped_cap, out0, out1, mode0, mode1)
+        // channel_create(untyped_cap, target_cs0, slot0, target_cs1, slot1, modes)
+        CSpace* current_cs = get_cspace();
+        if (!current_cs) return SyscallResult(SYS_ERR_INVALID, 0);
+
+        CapID ut_cap = static_cast<CapID>(rdi);
+        CapID target_cs0_id = static_cast<CapID>(rsi);
+        CapID slot0 = static_cast<CapID>(rdx);
+        CapID target_cs1_id = static_cast<CapID>(r10);
+        CapID slot1 = static_cast<CapID>(r8);
+        std::uint64_t modes_raw = r9;
+
+        Capability* ut_slot = current_cs->getSlot(ut_cap);
+        if (!ut_slot || ut_slot->type() != CapType::UntypedMemory ||
+            (!ut_slot->has_rights(CapRights::WRITE) && !ut_slot->has_rights(CapRights::DERIVE))) {
+            return SyscallResult(SYS_ERR_PERM, 0);
+        }
+        if (ut_slot->untyped_is_device()) {
+            return SyscallResult(SYS_ERR_INVALID, 0);
+        }
+
+        CSpace* cs0 = resolve_target_cspace(current_cs, target_cs0_id);
+        if (!cs0) return SyscallResult(SYS_ERR_PERM, 0);
+
+        CSpace* cs1 = resolve_target_cspace(current_cs, target_cs1_id);
+        if (!cs1) return SyscallResult(SYS_ERR_PERM, 0);
+
+        if (slot0 == 0 || slot0 >= CSpace::MAX_CAPS || slot1 == 0 || slot1 >= CSpace::MAX_CAPS) {
+            return SyscallResult(SYS_ERR_INVALID, 0);
+        }
+        if (is_reserved_system_slot(slot0) || is_reserved_system_slot(slot1)) {
+            return SyscallResult(SYS_ERR_INVALID, 0);
+        }
+        if (cs0 == cs1 && slot0 == slot1) {
+            return SyscallResult(SYS_ERR_INVALID, 0);
+        }
+
+        Capability* s0 = cs0->getSlot(slot0);
+        Capability* s1 = cs1->getSlot(slot1);
+        if (!s0 || !s0->is_null() || !s1 || !s1->is_null()) {
+            return SyscallResult(SYS_ERR_BUSY, 0);
+        }
+
+        ChannelMode mode0 = static_cast<ChannelMode>(modes_raw & 0xFFFFFFFF);
+        ChannelMode mode1 = static_cast<ChannelMode>(modes_raw >> 32);
+        if (!is_valid_channel_pair(mode0, mode1)) {
+            return SyscallResult(SYS_ERR_INVALID, 0);
+        }
+
+        if (!untyped_can_allocate_bulk(ut_slot, ObjectType::ChannelEndpoint, 0, 2)) {
+            return SyscallResult(SYS_ERR_NO_MEMORY, 0);
+        }
+
+        if (!sys_channel_create(ut_slot, cs0, slot0, cs1, slot1, mode0, mode1)) {
+            return SyscallResult(SYS_ERR_INVALID, 0);
+        }
+        return SyscallResult(0, 0);
+    } else if (syscall_number == 4) {
+        // sys_pagetable_map_frame(pt_cap, index, frame_cap, flags)
         CSpace* cspace = get_cspace();
         if (!cspace) return -1;
-        if (!is_user_buffer(rsi, sizeof(CapID))) return -1;
-        if (!is_user_buffer(rdx, sizeof(CapID))) return -1;
-        CapID* out0 = reinterpret_cast<CapID*>(rsi);
-        CapID* out1 = reinterpret_cast<CapID*>(rdx);
-        ChannelMode mode0 = static_cast<ChannelMode>(r10);
-        ChannelMode mode1 = static_cast<ChannelMode>(r8);
-        if (sys_channel_create(cspace, static_cast<CapID>(rdi), out0, out1, mode0, mode1)) return 0;
-        return -1;
-    } else if (syscall_number == 4) {
-        // vspace_map
-        CSpace* cspace = get_cspace();
-        if (!cspace) { dprint("[vspace_map] no cspace\n\r"); return -1; }
-        
-        VSpace* vspace = get_cap_typed<VSpace>(
-            cspace, static_cast<CapID>(rdi), ObjectType::VSpace, CapRights::WRITE);
-        if (!vspace) { dprint("[vspace_map] bad vspace cap\n\r"); return -1; }
-        
-        Frame* frame = get_cap_typed<Frame>(
-            cspace, static_cast<CapID>(rsi), ObjectType::Frame, CapRights::READ);
-        if (!frame) { dprint("[vspace_map] bad frame cap\n\r"); return -1; }
-        
-        std::uintptr_t virt = rdx;
-        std::uintptr_t phys = frame->physicalAddress();
-        std::size_t frame_size = frame->size();
-        for (std::size_t offset = 0; offset < frame_size; offset += 4096) {
-            if (!vspace->mapUser(virt + offset, phys + offset, r10)) {
-                return -1;
-            }
+
+        Capability* pt_slot = cspace->getSlot(static_cast<CapID>(rdi));
+        if (!pt_slot || pt_slot->type() != CapType::PageTable || !pt_slot->has_rights(CapRights::WRITE)) {
+            return -1;
         }
-        return 0;
+
+        auto* pt_obj = pt_slot->pagetable_object();
+        if (!pt_obj) return -1;
+
+        if (rsi >= 512 || (pt_obj->level() == 4 && rsi >= 256)) {
+            return -1;
+        }
+
+        Capability* frame_slot = cspace->getSlot(static_cast<CapID>(rdx));
+        if (!frame_slot || frame_slot->type() != CapType::Frame || !frame_slot->has_rights(CapRights::READ)) {
+            return -1;
+        }
+
+        int res = pt_obj->map_frame(rsi, frame_slot, r10);
+        return res;
     } else if (syscall_number == 5) {
-        // frame_alloc
-        CSpace* cspace = get_cspace();
-        if (!cspace) {
-            dprint("frame_alloc: no cspace\n\r");
-            return -1;
-        }
-        
-        UntypedMemory* untyped = get_cap_typed<UntypedMemory>(
-            cspace, static_cast<CapID>(rdi), ObjectType::UntypedMemory, CapRights::WRITE);
-        if (!untyped) {
-            dprint("frame_alloc: get_cap_typed failed for untyped cap ");
-            dprint_hex(rdi);
-            dprint("\n\r");
-            return -1;
-        }
-        
-        Frame* frame = untyped->retypeFrame(rsi);
-        if (!frame) {
-            dprint("frame_alloc: untyped->retypeFrame failed! requested pages: ");
-            dprint_dec(rsi);
-            dprint(", remaining bytes: ");
-            dprint_dec(untyped->remainingBytes());
-            dprint("\n\r");
-            return -1;
-        }
-        
-        Capability frame_cap(frame, CapRights::ALL);
-        CapID new_id = cspace->add(frame_cap);
-        frame->release();
-        
-        if (new_id == INVALID_CAP_ID) {
-            dprint("frame_alloc: cspace->add failed\n\r");
-            return static_cast<std::uint64_t>(-1);
-        }
-        return static_cast<std::uint64_t>(new_id);
+        // sys_frame_alloc (kernel-internal slot allocation abolished; use syscall 59 / userlib wrapper)
+        return SyscallResult(SYS_ERR_INVALID, 0);
     } else if (syscall_number == 60) {
         // exit
         if (g_get_current_thread_func) {
@@ -384,54 +628,76 @@ extern "C" SyscallResult handleSyscall(std::uint64_t rdi, std::uint64_t rsi, std
         }
         return 0;
     } else if (syscall_number == 7) {
-        // vspace_unmap
+        // sys_cap_unmap(mapped_cap)
         CSpace* cspace = get_cspace();
         if (!cspace) return -1;
-        
-        VSpace* vspace = get_cap_typed<VSpace>(
-            cspace, static_cast<CapID>(rdi), ObjectType::VSpace, CapRights::WRITE);
-        if (!vspace) return -1;
-        
-        if (!vspace->unmapUser(rsi)) return -1;
+
+        Capability* slot = cspace->getSlot(static_cast<CapID>(rdi));
+        if (!slot || !slot->has_slot_flag(SLOT_FLAG_IS_MAPPED)) {
+            return -1;
+        }
+
+        if (!unmap_capability_slot(slot)) {
+            return -1;
+        }
         return 0;
     } else if (syscall_number == 8) {
         // frame_phys_addr
         CSpace* cspace = get_cspace();
         if (!cspace) return 0;
         
-        Frame* frame = get_cap_typed<Frame>(
-            cspace, static_cast<CapID>(rdi), ObjectType::Frame, CapRights::READ);
-        if (!frame) return 0;
+        Capability* slot = cspace->getSlot(static_cast<CapID>(rdi));
+        if (!slot || slot->type() != CapType::Frame || !slot->has_rights(CapRights::READ)) return 0;
         
-        return static_cast<std::uint64_t>(frame->physicalAddress());
+        return static_cast<std::uint64_t>(slot->frame_phys());
     } else if (syscall_number == 9) {
-        // cap_mint
-        CSpace* cspace = get_cspace();
-        if (!cspace) return -1;
-        
-        Capability src_cap = cspace->get(static_cast<CapID>(rdi));
-        if (!src_cap.is_valid()) return -1;
-        if (!src_cap.can_duplicate()) return -1;
-        
-        CapRights new_rights = static_cast<CapRights>(rsi);
-        CapRights base_requested = new_rights & ~CapRights::ONCE;
-        if ((src_cap.rights & base_requested) != base_requested) return -1;
-        if ((new_rights & CapRights::ONCE) != CapRights::NONE) {
-            if ((src_cap.rights & CapRights::WRITE) != CapRights::WRITE) return -1;
+        // cap_mint(target_cspace, target_slot, src_cap, new_rights, badge)
+        CSpace* current_cs = get_cspace();
+        if (!current_cs) return SyscallResult(SYS_ERR_INVALID, 0);
+
+        CapID target_cs_id = static_cast<CapID>(rdi);
+        CapID target_slot = static_cast<CapID>(rsi);
+        CapID src_cap = static_cast<CapID>(rdx);
+        CapRights new_rights = static_cast<CapRights>(r10);
+        std::uint64_t badge = r8;
+
+        if (target_slot == 0 || target_slot >= CSpace::MAX_CAPS) return SyscallResult(SYS_ERR_INVALID, 0);
+        if (is_reserved_system_slot(target_slot)) return SyscallResult(SYS_ERR_INVALID, 0);
+
+        CSpace* target_cs = resolve_target_cspace(current_cs, target_cs_id);
+        if (!target_cs) return SyscallResult(SYS_ERR_PERM, 0);
+
+        Capability* target_slot_cap = target_cs->getSlot(target_slot);
+        if (!target_slot_cap || !target_slot_cap->is_null()) {
+            return SyscallResult(SYS_ERR_BUSY, 0);
         }
-        
-        std::uint64_t badge = (src_cap.badge != 0) ? src_cap.badge : rdx;
-        Capability minted(src_cap.object, new_rights, badge);
-        CapID new_id = cspace->add(minted);
-        
-        if (new_id == INVALID_CAP_ID) return static_cast<std::uint64_t>(-1);
-        return static_cast<std::uint64_t>(new_id);
+
+        Capability* src_slot = current_cs->getSlot(src_cap);
+        if (!src_slot || src_slot->is_null()) return SyscallResult(SYS_ERR_INVALID, 0);
+
+        // Privilege escalation check
+        if (new_rights == CapRights::ALL) {
+            new_rights = src_slot->rights();
+        } else if ((static_cast<std::uint32_t>(new_rights) & ~static_cast<std::uint32_t>(src_slot->rights())) != 0) {
+            return SyscallResult(SYS_ERR_PERM, 0);
+        }
+
+        if (!cap_copy(target_cs, target_slot, current_cs, src_cap, new_rights, badge, badge != 0)) {
+            return SyscallResult(SYS_ERR_INVALID, 0);
+        }
+        return SyscallResult(0, 0);
     } else if (syscall_number == 10) {
         // cap_delete
         CSpace* cspace = get_cspace();
         if (!cspace) return -1;
         
-        if (!cspace->remove(static_cast<CapID>(rdi))) return -1;
+        Capability* slot = cspace->getSlot(static_cast<CapID>(rdi));
+        if (!slot || slot->is_null()) return -1;
+
+        cdt_remove_and_reparent(slot);
+
+        Thread* current = g_get_current_thread_func ? g_get_current_thread_func() : nullptr;
+        handleSelfDestructionIfNeeded(current);
         return 0;
     } else if (syscall_number == 11) {
         // tcb_configure(tcb_cap, cspace_cap, vspace_cap, rip, user_rsp)
@@ -491,304 +757,286 @@ extern "C" SyscallResult handleSyscall(std::uint64_t rdi, std::uint64_t rsi, std
         target->is_blocked = true;
         return 0;
     } else if (syscall_number == 15) {
-        // cspace_create(untyped_cap)
-        CSpace* cspace = get_cspace();
-        if (!cspace) return -1;
-        
-        UntypedMemory* untyped = get_cap_typed<UntypedMemory>(
-            cspace, static_cast<CapID>(rdi), ObjectType::UntypedMemory, CapRights::WRITE);
-        if (!untyped) return -1;
-        
-        CSpaceCap* cs_cap_obj = untyped->retypeCSpace();
-        if (!cs_cap_obj) return -1;
-        
-        Capability cs_cap(cs_cap_obj, CapRights::ALL);
-        CapID new_id = cspace->add(cs_cap);
-        cs_cap_obj->release();
-        
-        if (new_id == INVALID_CAP_ID) return static_cast<std::uint64_t>(-1);
-        return static_cast<std::uint64_t>(new_id);
+        // cspace_create (abolished; use syscall 59 / userlib wrapper)
+        return SyscallResult(SYS_ERR_INVALID, 0);
     } else if (syscall_number == 16) {
-        // cspace_cap_insert
+        // cspace_cap_insert(target_cspace_cap, target_slot, src_cap_in_current_cspace, rights)
         CSpace* cspace = get_cspace();
         if (!cspace) return -1;
         
         CSpaceCap* target_cs = get_cap_typed<CSpaceCap>(
             cspace, static_cast<CapID>(rdi), ObjectType::CSpaceCap, CapRights::WRITE);
-        if (!target_cs) return -1;
-        
-        Capability src_cap = cspace->get(static_cast<CapID>(rdx));
-        if (!src_cap.is_valid()) return -1;
-        if (!src_cap.can_duplicate()) return -1;
-        
+        if (!target_cs || !target_cs->getCSpace()) return -1;
+
+        CapID target_slot = static_cast<CapID>(rsi);
+        CapID src_slot = static_cast<CapID>(rdx);
         CapRights new_rights = static_cast<CapRights>(r10);
-        CapRights base_requested = new_rights & ~CapRights::ONCE;
-        if ((src_cap.rights & base_requested) != base_requested) return -1;
-        if ((new_rights & CapRights::ONCE) != CapRights::NONE) {
-            if ((src_cap.rights & CapRights::WRITE) != CapRights::WRITE) return -1;
+
+        if (!cap_copy(target_cs->getCSpace(), target_slot, cspace, src_slot, new_rights)) {
+            return -1;
         }
-        
-        Capability minted(src_cap.object, new_rights, src_cap.badge);
-        if (!target_cs->insertCap(static_cast<CapID>(rsi), minted)) return -1;
         return 0;
     } else if (syscall_number == 17) {
-        // vspace_create(untyped_cap)
-        CSpace* cspace = get_cspace();
-        if (!cspace) return -1;
-        
-        UntypedMemory* untyped = get_cap_typed<UntypedMemory>(
-            cspace, static_cast<CapID>(rdi), ObjectType::UntypedMemory, CapRights::WRITE);
-        if (!untyped) return -1;
-        
-        std::uintptr_t pml4_phys = 0;
-        void* pml4_mem = untyped->allocateBytes(4096, 4096, pml4_phys);
-        if (!pml4_mem) return -1;
+        // sys_pagetable_create(untyped_cap, frame_cap, level, target_cspace, target_slot)
+        CSpace* current_cs = get_cspace();
+        if (!current_cs) return SyscallResult(SYS_ERR_INVALID, 0);
 
-        auto user_as = ProcessAddressSpace::createFromPhysical(
-            VSpace::createPhysicalAddress<PageTable>(pml4_phys),
-            Kernel::instance().getKernelSpace());
-        if (!user_as.isValid()) return -1;
-        auto* as_obj = untyped->allocateObject<ProcessAddressSpace>(std::move(user_as));
-        if (!as_obj) return -1;
-        
-        auto* vspace = untyped->allocateObject<VSpace>(as_obj, pml4_phys);
-        if (!vspace) return -1;
-        Capability vs_cap(vspace, CapRights::ALL);
-        CapID new_id = cspace->add(vs_cap);
-        vspace->release();
-        
-        if (new_id == INVALID_CAP_ID) return static_cast<std::uint64_t>(-1);
-        return static_cast<std::uint64_t>(new_id);
+        std::uint32_t level = static_cast<std::uint32_t>(rdx);
+        if (level < 1 || level > 4) return SyscallResult(SYS_ERR_INVALID, 0);
+
+        CapID target_cs_id = static_cast<CapID>(r10);
+        CapID target_slot = static_cast<CapID>(r8);
+        if (target_slot == 0 || target_slot >= CSpace::MAX_CAPS) return SyscallResult(SYS_ERR_INVALID, 0);
+        if (is_reserved_system_slot(target_slot)) return SyscallResult(SYS_ERR_INVALID, 0);
+
+        CSpace* target_cs = resolve_target_cspace(current_cs, target_cs_id);
+        if (!target_cs) return SyscallResult(SYS_ERR_PERM, 0);
+
+        Capability* target_slot_cap = target_cs->getSlot(target_slot);
+        if (!target_slot_cap || !target_slot_cap->is_null()) {
+            return SyscallResult(SYS_ERR_BUSY, 0);
+        }
+
+        Capability* ut_slot = current_cs->getSlot(static_cast<CapID>(rdi));
+        if (!ut_slot || ut_slot->type() != CapType::UntypedMemory ||
+            (!ut_slot->has_rights(CapRights::WRITE) && !ut_slot->has_rights(CapRights::DERIVE))) {
+            return SyscallResult(SYS_ERR_PERM, 0);
+        }
+        if (ut_slot->untyped_is_device()) return SyscallResult(SYS_ERR_INVALID, 0);
+
+        Capability* frame_slot = current_cs->getSlot(static_cast<CapID>(rsi));
+        if (!PageTableObject::validate_backing_frame(frame_slot)) {
+            return SyscallResult(SYS_ERR_INVALID, 0);
+        }
+
+        std::size_t saved_watermark = ut_slot->untyped_watermark();
+        auto* pt_obj = untyped_allocate_object<PageTableObject>(ut_slot, static_cast<std::uint8_t>(level));
+        if (!pt_obj) {
+            ut_slot->set_untyped_watermark(saved_watermark);
+            return SyscallResult(SYS_ERR_NO_MEMORY, 0);
+        }
+
+        pt_obj->bind_backing_frame(frame_slot, static_cast<std::uint8_t>(level));
+        init_pagetable_object_slot(target_slot_cap, pt_obj, static_cast<std::uint8_t>(level));
+        cdt_insert_child(ut_slot, target_slot_cap);
+        return SyscallResult(0, 0);
     } else if (syscall_number == 18) {
-        // irq_handler_create(untyped_cap, vector, notification_ep_cap)
-        CSpace* cspace = get_cspace();
-        if (!cspace || !g_register_irq_handler_fn || !g_eoi_fn) return -1;
-        
+        // irq_handler_create(untyped_cap, vector, notification_ep_cap, target_cspace, target_slot)
+        CSpace* current_cs = get_cspace();
+        if (!current_cs) return SyscallResult(SYS_ERR_INVALID, 0);
+
         std::uint8_t vector = static_cast<std::uint8_t>(rsi);
         // Whitelist check: only allow external IRQs defined in IDT (0x30 - 0x4F)
         if (vector < 0x30 || vector > 0x4F) {
-            return static_cast<std::uint64_t>(-1);
+            return SyscallResult(SYS_ERR_INVALID, 0);
         }
         // Conflict check: vector must not be already in use
-        if (oz::irq::getHandler(vector) != nullptr) {
-            return static_cast<std::uint64_t>(-1);
+        if (oz::irq::getHandler(vector) != nullptr && oz::irq::getHandler(vector)->isRegistered()) {
+            return SyscallResult(SYS_ERR_BUSY, 0);
         }
 
-        UntypedMemory* untyped = get_cap_typed<UntypedMemory>(
-            cspace, static_cast<CapID>(rdi), ObjectType::UntypedMemory, CapRights::WRITE);
-        if (!untyped) return -1;
-        
-        ChannelEndpoint* ep = get_cap_typed<ChannelEndpoint>(
-            cspace, static_cast<CapID>(rdx), ObjectType::ChannelEndpoint, CapRights::WRITE);
-        if (!ep) return -1;
-        
-        auto* handler = untyped->allocateObject<IRQHandler>(vector, g_register_irq_handler_fn, g_unregister_irq_handler_fn, g_eoi_fn);
-        if (!handler) return -1;
-        handler->setNotificationEndpoint(ep);
-        handler->registerHandler();
-        
-        Capability irq_cap(handler, CapRights::ALL);
-        CapID new_id = cspace->add(irq_cap);
-        handler->release();
-        
-        if (new_id == INVALID_CAP_ID) {
-            handler->unregisterHandler();
-            return static_cast<std::uint64_t>(-1);
+        CapID target_cs_id = static_cast<CapID>(r10);
+        CapID target_slot = static_cast<CapID>(r8);
+        if (target_slot == 0 || target_slot >= CSpace::MAX_CAPS) return SyscallResult(SYS_ERR_INVALID, 0);
+        if (is_reserved_system_slot(target_slot)) return SyscallResult(SYS_ERR_INVALID, 0);
+
+        CSpace* target_cs = resolve_target_cspace(current_cs, target_cs_id);
+        if (!target_cs) return SyscallResult(SYS_ERR_PERM, 0);
+
+        Capability* target_slot_cap = target_cs->getSlot(target_slot);
+        if (!target_slot_cap || !target_slot_cap->is_null()) {
+            return SyscallResult(SYS_ERR_BUSY, 0);
         }
-        return static_cast<std::uint64_t>(new_id);
+
+        Capability* ut_slot = nullptr;
+        if (rdi != 0 && rdi != INVALID_CAP_ID) {
+            ut_slot = current_cs->getSlot(static_cast<CapID>(rdi));
+            if (!ut_slot || ut_slot->type() != CapType::UntypedMemory || (!ut_slot->has_rights(CapRights::WRITE) && !ut_slot->has_rights(CapRights::DERIVE))) {
+                return SyscallResult(SYS_ERR_PERM, 0);
+            }
+        }
+
+        IRQHandler& handler = oz::g_irq_handlers[vector];
+        handler.vector = vector;
+        handler.unregisterAndReset();
+
+        if (rdx != 0 && rdx != INVALID_CAP_ID) {
+            Capability* ep_or_notif_slot = current_cs->getSlot(static_cast<CapID>(rdx));
+            if (ep_or_notif_slot && !ep_or_notif_slot->is_null()) {
+                if (ep_or_notif_slot->type() == CapType::ChannelEndpoint) {
+                    handler.setNotificationEndpoint(static_cast<ChannelEndpoint*>(ep_or_notif_slot->object()));
+                } else if (ep_or_notif_slot->type() == CapType::Notification) {
+                    handler.setNotification(static_cast<Notification*>(ep_or_notif_slot->object()), ep_or_notif_slot->badge());
+                }
+            }
+        }
+        handler.registerHandler();
+
+        init_irq_handler_slot(target_slot_cap, vector, &handler);
+        if (ut_slot) {
+            cdt_insert_child(ut_slot, target_slot_cap);
+        }
+        return SyscallResult(0, 0);
     } else if (syscall_number == 19) {
         // irq_ack
         CSpace* cspace = get_cspace();
         if (!cspace) return -1;
         
-        IRQHandler* handler = get_cap_typed<IRQHandler>(
-            cspace, static_cast<CapID>(rdi), ObjectType::IRQHandler, CapRights::WRITE);
-        if (!handler) return -1;
-        
-        if (!handler->acknowledge()) return -1;
+        Capability* slot = cspace->getSlot(static_cast<CapID>(rdi));
+        if (!slot || slot->type() != CapType::IRQHandler || !slot->has_rights(CapRights::ACK_WAIT)) {
+            return -1;
+        }
+        std::uint8_t vector = slot->irq_vector();
+        IRQHandler& handler = oz::g_irq_handlers[vector];
+        if (!handler.acknowledge()) return -1;
         return 0;
     } else if (syscall_number == 20) {
-        // ioport_create(parent_ioport_cap, untyped_cap, base_port, port_count)
-        CSpace* cspace = get_cspace();
-        if (!cspace) return -1;
-        
-        // 1. Verify parent IOPort capability and rights
-        Capability parent_cap = cspace->get(static_cast<CapID>(rdi));
-        if (!parent_cap.is_valid() || !parent_cap.object || parent_cap.object->objectType() != ObjectType::IOPort) {
-            return static_cast<std::uint64_t>(-1);
+        // ioport_create(parent_ioport_cap, base_port, port_count, target_cspace, target_slot)
+        CSpace* current_cs = get_cspace();
+        if (!current_cs) return SyscallResult(SYS_ERR_INVALID, 0);
+
+        Capability* parent_slot = current_cs->getSlot(static_cast<CapID>(rdi));
+        if (!parent_slot || parent_slot->type() != CapType::IOPort || !parent_slot->has_rights(CapRights::DERIVE)) {
+            return SyscallResult(SYS_ERR_PERM, 0);
         }
-        if ((parent_cap.rights & CapRights::WRITE) != CapRights::WRITE) {
-            return static_cast<std::uint64_t>(-1);
+
+        std::uint16_t parent_base = parent_slot->ioport_base();
+        std::uint32_t parent_count = parent_slot->ioport_count();
+
+        std::uint16_t base_port = static_cast<std::uint16_t>(rsi);
+        std::uint32_t port_count = static_cast<std::uint32_t>(rdx);
+
+        if (port_count == 0 || base_port < parent_base ||
+            static_cast<std::uint32_t>(base_port) + port_count > static_cast<std::uint32_t>(parent_base) + parent_count) {
+            return SyscallResult(SYS_ERR_INVALID, 0);
         }
-        auto* parent_ioport = static_cast<IOPort*>(parent_cap.object);
 
-        // 2. Verify untyped memory capability
-        UntypedMemory* untyped = get_cap_typed<UntypedMemory>(
-            cspace, static_cast<CapID>(rsi), ObjectType::UntypedMemory, CapRights::WRITE);
-        if (!untyped) return -1;
+        CapID target_cs_id = static_cast<CapID>(r10);
+        CapID target_slot = static_cast<CapID>(r8);
+        if (target_slot == 0 || target_slot >= CSpace::MAX_CAPS) return SyscallResult(SYS_ERR_INVALID, 0);
+        if (is_reserved_system_slot(target_slot)) return SyscallResult(SYS_ERR_INVALID, 0);
 
-        std::uint16_t base_port = static_cast<std::uint16_t>(rdx);
-        std::uint32_t port_count = static_cast<std::uint32_t>(r10);
+        CSpace* target_cs = resolve_target_cspace(current_cs, target_cs_id);
+        if (!target_cs) return SyscallResult(SYS_ERR_PERM, 0);
 
-        // 3. Check requested range is non-empty and contained within parent range
-        if (port_count == 0 || !parent_ioport->contains(base_port, port_count)) {
-            return static_cast<std::uint64_t>(-1);
+        Capability* target_slot_cap = target_cs->getSlot(target_slot);
+        if (!target_slot_cap || !target_slot_cap->is_null()) {
+            return SyscallResult(SYS_ERR_BUSY, 0);
         }
-        
-        auto* ioport = untyped->allocateObject<IOPort>(
-            base_port,
-            port_count,
-            parent_ioport->read8Fn(), parent_ioport->read16Fn(), parent_ioport->read32Fn(),
-            parent_ioport->write8Fn(), parent_ioport->write16Fn(), parent_ioport->write32Fn()
-        );
-        if (!ioport) return -1;
 
-        parent_ioport->addChild(ioport);
-        
-        Capability io_cap(ioport, parent_cap.rights);
-        CapID new_id = cspace->add(io_cap);
-        ioport->release();
-        
-        if (new_id == INVALID_CAP_ID) return static_cast<std::uint64_t>(-1);
-        return static_cast<std::uint64_t>(new_id);
+        init_ioport_slot(target_slot_cap, base_port, port_count);
+        target_slot_cap->set_rights(parent_slot->rights());
+        cdt_insert_child(parent_slot, target_slot_cap);
+        return SyscallResult(0, 0);
     } else if (syscall_number == 21) {
-        // ioport_read
+        // ioport_read(ioport_cap, port, size)
         CSpace* cspace = get_cspace();
         if (!cspace) return -1;
         
-        IOPort* ioport = get_cap_typed<IOPort>(
-            cspace, static_cast<CapID>(rdi), ObjectType::IOPort, CapRights::READ);
-        if (!ioport) return -1;
-        
+        Capability* slot = cspace->getSlot(static_cast<CapID>(rdi));
+        if (!slot || slot->type() != CapType::IOPort || !slot->has_rights(CapRights::IN)) {
+            return -1;
+        }
+
+        std::uint16_t base_port = slot->ioport_base();
+        std::uint32_t port_count = slot->ioport_count();
         std::uint16_t port = static_cast<std::uint16_t>(rsi);
-        if (rdx == 1) {
-            std::uint8_t val;
-            if (!ioport->read8(port, val)) return -1;
-            return static_cast<std::uint64_t>(val);
-        } else if (rdx == 2) {
-            std::uint16_t val;
-            if (!ioport->read16(port, val)) return -1;
-            return static_cast<std::uint64_t>(val);
-        } else if (rdx == 4) {
-            std::uint32_t val;
-            if (!ioport->read32(port, val)) return -1;
-            return static_cast<std::uint64_t>(val);
+        std::uint64_t size = rdx;
+
+        if (port < base_port || static_cast<std::uint32_t>(port) + size > static_cast<std::uint32_t>(base_port) + port_count) {
+            return -1;
+        }
+
+        if (size == 1) {
+            return static_cast<std::uint64_t>(oz::x86_64::readIO8(port));
+        } else if (size == 2) {
+            return static_cast<std::uint64_t>(oz::x86_64::readIO16(port));
+        } else if (size == 4) {
+            return static_cast<std::uint64_t>(oz::x86_64::readIO32(port));
         }
         return -1;
     } else if (syscall_number == 22) {
-        // ioport_write
+        // ioport_write(ioport_cap, port, value, size)
         CSpace* cspace = get_cspace();
         if (!cspace) return -1;
         
-        IOPort* ioport = get_cap_typed<IOPort>(
-            cspace, static_cast<CapID>(rdi), ObjectType::IOPort, CapRights::WRITE);
-        if (!ioport) return -1;
-        
+        Capability* slot = cspace->getSlot(static_cast<CapID>(rdi));
+        if (!slot || slot->type() != CapType::IOPort || !slot->has_rights(CapRights::OUT)) {
+            return -1;
+        }
+
+        std::uint16_t base_port = slot->ioport_base();
+        std::uint32_t port_count = slot->ioport_count();
         std::uint16_t port = static_cast<std::uint16_t>(rsi);
-        if (r10 == 1) {
-            if (!ioport->write8(port, static_cast<std::uint8_t>(rdx))) return -1;
-        } else if (r10 == 2) {
-            if (!ioport->write16(port, static_cast<std::uint16_t>(rdx))) return -1;
-        } else if (r10 == 4) {
-            if (!ioport->write32(port, static_cast<std::uint32_t>(rdx))) return -1;
+        std::uint64_t size = r10;
+
+        if (port < base_port || static_cast<std::uint32_t>(port) + size > static_cast<std::uint32_t>(base_port) + port_count) {
+            return -1;
+        }
+
+        if (size == 1) {
+            oz::x86_64::writeIO8(port, static_cast<std::uint8_t>(rdx));
+        } else if (size == 2) {
+            oz::x86_64::writeIO16(port, static_cast<std::uint16_t>(rdx));
+        } else if (size == 4) {
+            oz::x86_64::writeIO32(port, static_cast<std::uint32_t>(rdx));
         } else {
             return -1;
         }
         return 0;
     } else if (syscall_number == 23) {
-        // untyped_retype(untyped_cap, target_type, arg)
-        CSpace* cspace = get_cspace();
-        if (!cspace) return -1;
-
-        UntypedMemory* untyped = get_cap_typed<UntypedMemory>(
-            cspace, static_cast<CapID>(rdi), ObjectType::UntypedMemory, CapRights::WRITE);
-        if (!untyped) return -1;
-
-        ObjectType target_type = static_cast<ObjectType>(rsi);
-        KernelObject* obj = nullptr;
-
-        if (target_type == ObjectType::Frame) {
-            obj = untyped->retypeFrame(rdx); // rdx = num_pages
-        } else if (target_type == ObjectType::PageTable) {
-            obj = untyped->retypePageTable();
-        } else if (target_type == ObjectType::TCB) {
-            obj = untyped->retypeTCB(g_queue_thread_func);
-        } else if (target_type == ObjectType::CSpaceCap) {
-            obj = untyped->retypeCSpace();
-        } else if (target_type == ObjectType::UntypedMemory) {
-            obj = untyped->retypeUntyped(rdx); // rdx = size in bytes
-        } else if (target_type == ObjectType::Notification) {
-            obj = untyped->retypeNotification();
-        } else if (target_type == ObjectType::Baton) {
-            obj = untyped->retypeBaton();
-        } else if (target_type == ObjectType::ChannelEndpoint) {
-            ChannelEndpoint* end0 = nullptr;
-            ChannelEndpoint* end1 = nullptr;
-            if (!untyped->retypeChannelPair(&end0, &end1)) return -1;
-            Capability cap0(end0, CapRights::ALL);
-            Capability cap1(end1, CapRights::ALL);
-            CapID id0 = cspace->add(cap0);
-            CapID id1 = cspace->add(cap1);
-            end0->release();
-            end1->release();
-            if (id0 == INVALID_CAP_ID || id1 == INVALID_CAP_ID) return -1;
-            return (static_cast<std::uint64_t>(id1) << 32) | static_cast<std::uint64_t>(id0);
-        }
-
-        if (!obj) return -1;
-
-        Capability cap(obj, CapRights::ALL);
-        CapID new_id = cspace->add(cap);
-        obj->release();
-
-        if (new_id == INVALID_CAP_ID) return static_cast<std::uint64_t>(-1);
-        return static_cast<std::uint64_t>(new_id);
+        // untyped_retype (abolished; use syscall 59 / userlib wrapper)
+        return SyscallResult(SYS_ERR_INVALID, 0);
     } else if (syscall_number == 24) {
         // untyped_revoke(untyped_cap)
         CSpace* cspace = get_cspace();
         if (!cspace) return -1;
 
-        UntypedMemory* untyped = get_cap_typed<UntypedMemory>(
-            cspace, static_cast<CapID>(rdi), ObjectType::UntypedMemory, CapRights::WRITE);
-        if (!untyped) return -1;
-
-        untyped->revoke();
-        return 0;
-    } else if (syscall_number == 25) {
-        // vspace_map_pagetable(vspace_cap, pt_cap, virt_addr, level)
-        CSpace* cspace = get_cspace();
-        if (!cspace) return -1;
-
-        VSpace* vspace = get_cap_typed<VSpace>(
-            cspace, static_cast<CapID>(rdi), ObjectType::VSpace, CapRights::WRITE);
-        if (!vspace) return -1;
-
-        PageTableObject* pt_obj = get_cap_typed<PageTableObject>(
-            cspace, static_cast<CapID>(rsi), ObjectType::PageTable, CapRights::WRITE);
-        if (!pt_obj) return -1;
-
-        if (pt_obj->isMapped()) return -1;
-
-        std::uintptr_t virt = rdx;
-        std::uint8_t level = static_cast<std::uint8_t>(r10); // 1: PT, 2: PD, 3: PDPT
-        if (level < 1 || level > 3) return -1;
-
-        if (!vspace->installPageTable(virt, pt_obj->physicalAddress(), level)) {
+        Capability* ut_slot = cspace->getSlot(static_cast<CapID>(rdi));
+        if (!ut_slot || ut_slot->type() != CapType::UntypedMemory || !ut_slot->has_rights(CapRights::REVOKE)) {
             return -1;
         }
 
-        pt_obj->setMapped(true, level);
+        cdt_revoke_subtree(ut_slot);
+
+        Thread* current = g_get_current_thread_func ? g_get_current_thread_func() : nullptr;
+        handleSelfDestructionIfNeeded(current);
         return 0;
+    } else if (syscall_number == 25) {
+        // sys_pagetable_map(parent_pt_cap, index, child_pt_cap)
+        CSpace* cspace = get_cspace();
+        if (!cspace) return -1;
+
+        Capability* parent_slot = cspace->getSlot(static_cast<CapID>(rdi));
+        if (!parent_slot || (parent_slot->type() != CapType::PageTable && parent_slot->type() != CapType::VSpace) || !parent_slot->has_rights(CapRights::WRITE)) {
+            return -1;
+        }
+
+        auto* parent_pt = parent_slot->pagetable_object();
+        if (!parent_pt) return -1;
+
+        if (rsi >= 512 || (parent_pt->level() == 4 && rsi >= 256)) {
+            return -1;
+        }
+
+        Capability* child_slot = cspace->getSlot(static_cast<CapID>(rdx));
+        if (!child_slot || (child_slot->type() != CapType::PageTable && child_slot->type() != CapType::VSpace)) {
+            return -1;
+        }
+
+        int res = parent_pt->map_child_table(rsi, child_slot);
+        return res;
     } else if (syscall_number == 26) {
         // frame_size(frame_cap)
         CSpace* cspace = get_cspace();
         if (!cspace) return 0;
 
-        Frame* frame = get_cap_typed<Frame>(
-            cspace, static_cast<CapID>(rdi), ObjectType::Frame, CapRights::READ);
-        if (!frame) return 0;
+        Capability* frame_slot = cspace->getSlot(static_cast<CapID>(rdi));
+        if (!frame_slot || frame_slot->type() != CapType::Frame || !frame_slot->has_rights(CapRights::READ)) {
+            return 0;
+        }
 
-        return static_cast<std::uint64_t>(frame->size());
+        return static_cast<std::uint64_t>(frame_slot->frame_size());
     } else if (syscall_number == 27) {
         // sys_call(ep_cap, send_msg, recv_msg, flags)
         // rdi: ep_cap, rsi: send_msg, rdx: recv_msg, r10: flags
@@ -797,9 +1045,8 @@ extern "C" SyscallResult handleSyscall(std::uint64_t rdi, std::uint64_t rsi, std
         if (!is_user_buffer(rsi, sizeof(IPCMessage))) return SYS_ERR_INVALID;
         if (!is_user_buffer(rdx, sizeof(IPCMessage))) return SYS_ERR_INVALID;
 
-        Capability ep_cap_check = cspace->get(static_cast<CapID>(rdi));
-        if (!ep_cap_check.is_valid()) return SYS_ERR_INVALID;
-        bool is_once = ep_cap_check.is_once();
+        Capability* ep_slot = cspace->getSlot(static_cast<CapID>(rdi));
+        if (!ep_slot || ep_slot->is_null()) return SYS_ERR_INVALID;
 
         ChannelEndpoint* ep = get_cap_typed<ChannelEndpoint>(
             cspace, static_cast<CapID>(rdi), ObjectType::ChannelEndpoint, CapRights::WRITE);
@@ -821,7 +1068,6 @@ extern "C" SyscallResult handleSyscall(std::uint64_t rdi, std::uint64_t rsi, std
         // Check SEND_NONBLOCK mode
         if (ep->get_mode() == ChannelMode::SEND_NONBLOCK && !(flags & IPC_FLAG_BLOCK)) {
             if (!peer->has_recv_waiters()) {
-                if (is_once) cspace->remove(static_cast<CapID>(rdi));
                 return SYS_ERR_WOULDBLOCK;
             }
         }
@@ -829,17 +1075,20 @@ extern "C" SyscallResult handleSyscall(std::uint64_t rdi, std::uint64_t rsi, std
         const IPCMessage* msg = reinterpret_cast<const IPCMessage*>(rsi);
         InternalIPCMessage internal;
         internal.user_msg = *msg;
-        internal.user_msg.badge = ep_cap_check.badge;
+        internal.user_msg.badge = ep_slot->badge();
         if (msg->has_cap) {
-            if ((ep_cap_check.rights & CapRights::GRANT) == CapRights::NONE) return SYS_ERR_INVALID;
-            Capability src_cap = cspace->get(msg->transferred_cap);
-            if (!src_cap.is_valid()) return SYS_ERR_INVALID;
-            internal.attached_cap = src_cap;
-            cspace->remove(msg->transferred_cap);
+            if (!ep_slot->has_rights(CapRights::GRANT)) return SYS_ERR_INVALID;
+            if (msg->transferred_cap == 0 || msg->transferred_cap >= CSpace::MAX_CAPS ||
+                is_reserved_system_slot(msg->transferred_cap)) {
+                return SYS_ERR_INVALID;
+            }
+            Capability* src_cap = cspace->getSlot(msg->transferred_cap);
+            if (!src_cap || src_cap->is_null() || !src_cap->has_rights(CapRights::TRANSFER)) return SYS_ERR_INVALID;
         }
 
         current->recv_msg_buf = reinterpret_cast<IPCMessage*>(rdx);
         current->blocking_ep = ep;
+        current->recv_slot = static_cast<CapID>(r8);
 
         // Baton to lend is current thread's active baton
         Baton* baton_to_lend = current->get_active_baton();
@@ -847,16 +1096,14 @@ extern "C" SyscallResult handleSyscall(std::uint64_t rdi, std::uint64_t rsi, std
         // Check if receiver is already waiting on peer (Recv 先行 -> Call 到着)
         Thread* receiver = peer->pop_recv_waiter();
         if (receiver) {
-            dprint("[sys_call] Receiver found! Handoff baton and direct switch\n\r");
-            if (internal.attached_cap.is_valid()) {
-                if (receiver->cspace) {
-                    CapID new_id = receiver->cspace->add(internal.attached_cap);
-                    if (new_id != INVALID_CAP_ID) {
-                        internal.user_msg.transferred_cap = new_id;
-                        internal.user_msg.has_cap = true;
-                    }
-                }
-                internal.attached_cap = Capability();
+            if (internal.user_msg.has_cap) {
+                bool out_has_cap = false;
+                CapID out_cap = 0;
+                transfer_or_drop_ipc_cap(receiver->cspace, receiver->recv_slot, cspace, internal.user_msg.transferred_cap, out_has_cap, out_cap);
+                internal.user_msg.transferred_cap = out_cap;
+                internal.user_msg.has_cap = out_has_cap;
+            } else {
+                internal.user_msg.has_cap = false;
             }
             receiver->kernel_ipc_msg = internal.user_msg;
             receiver->has_kernel_ipc_msg = true;
@@ -895,8 +1142,10 @@ extern "C" SyscallResult handleSyscall(std::uint64_t rdi, std::uint64_t rsi, std
             }
 
             current->blocking_ep = nullptr;
-            if (is_once) {
-                cspace->remove(static_cast<CapID>(rdi));
+            if (current->ipc_error != 0) {
+                int err = current->ipc_error;
+                current->ipc_error = 0;
+                return SyscallResult(err, 0);
             }
             if (current->ipc_cancelled) {
                 current->ipc_cancelled = false;
@@ -906,7 +1155,6 @@ extern "C" SyscallResult handleSyscall(std::uint64_t rdi, std::uint64_t rsi, std
         }
 
         // Server not waiting (Call 先行 -> Recv 到着)
-        dprint("[sys_call] Server not waiting! Added send waiter, yielding BLOCKED\n\r");
         current->send_msg = internal;
         current->state = ThreadState::BlockedOnCall;
         current->is_blocked = true;
@@ -942,8 +1190,10 @@ extern "C" SyscallResult handleSyscall(std::uint64_t rdi, std::uint64_t rsi, std
         }
 
         current->blocking_ep = nullptr;
-        if (is_once) {
-            cspace->remove(static_cast<CapID>(rdi));
+        if (current->ipc_error != 0) {
+            int err = current->ipc_error;
+            current->ipc_error = 0;
+            return SyscallResult(err, 0);
         }
         if (current->ipc_cancelled) {
             current->ipc_cancelled = false;
@@ -963,6 +1213,7 @@ extern "C" SyscallResult handleSyscall(std::uint64_t rdi, std::uint64_t rsi, std
         const IPCMessage* reply_msg = reinterpret_cast<const IPCMessage*>(rsi);
         IPCMessage* recv_msg = reinterpret_cast<IPCMessage*>(rdx);
         std::uint32_t flags = static_cast<std::uint32_t>(r10);
+        CapID recv_slot = static_cast<CapID>(r8);
 
         if (rsi != 0 && !is_user_buffer(rsi, sizeof(IPCMessage))) {
             return SYS_ERR_INVALID;
@@ -1008,17 +1259,51 @@ extern "C" SyscallResult handleSyscall(std::uint64_t rdi, std::uint64_t rsi, std
         else if (client != nullptr && b_baton != nullptr) {
             // Deliver reply if reply_msg != nullptr
             if (reply_msg != nullptr) {
-                IPCMessage reply_to_send = *reply_msg;
-                if (reply_msg->has_cap && client->cspace) {
-                    Capability cap = cspace->get(reply_msg->transferred_cap);
-                    if (cap.is_valid()) {
-                        CapID new_id = client->cspace->add(cap);
-                        reply_to_send.transferred_cap = new_id;
-                        reply_to_send.has_cap = (new_id != INVALID_CAP_ID);
-                        cspace->remove(reply_msg->transferred_cap);
-                    } else {
-                        reply_to_send.has_cap = false;
+                if (reply_msg->has_cap) {
+                    bool ep_authorized = false;
+                    if (ep_cap_id != 0 && ep_cap_id != INVALID_CAP_ID) {
+                        Capability* ep_slot = cspace->getSlot(ep_cap_id);
+                        if (ep_slot && ep_slot->type() == CapType::ChannelEndpoint &&
+                            (ep_slot->has_rights(CapRights::GRANT_REPLY) || ep_slot->has_rights(CapRights::GRANT))) {
+                            ep_authorized = true;
+                        }
                     }
+                    if (!ep_authorized && client->blocking_ep) {
+                        ChannelEndpoint* peer_ep = client->blocking_ep->get_peer();
+                        for (std::size_t i = 0; i < CSpace::MAX_CAPS; ++i) {
+                            Capability* slot = cspace->getSlot(i);
+                            if (slot && slot->type() == CapType::ChannelEndpoint &&
+                                reinterpret_cast<ChannelEndpoint*>(slot->object()) == peer_ep) {
+                                if (slot->has_rights(CapRights::GRANT_REPLY) || slot->has_rights(CapRights::GRANT)) {
+                                    ep_authorized = true;
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    if (!ep_authorized) {
+                        return SYS_ERR_INVALID;
+                    }
+
+                    if (reply_msg->transferred_cap == 0 || reply_msg->transferred_cap >= CSpace::MAX_CAPS ||
+                        is_reserved_system_slot(reply_msg->transferred_cap)) {
+                        return SYS_ERR_INVALID;
+                    }
+                    Capability* src_cap = cspace->getSlot(reply_msg->transferred_cap);
+                    if (!src_cap || src_cap->is_null() || !src_cap->has_rights(CapRights::TRANSFER)) {
+                        return SYS_ERR_INVALID;
+                    }
+                }
+
+                IPCMessage reply_to_send = *reply_msg;
+                if (reply_msg->has_cap) {
+                    bool out_has_cap = false;
+                    CapID out_cap = 0;
+                    transfer_or_drop_ipc_cap(client->cspace, client->recv_slot, cspace, reply_msg->transferred_cap, out_has_cap, out_cap);
+                    reply_to_send.transferred_cap = out_cap;
+                    reply_to_send.has_cap = out_has_cap;
+                } else {
+                    reply_to_send.has_cap = false;
                 }
                 client->kernel_ipc_msg = reply_to_send;
                 client->has_kernel_ipc_msg = true;
@@ -1067,13 +1352,17 @@ extern "C" SyscallResult handleSyscall(std::uint64_t rdi, std::uint64_t rsi, std
 
             // Check if a client is already waiting on peer
             Thread* sender = peer ? peer->pop_send_waiter() : nullptr;
+
             if (sender) {
                 *recv_msg = sender->send_msg.user_msg;
-                if (sender->send_msg.attached_cap.is_valid()) {
-                    CapID new_id = cspace->add(sender->send_msg.attached_cap);
-                    recv_msg->transferred_cap = new_id;
-                    recv_msg->has_cap = (new_id != INVALID_CAP_ID);
-                    sender->send_msg.attached_cap = Capability();
+                if (sender->send_msg.user_msg.has_cap) {
+                    bool out_has_cap = false;
+                    CapID out_cap = 0;
+                    transfer_or_drop_ipc_cap(cspace, recv_slot, sender->cspace, sender->send_msg.user_msg.transferred_cap, out_has_cap, out_cap);
+                    recv_msg->transferred_cap = out_cap;
+                    recv_msg->has_cap = out_has_cap;
+                } else {
+                    recv_msg->has_cap = false;
                 }
 
                 // Lend sender's active baton to current as borrowed_baton
@@ -1136,6 +1425,7 @@ extern "C" SyscallResult handleSyscall(std::uint64_t rdi, std::uint64_t rsi, std
                     current->is_blocked = true;
                     current->blocking_ep = ep;
                     current->recv_msg_buf = recv_msg;
+                    current->recv_slot = recv_slot;
                     ep->add_recv_waiter(current);
 
                     if (action == NextAction::NONE) {
@@ -1171,6 +1461,11 @@ extern "C" SyscallResult handleSyscall(std::uint64_t rdi, std::uint64_t rsi, std
                     current->has_kernel_ipc_msg = false;
                 }
                 current->blocking_ep = nullptr;
+                if (current->ipc_error != 0) {
+                    int err = current->ipc_error;
+                    current->ipc_error = 0;
+                    return SyscallResult(err, 0);
+                }
                 if (current->ipc_cancelled) {
                     current->ipc_cancelled = false;
                     return SYS_ERR_CANCELLED;
@@ -1204,6 +1499,11 @@ extern "C" SyscallResult handleSyscall(std::uint64_t rdi, std::uint64_t rsi, std
                     current->has_kernel_ipc_msg = false;
                 }
                 current->blocking_ep = nullptr;
+                if (current->ipc_error != 0) {
+                    int err = current->ipc_error;
+                    current->ipc_error = 0;
+                    return SyscallResult(err, 0);
+                }
                 if (current->ipc_cancelled) {
                     current->ipc_cancelled = false;
                     return SYS_ERR_CANCELLED;
@@ -1233,6 +1533,11 @@ extern "C" SyscallResult handleSyscall(std::uint64_t rdi, std::uint64_t rsi, std
                     current->has_kernel_ipc_msg = false;
                 }
                 current->blocking_ep = nullptr;
+                if (current->ipc_error != 0) {
+                    int err = current->ipc_error;
+                    current->ipc_error = 0;
+                    return SyscallResult(err, 0);
+                }
                 if (current->ipc_cancelled) {
                     current->ipc_cancelled = false;
                     return SYS_ERR_CANCELLED;
@@ -1288,32 +1593,11 @@ extern "C" SyscallResult handleSyscall(std::uint64_t rdi, std::uint64_t rsi, std
         if (!cap_copy(cspace, dest, src, rights)) return -1;
         return 0;
     } else if (syscall_number == 33) {
-        CSpace* cspace = get_cspace();
-        if (!cspace) return -1;
-        if (!is_user_buffer(r10, sizeof(CapID))) return -1;
-        if (!is_user_buffer(r8, sizeof(CapID))) return -1;
-        CapRights r0 = static_cast<CapRights>(rsi);
-        CapRights r1 = static_cast<CapRights>(rdx);
-        CapID* out0 = reinterpret_cast<CapID*>(r10);
-        CapID* out1 = reinterpret_cast<CapID*>(r8);
-        ChannelMode m0 = static_cast<ChannelMode>(r9 & 0xFFFFFFFF);
-        ChannelMode m1 = static_cast<ChannelMode>((r9 >> 32) & 0xFFFFFFFF);
-        if (sys_channel_create_ext(cspace, static_cast<CapID>(rdi), r0, r1, out0, out1, m0, m1)) return 0;
-        return -1;
+        // channel_create_ext (abolished; use sys_channel_create)
+        return SyscallResult(SYS_ERR_INVALID, 0);
     } else if (syscall_number == 34) {
-        // notification_create(untyped_cap)
-        CSpace* cspace = get_cspace();
-        if (!cspace) return -1;
-        UntypedMemory* untyped = get_cap_typed<UntypedMemory>(
-            cspace, static_cast<CapID>(rdi), ObjectType::UntypedMemory, CapRights::WRITE);
-        if (!untyped) return -1;
-        Notification* notif = untyped->retypeNotification();
-        if (!notif) return -1;
-        Capability notif_cap(notif, CapRights::ALL);
-        CapID new_id = cspace->add(notif_cap);
-        notif->release();
-        if (new_id == INVALID_CAP_ID) return static_cast<std::uint64_t>(-1);
-        return static_cast<std::uint64_t>(new_id);
+        // notification_create (abolished; use sys_untyped_retype_bulk / userlib sys_notification_create)
+        return SyscallResult(SYS_ERR_INVALID, 0);
     } else if (syscall_number == 35) {
         // notification_signal(notif_cap, badge)
         CSpace* cspace = get_cspace();
@@ -1392,13 +1676,6 @@ extern "C" SyscallResult handleSyscall(std::uint64_t rdi, std::uint64_t rsi, std
         Notification* notif = get_cap_typed<Notification>(
             cspace, static_cast<CapID>(rsi), ObjectType::Notification, CapRights::WRITE);
         if (!notif) return -1;
-        dprint("channel_bind_notification: ep=");
-        dprint_hex(reinterpret_cast<std::uint64_t>(ep));
-        dprint(", notif=");
-        dprint_hex(reinterpret_cast<std::uint64_t>(notif));
-        dprint(", badge=");
-        dprint_hex(rdx);
-        dprint("\n\r");
         ep->bind_notification(notif, rdx);
         return 0;
     } else if (syscall_number == 38) {
@@ -1464,11 +1741,6 @@ extern "C" SyscallResult handleSyscall(std::uint64_t rdi, std::uint64_t rsi, std
         // sys_baton_switch(target_baton_cap, quantum_us)
         // rdi: target_baton_cap
         // rsi: quantum_us
-        dprint("[DEBUG sys_baton_switch ENTER] cap=");
-        dprint_dec(rdi);
-        dprint(" q=");
-        dprint_dec(rsi);
-        dprint("\n\r");
         CSpace* cspace = get_cspace();
         if (!cspace) return SyscallResult(static_cast<std::uint64_t>(SYS_ERR_INVALID), 0);
 
@@ -1483,37 +1755,31 @@ extern "C" SyscallResult handleSyscall(std::uint64_t rdi, std::uint64_t rsi, std
         Baton* baton = get_cap_typed<Baton>(
             cspace, static_cast<CapID>(rdi), ObjectType::Baton, CapRights::WRITE);
         if (!baton) {
-            dprint("[DEBUG sys_baton_switch FAIL] !baton\n\r");
             return SyscallResult(static_cast<std::uint64_t>(SchedReason::ORPHANED), 0);
         }
 
         // 不変条件 2（デカルト木非所属不変条件）: target が irq_baton の場合は SYS_ERR_INVALID で拒絶
         if (baton->is_irq_baton) {
-            dprint("[DEBUG sys_baton_switch FAIL] is_irq_baton\n\r");
             return SyscallResult(static_cast<std::uint64_t>(SYS_ERR_INVALID), 0);
         }
 
         if (!baton->thread) {
-            dprint("[DEBUG sys_baton_switch FAIL] !baton->thread\n\r");
             return SyscallResult(static_cast<std::uint64_t>(SchedReason::ORPHANED), 0);
         }
 
         // 1. ループ検出 (デッドロック防止: 設計書 4.2 不変条件2, 5.2 (1))
         if (baton->state == BatonState::WAIT_RETURN) {
-            dprint("[DEBUG sys_baton_switch FAIL] WAIT_RETURN\n\r");
             return SyscallResult(static_cast<std::uint64_t>(SYS_ERR_DEADLK), 0);
         }
 
         ExecutionContext* target = baton->thread;
         if (target->is_dead) {
-            dprint("[DEBUG sys_baton_switch FAIL] target is_dead\n\r");
             baton->thread = nullptr;
             return SyscallResult(static_cast<std::uint64_t>(SchedReason::EXIT), 0);
         }
 
         // 走行中コンテキスト自身へのスイッチ禁止
         if (target == current) {
-            dprint("[DEBUG sys_baton_switch FAIL] target == current\n\r");
             return SyscallResult(static_cast<std::uint64_t>(SYS_ERR_DEADLK), 0);
         }
 
@@ -1526,17 +1792,11 @@ extern "C" SyscallResult handleSyscall(std::uint64_t rdi, std::uint64_t rsi, std
         }
 
         if (!baton->has_budget()) {
-            dprint("[DEBUG sys_baton_switch FAIL] !has_budget\n\r");
             return SyscallResult(static_cast<std::uint64_t>(SchedReason::TIMEOUT), 0);
         }
 
         if (target->is_blocked || target->state != ThreadState::Ready ||
             (baton->state != BatonState::WAIT_START && target->baton != baton)) {
-            dprint("[DEBUG sys_baton_switch FAIL] target is_blocked or not Ready state=");
-            dprint_dec(static_cast<std::uint64_t>(target->state));
-            dprint(" is_blocked=");
-            dprint_dec(target->is_blocked ? 1 : 0);
-            dprint("\n\r");
             return SyscallResult(static_cast<std::uint64_t>(SchedReason::BLOCKED), 0);
         }
 
@@ -1791,20 +2051,25 @@ extern "C" SyscallResult handleSyscall(std::uint64_t rdi, std::uint64_t rsi, std
         CSpace* cspace = get_cspace();
         if (!cspace) return SyscallResult(-1, 0);
 
-        IRQHandler* handler = get_cap_typed<IRQHandler>(
-            cspace, static_cast<CapID>(rdi), ObjectType::IRQHandler, CapRights::WRITE);
-        if (!handler) return SyscallResult(-1, 0);
-
-        handler->acknowledge();
+        Capability* slot = cspace->getSlot(static_cast<CapID>(rdi));
+        if (!slot || slot->type() != CapType::IRQHandler || !slot->has_rights(CapRights::ACK_WAIT)) {
+            return SyscallResult(-1, 0);
+        }
+        std::uint8_t vector = slot->irq_vector();
+        IRQHandler& handler = oz::g_irq_handlers[vector];
+        handler.acknowledge();
         return SyscallResult(0, 0);
     } else if (syscall_number == 48) {
         // sys_irq_handler_set_notification(irq_handler_cap, notif_cap, badge)
         CSpace* cspace = get_cspace();
         if (!cspace) return SyscallResult(-1, 0);
 
-        IRQHandler* handler = get_cap_typed<IRQHandler>(
-            cspace, static_cast<CapID>(rdi), ObjectType::IRQHandler, CapRights::WRITE);
-        if (!handler) return SyscallResult(-1, 0);
+        Capability* slot = cspace->getSlot(static_cast<CapID>(rdi));
+        if (!slot || slot->type() != CapType::IRQHandler || !slot->has_rights(CapRights::BIND)) {
+            return SyscallResult(-1, 0);
+        }
+        std::uint8_t vector = slot->irq_vector();
+        IRQHandler* handler = &oz::g_irq_handlers[vector];
 
         Notification* notif = nullptr;
         if (static_cast<CapID>(rsi) != INVALID_CAP_ID && rsi != 0) {
@@ -1827,8 +2092,13 @@ extern "C" SyscallResult handleSyscall(std::uint64_t rdi, std::uint64_t rsi, std
         Thread* current = g_get_current_thread_func ? g_get_current_thread_func() : nullptr;
         if (!current) return SyscallResult(static_cast<std::uint64_t>(SYS_ERR_INVALID), 0);
 
-        IRQHandler* handler = get_cap_typed<IRQHandler>(
-            cspace, static_cast<CapID>(rdi), ObjectType::IRQHandler, CapRights::WRITE);
+        Capability* slot = cspace->getSlot(static_cast<CapID>(rdi));
+        if (!slot || slot->type() != CapType::IRQHandler || !slot->has_rights(CapRights::ACK_WAIT)) {
+            return SyscallResult(static_cast<std::uint64_t>(SYS_ERR_INVALID), 0);
+        }
+        std::uint8_t vector = slot->irq_vector();
+        IRQHandler* handler = &oz::g_irq_handlers[vector];
+
         Baton* next_irq_baton = get_cap_typed<Baton>(
             cspace, static_cast<CapID>(rsi), ObjectType::Baton, CapRights::USE);
 
@@ -2099,43 +2369,64 @@ extern "C" SyscallResult handleSyscall(std::uint64_t rdi, std::uint64_t rsi, std
         if (!cspace->revoke(static_cast<CapID>(rdi))) {
             return SyscallResult(static_cast<std::uint64_t>(SYS_ERR_INVALID), 0);
         }
+        Thread* current = g_get_current_thread_func ? g_get_current_thread_func() : nullptr;
+        handleSelfDestructionIfNeeded(current);
         return SyscallResult(0, 0);
     } else if (syscall_number == 56) {
-        // sys_baton_create_irq(irq_control_cap, untyped_cap, initial_budget_us)
-        // rdi: irq_control_cap, rsi: untyped_cap, rdx: initial_budget_us
-        CSpace* cspace = get_cspace();
-        if (!cspace) return SyscallResult(static_cast<std::uint64_t>(SYS_ERR_INVALID), 0);
+        // sys_baton_create_irq(irq_control_cap, untyped_cap, initial_budget_us, target_cspace, target_slot)
+        // rdi: irq_control_cap, rsi: untyped_cap, rdx: initial_budget_us, r10: target_cspace, r8: target_slot
+        CSpace* current_cs = get_cspace();
+        if (!current_cs) return SyscallResult(SYS_ERR_INVALID, 0);
 
-        IRQBatonControl* ctrl = get_cap_typed<IRQBatonControl>(
-            cspace, static_cast<CapID>(rdi), ObjectType::IRQBatonControl, CapRights::WRITE);
-        if (!ctrl) {
-            return SyscallResult(static_cast<std::uint64_t>(SYS_ERR_PERM), 0);
+        CapID ctrl_cap = static_cast<CapID>(rdi);
+        CapID ut_cap = static_cast<CapID>(rsi);
+        std::uint64_t budget = rdx;
+        CapID target_cs_id = static_cast<CapID>(r10);
+        CapID target_slot = static_cast<CapID>(r8);
+
+        if (target_slot == 0 || target_slot >= CSpace::MAX_CAPS) return SyscallResult(SYS_ERR_INVALID, 0);
+        if (is_reserved_system_slot(target_slot)) return SyscallResult(SYS_ERR_INVALID, 0);
+
+        Capability* ctrl_slot = current_cs->getSlot(ctrl_cap);
+        if (!ctrl_slot || ctrl_slot->type() != CapType::IRQBatonControl) {
+            return SyscallResult(SYS_ERR_PERM, 0);
         }
 
-        UntypedMemory* untyped = get_cap_typed<UntypedMemory>(
-            cspace, static_cast<CapID>(rsi), ObjectType::UntypedMemory, CapRights::WRITE);
-        if (!untyped) {
-            return SyscallResult(static_cast<std::uint64_t>(SYS_ERR_INVALID), 0);
+        Capability* ut_slot = current_cs->getSlot(ut_cap);
+        if (!ut_slot || ut_slot->type() != CapType::UntypedMemory ||
+            (!ut_slot->has_rights(CapRights::WRITE) && !ut_slot->has_rights(CapRights::DERIVE))) {
+            return SyscallResult(SYS_ERR_PERM, 0);
+        }
+        if (ut_slot->untyped_is_device()) {
+            return SyscallResult(SYS_ERR_INVALID, 0);
         }
 
-        Baton* baton = untyped->allocateObject<Baton>(true);
+        CSpace* target_cs = resolve_target_cspace(current_cs, target_cs_id);
+        if (!target_cs) return SyscallResult(SYS_ERR_PERM, 0);
+
+        Capability* slot = target_cs->getSlot(target_slot);
+        if (!slot || !slot->is_null()) {
+            return SyscallResult(SYS_ERR_BUSY, 0);
+        }
+
+        if (!untyped_can_allocate_bulk(ut_slot, ObjectType::Baton, sizeof(Baton), 1)) {
+            return SyscallResult(SYS_ERR_NO_MEMORY, 0);
+        }
+
+        Baton* baton = untyped_allocate_object<Baton>(ut_slot, true);
         if (!baton) {
-            return SyscallResult(static_cast<std::uint64_t>(SYS_ERR_INVALID), 0);
+            return SyscallResult(SYS_ERR_NO_MEMORY, 0);
         }
 
         baton->is_irq_baton = true;
-        baton->remaining = rdx;
-        baton->quantum = rdx;
+        baton->remaining = budget;
+        baton->quantum = budget;
         baton->state = BatonState::READY;
 
-        Capability new_cap(baton, CapRights::ALL);
-        CapID new_slot = cspace->add(new_cap);
-        baton->release();
-        if (new_slot == INVALID_CAP_ID) {
-            return SyscallResult(static_cast<std::uint64_t>(SYS_ERR_INVALID), 0);
-        }
+        init_kernel_object_slot(slot, baton, CapRights::ALL & ~CapRights::DUPLICATE);
+        cdt_insert_child(ut_slot, slot);
 
-        return SyscallResult(new_slot, 0);
+        return SyscallResult(0, 0);
     } else if (syscall_number == 57) {
         // sys_baton_set_budget(baton_cap, budget_us)
         // rdi: baton_cap, rsi: budget_us
@@ -2182,6 +2473,46 @@ extern "C" SyscallResult handleSyscall(std::uint64_t rdi, std::uint64_t rsi, std
         }
 
         return SyscallResult(0, 0);
+    } else if (syscall_number == 58) {
+        // sys_cap_identify(cap_id, info_ptr)
+        CSpace* cspace = get_cspace();
+        if (!cspace) return SyscallResult(static_cast<std::uint64_t>(SYS_ERR_INVALID), 0);
+        if (!is_user_buffer(rsi, sizeof(CapInfo))) return SyscallResult(static_cast<std::uint64_t>(SYS_ERR_INVALID), 0);
+
+        Capability* slot = cspace->getSlot(static_cast<CapID>(rdi));
+        if (!slot || slot->is_null()) return SyscallResult(static_cast<std::uint64_t>(SYS_ERR_INVALID), 0);
+
+        CapInfo info{};
+        info.type = static_cast<std::uint8_t>(slot->type());
+        info.level = 0;
+        info.is_mapped = slot->has_slot_flag(SLOT_FLAG_IS_MAPPED) ? 1 : 0;
+        info.padding = 0;
+        info.rights = static_cast<std::uint32_t>(slot->rights());
+        info.size = 0;
+
+        if (slot->type() == CapType::Frame) {
+            info.size = 4096;
+        } else if (slot->type() == CapType::PageTable || slot->type() == CapType::VSpace) {
+            auto* pt = slot->pagetable_object();
+            if (pt) info.level = pt->level();
+            info.size = 4096;
+        } else if (slot->type() == CapType::UntypedMemory) {
+            info.size = slot->untyped_size();
+        }
+
+        utils::memcpy(reinterpret_cast<void*>(rsi), &info, sizeof(CapInfo));
+        return SyscallResult(0, 0);
+    } else if (syscall_number == 59) {
+        // sys_untyped_retype_bulk(ut_cap, type, size_or_arg, target_cspace, start_slot, count)
+        // rdi: ut_cap, rsi: type, rdx: size_or_arg, r10: target_cspace, r8: start_slot, r9: count
+        return handle_untyped_retype_bulk(
+            static_cast<CapID>(rdi),
+            static_cast<ObjectType>(rsi),
+            rdx,
+            static_cast<CapID>(r10),
+            static_cast<CapID>(r8),
+            static_cast<std::size_t>(r9)
+        );
     }
     
     return SyscallResult(static_cast<std::uint64_t>(-1), 0);

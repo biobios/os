@@ -55,7 +55,8 @@ extern "C" void _start() {
             oz::sys_cspace_cap_move(xhci_proc.cspace_cap, 3, irq_handler);
             oz::sys_cspace_cap_insert(xhci_proc.cspace_cap, 4, kbd_ring_frame, static_cast<std::uint32_t>(oz::CapRights::ALL));
             oz::sys_cspace_cap_insert(xhci_proc.cspace_cap, 5, notif_wm_kbd, static_cast<std::uint32_t>(oz::CapRights::WRITE | oz::CapRights::GRANT));
-            oz::sys_cspace_cap_insert(xhci_proc.cspace_cap, oz::CAP_UNTYPED, oz::CAP_UNTYPED, static_cast<std::uint32_t>(oz::CapRights::ALL));
+            std::uint32_t xhci_ut = oz::sys_untyped_retype(oz::CAP_UNTYPED, static_cast<std::uint32_t>(oz::ObjectType::UntypedMemory), 4 * 1024 * 1024);
+            oz::sys_cspace_cap_move(xhci_proc.cspace_cap, oz::CAP_UNTYPED, xhci_ut);
             oz::sys_cspace_cap_insert(xhci_proc.cspace_cap, oz::CAP_IRQ_CONTROL, oz::CAP_IRQ_CONTROL, static_cast<std::uint32_t>(oz::CapRights::ALL));
             oz::sys_cspace_cap_insert(xhci_proc.cspace_cap, 241, oz::CAP_XHCI_MMIO, static_cast<std::uint32_t>(oz::CapRights::ALL));
 

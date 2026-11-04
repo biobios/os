@@ -1,23 +1,62 @@
 #include "core/Channel.hpp"
 #include "core/Thread.hpp"
 #include "core/Notification.hpp"
+#include "core/IRQHandler.hpp"
 
 namespace oz {
 
 extern void (*g_unblock_thread_func)(Thread*);
 
+static ChannelEndpoint* s_channel_list_head = nullptr;
+
+ChannelEndpoint::ChannelEndpoint(bool untyped)
+    : KernelObject(ObjectType::ChannelEndpoint, untyped) {
+    reg_prev_ = nullptr;
+    reg_next_ = s_channel_list_head;
+    if (s_channel_list_head) {
+        s_channel_list_head->reg_prev_ = this;
+    }
+    s_channel_list_head = this;
+}
+
 ChannelEndpoint::~ChannelEndpoint() {
+    if (reg_prev_) {
+        reg_prev_->reg_next_ = reg_next_;
+    } else if (s_channel_list_head == this) {
+        s_channel_list_head = reg_next_;
+    }
+    if (reg_next_) {
+        reg_next_->reg_prev_ = reg_prev_;
+    }
+    reg_prev_ = nullptr;
+    reg_next_ = nullptr;
+
     unbind_notification();
     if (peer) {
         peer->on_peer_closed();
     }
     while (Thread* t = pop_recv_waiter()) {
+        t->ipc_cancelled = true;
         t->state = ThreadState::Ready;
         if (g_unblock_thread_func) g_unblock_thread_func(t);
     }
     while (Thread* t = pop_send_waiter()) {
+        t->ipc_cancelled = true;
         t->state = ThreadState::Ready;
         if (g_unblock_thread_func) g_unblock_thread_func(t);
+    }
+
+    // 逆引き強制アンバインド
+    for_each_registered_thread([this](Thread* t) {
+        if (!t) return;
+        if (t->fault_ep == this) t->fault_ep = nullptr;
+        if (t->blocking_ep == this) t->blocking_ep = nullptr;
+    });
+
+    for (std::size_t i = 0; i < 256; ++i) {
+        if (g_irq_handlers[i].notification_ep_ == this) {
+            g_irq_handlers[i].notification_ep_ = nullptr;
+        }
     }
 }
 
@@ -27,10 +66,12 @@ void ChannelEndpoint::on_peer_closed() {
         bound_notification_->signal(bound_badge_);
     }
     while (Thread* t = pop_recv_waiter()) {
+        t->ipc_cancelled = true;
         t->state = ThreadState::Ready;
         if (g_unblock_thread_func) g_unblock_thread_func(t);
     }
     while (Thread* t = pop_send_waiter()) {
+        t->ipc_cancelled = true;
         t->state = ThreadState::Ready;
         if (g_unblock_thread_func) g_unblock_thread_func(t);
     }
@@ -39,7 +80,6 @@ void ChannelEndpoint::on_peer_closed() {
 void ChannelEndpoint::bind_notification(Notification* notif, std::uint64_t badge) {
     unbind_notification();
     if (notif) {
-        notif->add_ref();
         bound_notification_ = notif;
         bound_badge_ = badge;
 
@@ -51,11 +91,8 @@ void ChannelEndpoint::bind_notification(Notification* notif, std::uint64_t badge
 }
 
 void ChannelEndpoint::unbind_notification() {
-    if (bound_notification_) {
-        bound_notification_->release();
-        bound_notification_ = nullptr;
-        bound_badge_ = 0;
-    }
+    bound_notification_ = nullptr;
+    bound_badge_ = 0;
 }
 
 void ChannelEndpoint::add_recv_waiter(Thread* thread) {
@@ -129,6 +166,15 @@ Thread* ChannelEndpoint::pop_send_waiter() {
 
 bool ChannelEndpoint::remove_send_waiter(Thread* thread) {
     return remove_waiter_node(send_waiter_head, send_waiter_tail, thread);
+}
+
+void unbind_notification_from_all_channels(Notification* notif) {
+    if (!notif) return;
+    for (ChannelEndpoint* ep = s_channel_list_head; ep != nullptr; ep = ep->reg_next_) {
+        if (ep->bound_notification_ == notif) {
+            ep->unbind_notification();
+        }
+    }
 }
 
 } // namespace oz

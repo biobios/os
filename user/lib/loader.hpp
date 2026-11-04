@@ -185,7 +185,29 @@ inline SpawnedProcess spawn_process(
     if (result.cspace_cap == static_cast<std::uint32_t>(-1)) return result;
 
     result.vspace_cap = sys_vspace_create(untyped_cap);
-    if (result.vspace_cap == static_cast<std::uint32_t>(-1)) return result;
+    if (result.vspace_cap == static_cast<std::uint32_t>(-1)) {
+        sys_cap_delete(result.cspace_cap);
+        return SpawnedProcess{};
+    }
+
+    auto fail_cleanup = [&]() {
+        for (std::size_t i = 0; i < PT_CACHE_SIZE; ++i) {
+            if (g_pt_cache[i].valid && g_pt_cache[i].vspace_cap == result.vspace_cap) {
+                sys_cap_delete(g_pt_cache[i].pt_cap);
+                g_pt_cache[i].valid = false;
+            }
+        }
+        if (result.tcb_cap != static_cast<std::uint32_t>(-1) && result.tcb_cap != 0) {
+            sys_cap_delete(result.tcb_cap);
+        }
+        if (result.vspace_cap != static_cast<std::uint32_t>(-1) && result.vspace_cap != 0) {
+            sys_cap_delete(result.vspace_cap);
+        }
+        if (result.cspace_cap != static_cast<std::uint32_t>(-1) && result.cspace_cap != 0) {
+            sys_cap_delete(result.cspace_cap);
+        }
+        return SpawnedProcess{};
+    };
 
     // 2. Retype a TCB from UntypedMemory
     result.tcb_cap = sys_untyped_retype(
@@ -193,9 +215,9 @@ inline SpawnedProcess spawn_process(
         static_cast<std::uint32_t>(ObjectType::TCB),
         0
     );
-    if (result.tcb_cap == static_cast<std::uint32_t>(-1)) return result;
+    if (result.tcb_cap == static_cast<std::uint32_t>(-1)) return fail_cleanup();
 
-    // 3. Load PT_LOAD segments via staging buffer
+    // 3. Load PT_LOAD segments via staging buffer (1 page at a time)
     for (int i = 0; i < ehdr->e_phnum; ++i) {
         const auto* phdr_entry = reinterpret_cast<const elf::Elf64_Phdr*>(
             elf_data + ehdr->e_phoff + static_cast<std::uint64_t>(i) * ehdr->e_phentsize
@@ -212,34 +234,42 @@ inline SpawnedProcess spawn_process(
         std::uint64_t map_size = (memsz + vaddr_offset + 0xFFF) & ~0xFFFULL;
         std::uint64_t num_pages = map_size / 4096;
 
-        std::uint32_t seg_frame = sys_frame_alloc(untyped_cap, num_pages);
-        if (seg_frame == static_cast<std::uint32_t>(-1)) return result;
-
-        // Map into parent's staging area (Read/Write = 0x01)
-        if (sys_vspace_map_with_pagetables(self_vspace_cap, untyped_cap, seg_frame, staging_vaddr, 0x01, map_size) != 0) {
-            return result;
-        }
-
-        // Zero out memory (handles BSS)
-        utils::memset(reinterpret_cast<void*>(staging_vaddr), 0, map_size);
-
-        // Copy file content
-        if (filesz > 0) {
-            utils::memcpy(reinterpret_cast<void*>(staging_vaddr + vaddr_offset),
-                          elf_data + offset, filesz);
-        }
-
-        // Unmap from staging area
-        for (std::size_t p = 0; p < num_pages; ++p) {
-            sys_vspace_unmap(self_vspace_cap, staging_vaddr + p * 4096);
-        }
-
-        // Map into child's VSpace
         std::uint64_t flags = 0;
         if (phdr_entry->p_flags & elf::PF_W) flags |= 0x01; // Writable
         if (phdr_entry->p_flags & elf::PF_X) flags |= 0x02; // Executable
-        if (sys_vspace_map_with_pagetables(result.vspace_cap, untyped_cap, seg_frame, vaddr_aligned, flags, map_size) != 0) {
-            return result;
+
+        for (std::uint64_t p = 0; p < num_pages; ++p) {
+            std::uint32_t page_frame = sys_frame_alloc(untyped_cap, 0, 1);
+            if (page_frame == static_cast<std::uint32_t>(-1)) return fail_cleanup();
+
+            // Map into parent's staging area (Read/Write = 0x01)
+            if (sys_vspace_map_with_pagetables(self_vspace_cap, untyped_cap, page_frame, staging_vaddr, 0x01, 4096) != 0) {
+                sys_cap_delete(page_frame);
+                return fail_cleanup();
+            }
+
+            utils::memset(reinterpret_cast<void*>(staging_vaddr), 0, 4096);
+
+            std::uint64_t cur_vaddr = vaddr_aligned + p * 4096;
+            if (cur_vaddr + 4096 > vaddr && cur_vaddr < vaddr + filesz) {
+                std::uint64_t copy_start = (cur_vaddr < vaddr) ? vaddr : cur_vaddr;
+                std::uint64_t copy_end = (cur_vaddr + 4096 > vaddr + filesz) ? (vaddr + filesz) : (cur_vaddr + 4096);
+                std::uint64_t copy_size = copy_end - copy_start;
+                std::uint64_t file_off = offset + (copy_start - vaddr);
+                std::uint64_t stg_off = copy_start - cur_vaddr;
+
+                utils::memcpy(reinterpret_cast<void*>(staging_vaddr + stg_off),
+                              elf_data + file_off, copy_size);
+            }
+
+            // Unmap from parent staging area
+            sys_cap_unmap(page_frame);
+
+            // Map into child's VSpace
+            if (sys_vspace_map_with_pagetables(result.vspace_cap, untyped_cap, page_frame, cur_vaddr, flags, 4096) != 0) {
+                sys_cap_delete(page_frame);
+                return fail_cleanup();
+            }
         }
     }
 
@@ -247,54 +277,61 @@ inline SpawnedProcess spawn_process(
     constexpr std::uint64_t STACK_SIZE = 8192;
     constexpr std::uint64_t STACK_TOP_VADDR = 0x700000000000ULL;
     std::uint64_t stack_base_vaddr = STACK_TOP_VADDR - STACK_SIZE;
-
-    std::uint32_t stack_frame = sys_frame_alloc(untyped_cap, STACK_SIZE / 4096);
-    if (stack_frame == static_cast<std::uint32_t>(-1)) return result;
-
     result.stack_top = STACK_TOP_VADDR - 8;
 
-    // If startup_info is provided, write it to the top of child stack via staging buffer
-    if (startup_info) {
-        if (sys_vspace_map_with_pagetables(self_vspace_cap, untyped_cap, stack_frame, staging_vaddr, 0x01, STACK_SIZE) == 0) {
-            utils::memset(reinterpret_cast<void*>(staging_vaddr), 0, STACK_SIZE);
+    for (std::uint64_t p = 0; p < 2; ++p) {
+        std::uint32_t stack_frame = sys_frame_alloc(untyped_cap, 0, 1);
+        if (stack_frame == static_cast<std::uint32_t>(-1)) return fail_cleanup();
 
-            // Layout at top of stack:
-            // [ STACK_TOP_VADDR - info_size - 16 ]: ProcessStartupInfo struct
-            // [ STACK_TOP_VADDR - info_size - 24 ]: Pointer to ProcessStartupInfo (which will be at RSP)
+        if (sys_vspace_map_with_pagetables(self_vspace_cap, untyped_cap, stack_frame, staging_vaddr, 0x01, 4096) != 0) {
+            sys_cap_delete(stack_frame);
+            return fail_cleanup();
+        }
+        utils::memset(reinterpret_cast<void*>(staging_vaddr), 0, 4096);
+
+        if (p == 1 && startup_info) {
             std::size_t info_size = sizeof(ProcessStartupInfo);
-            std::uint64_t info_offset = STACK_SIZE - info_size - 16;
+            std::uint64_t info_offset = 4096 - info_size - 16;
             utils::memcpy(reinterpret_cast<void*>(staging_vaddr + info_offset), startup_info, info_size);
-
-            std::uint64_t child_info_vaddr = stack_base_vaddr + info_offset;
+            std::uint64_t child_info_vaddr = stack_base_vaddr + 4096 + info_offset;
             *reinterpret_cast<std::uint64_t*>(staging_vaddr + info_offset - 8) = child_info_vaddr;
+            result.stack_top = stack_base_vaddr + 4096 + info_offset - 8;
+        }
 
-            result.stack_top = stack_base_vaddr + info_offset - 8;
+        sys_cap_unmap(stack_frame);
 
-            for (std::size_t p = 0; p < STACK_SIZE / 4096; ++p) {
-                sys_vspace_unmap(self_vspace_cap, staging_vaddr + p * 4096);
-            }
+        if (sys_vspace_map_with_pagetables(result.vspace_cap, untyped_cap, stack_frame, stack_base_vaddr + p * 4096, 0x01, 4096) != 0) {
+            sys_cap_delete(stack_frame);
+            return fail_cleanup();
         }
     }
 
-    if (sys_vspace_map_with_pagetables(result.vspace_cap, untyped_cap, stack_frame, stack_base_vaddr, 0x01, STACK_SIZE) != 0) {
-        return result;
+    // 子プロセス中間テーブルの所有権移譲 (Slot 64〜127: CAP_PT_DELEGATE_START..CAP_PT_DELEGATE_END)
+    std::uint32_t child_res_slot = CAP_PT_DELEGATE_START;
+    for (std::size_t i = 0; i < PT_CACHE_SIZE && child_res_slot <= CAP_PT_DELEGATE_END; ++i) {
+        if (g_pt_cache[i].valid && g_pt_cache[i].vspace_cap == result.vspace_cap) {
+            sys_cspace_cap_move(result.cspace_cap, child_res_slot++, g_pt_cache[i].pt_cap);
+            g_pt_cache[i].valid = false;
+        }
     }
 
     // 5. Insert child's VSpace into its own CSpace at Slot 0 (CAP_SELF_VSPACE)
     if (sys_cspace_cap_insert(result.cspace_cap, CAP_SELF_VSPACE, result.vspace_cap,
                               static_cast<std::uint32_t>(CapRights::ALL)) != 0) {
-        return result;
+        return fail_cleanup();
     }
     // Insert child's CSpace into its own CSpace at Slot 245 (CAP_SELF_CSPACE)
-    sys_cspace_cap_insert(result.cspace_cap, CAP_SELF_CSPACE, result.cspace_cap,
-                          static_cast<std::uint32_t>(CapRights::ALL));
+    if (sys_cspace_cap_insert(result.cspace_cap, CAP_SELF_CSPACE, result.cspace_cap,
+                              static_cast<std::uint32_t>(CapRights::ALL)) != 0) {
+        return fail_cleanup();
+    }
 
     // 6. Configure TCB
     result.entry_point = ehdr->e_entry;
 
     if (sys_tcb_configure(result.tcb_cap, result.cspace_cap, result.vspace_cap,
                           result.entry_point, result.stack_top) != 0) {
-        return result;
+        return fail_cleanup();
     }
 
 

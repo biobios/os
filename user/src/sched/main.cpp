@@ -187,10 +187,15 @@ static void sched_ipc_worker() {
     oz::ReplyToken tok = oz::INVALID_REPLY_TOKEN;
     oz::IPCMessage req{};
     oz::IPCMessage resp{};
+    std::uint32_t recv_slot = oz::g_slot_allocator.allocate_one();
     while (true) {
-        tok = oz::sys_reply_recv(tok, CAP_SCHED_RECV, (tok != oz::INVALID_REPLY_TOKEN) ? &resp : nullptr, &req);
+        tok = oz::sys_reply_recv(tok, CAP_SCHED_RECV, (tok != oz::INVALID_REPLY_TOKEN) ? &resp : nullptr, &req, recv_slot);
         if (tok == oz::INVALID_REPLY_TOKEN) {
             continue;
+        }
+
+        if (req.has_cap) {
+            recv_slot = oz::g_slot_allocator.allocate_one();
         }
 
         auto cmd = static_cast<oz::ipc::SchedCmd>(req.data[0]);

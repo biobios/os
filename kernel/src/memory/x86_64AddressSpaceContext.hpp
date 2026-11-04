@@ -64,6 +64,11 @@ public:
         return pt_manager.installPageTable(virt_addr, pt_phys, level);
     }
 
+    bool uninstallPageTable(std::uintptr_t virt_addr, std::uintptr_t expected_pt_phys, std::uint8_t level) {
+        if (virt_addr >= 0x0000800000000000ULL) return false;
+        return pt_manager.uninstallPageTable(virt_addr, expected_pt_phys, level);
+    }
+
     std::uint8_t getMissingTableLevel(std::uintptr_t virt_addr) const {
         if (virt_addr >= 0x0000800000000000ULL) return 4;
         return pt_manager.getMissingTableLevel(virt_addr);

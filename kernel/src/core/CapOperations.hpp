@@ -8,59 +8,91 @@ namespace oz {
 
 inline bool cap_move(CSpace* dest_cs, CapID dest, CSpace* src_cs, CapID src) {
     if (!dest_cs || !src_cs) return false;
+    if (dest_cs == src_cs && dest == src) return true;
 
-    Capability src_cap = src_cs->get(src);
-    if (!src_cap.is_valid()) return false;
+    Capability* src_slot = src_cs->getSlot(src);
+    if (!src_slot || src_slot->is_null()) return false;
 
-    // Disallow overwriting an existing valid capability at destination
-    Capability dest_cap = dest_cs->get(dest);
-    if (dest_cap.is_valid() && !(dest_cs == src_cs && dest == src)) {
-        return false;
+    Capability* dest_slot = dest_cs->getSlot(dest);
+    if (!dest_slot || !dest_slot->is_null()) return false;
+
+    // 異なる CSpace 間移動では TRANSFER 権限を検証
+    if (dest_cs != src_cs) {
+        if (!src_slot->has_rights(CapRights::TRANSFER)) {
+            return false;
+        }
     }
 
-    if (dest_cs == src_cs && dest == src) {
-        return true; // No-op move within same slot
-    }
-
-    if (!dest_cs->insert(dest, src_cap)) {
-        return false;
-    }
-
-    src_cs->remove(src);
-    return true;
+    return cdt_move_slot(dest_slot, src_slot);
 }
 
 inline bool cap_move(CSpace* cspace, CapID dest, CapID src) {
     return cap_move(cspace, dest, cspace, src);
 }
 
-inline bool cap_copy(CSpace* dest_cs, CapID dest, CSpace* src_cs, CapID src, CapRights rights) {
+inline bool cap_copy(CSpace* dest_cs, CapID dest, CSpace* src_cs, CapID src, CapRights requested_rights, std::uint64_t badge = 0, bool set_badge_flag = false) {
     if (!dest_cs || !src_cs) return false;
 
-    Capability src_cap = src_cs->get(src);
-    if (!src_cap.is_valid()) return false;
+    Capability* src_slot = src_cs->getSlot(src);
+    if (!src_slot || src_slot->is_null()) return false;
 
-    // Disallow copying linear capabilities or capabilities lacking DUPLICATE right
-    if (!src_cap.can_duplicate()) return false;
+    // DUPLICATE 権限チェック (Linear は複製不可)
+    if (!src_slot->can_duplicate()) return false;
 
-    // Disallow granting base rights not possessed by source
-    CapRights base_requested = rights & ~CapRights::ONCE;
-    if ((src_cap.rights & base_requested) != base_requested) return false;
-
-    // Requesting ONCE attenuation requires WRITE right on source
-    if ((rights & CapRights::ONCE) != CapRights::NONE) {
-        if ((src_cap.rights & CapRights::WRITE) != CapRights::WRITE) return false;
+    // PT裏付け中の Frame は複製不可
+    if (src_slot->type() == CapType::Frame && src_slot->has_slot_flag(SLOT_FLAG_PT_BACKING)) {
+        return false;
     }
 
-    Capability new_cap(src_cap.object, rights, src_cap.badge);
-    return dest_cs->insert(dest, new_cap); 
+    // 単一ビットマスクによる権限昇格防止チェック: (requested & ~parent) == 0
+    if (requested_rights == CapRights::ALL) {
+        requested_rights = src_slot->rights();
+    } else if ((static_cast<std::uint32_t>(requested_rights) & ~static_cast<std::uint32_t>(src_slot->rights())) != 0) {
+        return false;
+    }
+
+    Capability* dest_slot = dest_cs->getSlot(dest);
+    if (!dest_slot || !dest_slot->is_null()) return false;
+
+    // 生データコピー
+    for (int i = 0; i < 4; ++i) dest_slot->data[i] = src_slot->data[i];
+    dest_slot->flags = src_slot->flags;
+    dest_slot->set_rights(requested_rights);
+
+    // バッジ上書き (Mint 時)
+    if (set_badge_flag) {
+        dest_slot->data[1] = badge;
+    }
+
+    // KernelObject 参照型であれば add_ref
+    if (dest_slot->has_slot_flag(SLOT_FLAG_HAS_KERNEL_OBJECT)) {
+        if (KernelObject* obj = dest_slot->object()) {
+            obj->add_ref();
+        }
+    }
+
+    // Frame / PageTable / VSpace の複製時は未マップ状態に初期化
+    if (dest_slot->type() == CapType::Frame ||
+        dest_slot->type() == CapType::PageTable ||
+        dest_slot->type() == CapType::VSpace) {
+        dest_slot->clear_slot_flag(SLOT_FLAG_ORIGINAL | SLOT_FLAG_IS_MAPPED | SLOT_FLAG_PT_BACKING);
+        dest_slot->set_map_entry_index(0);
+        dest_slot->data[1] = 0;
+        dest_slot->data[2] = 0;
+        dest_slot->data[3] = 0;
+    }
+
+    // CDT 派生ツリーへ挿入
+    cdt_insert_child(src_slot, dest_slot);
+    return true;
 }
 
 inline bool cap_copy(CSpace* cspace, CapID dest, CapID src, CapRights rights) {
-    return cap_copy(cspace, dest, cspace, src, rights);
+    return cap_copy(cspace, dest, cspace, src, rights, 0, false);
 }
 
 inline bool cap_delete(CSpace* cspace, CapID id) {
+    if (!cspace) return false;
     return cspace->remove(id);
 }
 
@@ -71,48 +103,47 @@ inline bool is_valid_channel_pair(ChannelMode m0, ChannelMode m1) {
     return true;
 }
 
-// Create a channel endpoint pair with specified rights and modes for each end
-inline bool sys_channel_create_ext(CSpace* cspace, CapID untyped_cap, CapRights rights0, CapRights rights1,
-                                   CapID* out_id0, CapID* out_id1,
-                                   ChannelMode mode0 = ChannelMode::BLOCKING,
-                                   ChannelMode mode1 = ChannelMode::BLOCKING) {
-    if (!cspace || !out_id0 || !out_id1) return false;
+inline bool sys_channel_create(Capability* ut_slot,
+                               CSpace* cs0, CapID slot0,
+                               CSpace* cs1, CapID slot1,
+                               ChannelMode mode0 = ChannelMode::BLOCKING,
+                               ChannelMode mode1 = ChannelMode::BLOCKING) {
+    if (!ut_slot || !cs0 || !cs1) return false;
     if (!is_valid_channel_pair(mode0, mode1)) return false;
+    if (ut_slot->type() != CapType::UntypedMemory) return false;
+    if (!ut_slot->has_rights(CapRights::DERIVE) && !ut_slot->has_rights(CapRights::WRITE)) return false;
+    if (ut_slot->untyped_is_device()) return false;
 
-    Capability ut_cap = cspace->get(untyped_cap);
-    if (!ut_cap.is_valid() || ut_cap.object->objectType() != ObjectType::UntypedMemory) return false;
-    auto* untyped = static_cast<UntypedMemory*>(ut_cap.object);
+    if (slot0 == 0 || slot0 >= CSpace::MAX_CAPS || slot1 == 0 || slot1 >= CSpace::MAX_CAPS) return false;
+    if (is_reserved_system_slot(slot0) || is_reserved_system_slot(slot1)) return false;
+    if (cs0 == cs1 && slot0 == slot1) return false;
 
-    ChannelEndpoint* end0 = nullptr;
-    ChannelEndpoint* end1 = nullptr;
-    if (!untyped->retypeChannelPair(&end0, &end1)) return false;
+    Capability* s0 = cs0->getSlot(slot0);
+    Capability* s1 = cs1->getSlot(slot1);
+    if (!s0 || !s0->is_null() || !s1 || !s1->is_null()) return false;
 
-    end0->set_mode(mode0);
-    end1->set_mode(mode1);
-
-    Capability cap0(end0, rights0);
-    Capability cap1(end1, rights1);
-
-    *out_id0 = cspace->add(cap0);
-    *out_id1 = cspace->add(cap1);
-
-    end0->release();
-    end1->release();
-
-    if (*out_id0 == INVALID_CAP_ID || *out_id1 == INVALID_CAP_ID) {
-        if (*out_id0 != INVALID_CAP_ID) cspace->remove(*out_id0);
-        if (*out_id1 != INVALID_CAP_ID) cspace->remove(*out_id1);
+    std::size_t saved_watermark = ut_slot->untyped_watermark();
+    ChannelEndpoint* end0 = untyped_allocate_object<ChannelEndpoint>(ut_slot, true);
+    ChannelEndpoint* end1 = end0 ? untyped_allocate_object<ChannelEndpoint>(ut_slot, true) : nullptr;
+    if (!end0 || !end1) {
+        if (end0) end0->destroy();
+        if (end1) end1->destroy();
+        ut_slot->set_untyped_watermark(saved_watermark);
         return false;
     }
 
-    return true;
-}
+    end0->set_peer(end1);
+    end1->set_peer(end0);
+    end0->set_mode(mode0);
+    end1->set_mode(mode1);
 
-// Syscall equivalent to create a channel and insert both ends into the CSpace
-inline bool sys_channel_create(CSpace* cspace, CapID untyped_cap, CapID* out_id0, CapID* out_id1,
-                               ChannelMode mode0 = ChannelMode::BLOCKING,
-                               ChannelMode mode1 = ChannelMode::BLOCKING) {
-    return sys_channel_create_ext(cspace, untyped_cap, CapRights::ALL, CapRights::ALL, out_id0, out_id1, mode0, mode1);
+    init_kernel_object_slot(s0, end0, CapRights::ALL);
+    init_kernel_object_slot(s1, end1, CapRights::ALL);
+
+    cdt_insert_child(ut_slot, s0);
+    cdt_insert_child(ut_slot, s1);
+
+    return true;
 }
 
 } // namespace oz

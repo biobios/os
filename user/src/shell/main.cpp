@@ -576,7 +576,7 @@ static bool procman_create_pipe(std::uint32_t* out_w, std::uint32_t* out_r) {
     oz::IPCMessage req{};
     req.data[0] = static_cast<std::uint64_t>(oz::ipc::ProcCmd::CREATE_PIPE);
     oz::IPCMessage resp{};
-    if (!oz::sys_call(CAP_PROCMAN_SEND, &req, &resp) || resp.data[0] != 0 || !resp.has_cap) return false;
+    if (!oz::sys_call_recv_cap(CAP_PROCMAN_SEND, &req, &resp) || resp.data[0] != 0 || !resp.has_cap) return false;
     *out_w = static_cast<std::uint32_t>(resp.data[1]);
     *out_r = resp.transferred_cap;
     return true;
@@ -828,7 +828,7 @@ static bool init_gui_terminal(std::uint32_t cap_wm, std::uint32_t cap_display) {
 
     oz::sys_debug_print("[Shell] init_gui_terminal: Sending CREATE_WINDOW via sys_call...\n\r");
     oz::IPCMessage resp{};
-    if (!oz::sys_call(cap_wm, &req, &resp)) {
+    if (!oz::sys_call_recv_cap(cap_wm, &req, &resp)) {
         oz::sys_debug_print("[Shell] init_gui_terminal: sys_call failed!\n\r");
         return false;
     }
@@ -867,7 +867,7 @@ static bool init_gui_terminal(std::uint32_t cap_wm, std::uint32_t cap_display) {
     // 5. Create Notification for asynchronous key events and bind to Window
     g_notif_gui_input = oz::sys_notification_create(oz::CAP_UNTYPED);
     if (g_notif_gui_input != 0 && g_notif_gui_input != oz::INVALID_CAP_ID) {
-        std::uint32_t notif_send = oz::sys_cap_mint(g_notif_gui_input, static_cast<std::uint32_t>(oz::CapRights::WRITE));
+        std::uint32_t notif_send = oz::sys_cap_mint(g_notif_gui_input, static_cast<std::uint32_t>(oz::CapRights::WRITE | oz::CapRights::TRANSFER));
         if (notif_send != 0 && notif_send != oz::INVALID_CAP_ID) {
             oz::IPCMessage bind_msg{};
             bind_msg.data[0] = static_cast<std::uint64_t>(oz::ipc::WMCmd::BIND_NOTIFICATION);
@@ -975,7 +975,7 @@ OZ_PROCESS_ENTRY() {
         } else {
             // Non-GUI fallback: receive from CAP_SHELL_INPUT
             oz::IPCMessage msg{};
-            if (!oz::sys_channel_recv(CAP_SHELL_INPUT, &msg)) {
+            if (oz::sys_reply_and_recv(CAP_SHELL_INPUT, nullptr, &msg) != 0) {
                 continue;
             }
             char c = static_cast<char>(msg.data[0] & 0xFF);

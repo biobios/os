@@ -1,8 +1,11 @@
 #include "core/Thread.hpp"
 #include "core/Capability.hpp"
 #include "core/Channel.hpp"
+#include "core/Notification.hpp"
 #include "core/Baton.hpp"
 #include "core/IRQHandler.hpp"
+#include "core/Scheduler.hpp"
+#include "core/CartesianTree.hpp"
 #include "utils/utils.hpp"
 
 namespace oz {
@@ -20,6 +23,15 @@ void register_thread(Thread* t) {
         if (!s_thread_registry[i] || s_thread_registry[i] == t) {
             s_thread_registry[i] = t;
             return;
+        }
+    }
+}
+
+void for_each_registered_thread_impl(void (*callback)(Thread*, void*), void* data) {
+    if (!callback) return;
+    for (std::size_t i = 0; i < MAX_GLOBAL_THREADS; ++i) {
+        if (Thread* t = s_thread_registry[i]) {
+            callback(t, data);
         }
     }
 }
@@ -88,6 +100,8 @@ Thread::Thread(std::uint64_t id, void* stack, std::uint64_t size, PageBlock<> bl
 }
 
 Thread::~Thread() {
+    cancel_ipc();
+
     if (this->pending_server) {
         if (this->pending_server->reply_target == this) {
             this->pending_server->reply_target = nullptr;
@@ -100,6 +114,49 @@ Thread::~Thread() {
         }
         this->reply_target = nullptr;
     }
+
+    remove_thread_from_all_notifications(this);
+
+    if (this->is_irq_handling()) {
+        Baton* irq_b = this->borrowed_baton;
+        if (irq_b) {
+            irq_b->thread = nullptr;
+            irq_b->state = BatonState::READY;
+            irq_b->remaining = 0;
+            this->borrowed_baton = nullptr;
+        }
+        if (g_current_irq_thread == this) {
+            g_current_irq_thread = this->next_nested_irq;
+            this->next_nested_irq = nullptr;
+        }
+    }
+
+    if (g_scheduler_ptr) {
+        Baton* b = this->get_active_baton();
+        if (!b) b = this->baton;
+        if (b && g_scheduler_ptr->running_baton == b) {
+            cartesianPopLeaf(g_scheduler_ptr->cartesian_root, b);
+            b->state = BatonState::READY;
+            b->is_active = false;
+            ExecutionContext* caller = b->caller_context;
+            Baton* caller_b = b->caller_baton;
+            b->caller_baton = nullptr;
+            b->caller_context = nullptr;
+            if (caller_b) {
+                caller_b->callee_baton = nullptr;
+                caller_b->state = BatonState::RUNNING;
+                cartesianPushDown(caller_b);
+                g_scheduler_ptr->running_baton = caller_b;
+                if (!caller) caller = caller_b->thread;
+            } else {
+                g_scheduler_ptr->running_baton = nullptr;
+            }
+            if (caller && caller != this) {
+                caller->sched_reason = SchedReason::ORPHANED;
+            }
+        }
+    }
+
     if (this->own_baton) {
         if (this->own_baton->thread == this) {
             this->own_baton->thread = nullptr;
@@ -114,6 +171,16 @@ Thread::~Thread() {
         }
         this->borrowed_baton = nullptr;
     }
+    if (this->baton) {
+        if (this->baton->thread == this) {
+            this->baton->thread = nullptr;
+            this->baton->is_active = false;
+        }
+        this->baton = nullptr;
+    }
+
+    unbind_thread_from_all_batons(this);
+
     if (this->bound_irq_handler) {
         if (this->bound_irq_handler->handler_thread == this) {
             this->bound_irq_handler->handler_thread = nullptr;
@@ -122,6 +189,8 @@ Thread::~Thread() {
         this->bound_irq_handler = nullptr;
     }
     unregister_thread(this);
+    this->is_dead = true;
+    this->state = ThreadState::Dead;
 }
 
 bool Thread::cancel_ipc() {
@@ -146,10 +215,7 @@ bool Thread::cancel_ipc() {
             blocking_ep->remove_recv_waiter(this);
         } else if (state == ThreadState::BlockedOnSend || state == ThreadState::BlockedOnCall) {
             blocking_ep->remove_send_waiter(this);
-            if (send_msg.attached_cap.is_valid() && cspace) {
-                cspace->insert(send_msg.user_msg.transferred_cap, send_msg.attached_cap);
-                send_msg = InternalIPCMessage{};
-            }
+            send_msg = InternalIPCMessage{};
         }
         blocking_ep = nullptr;
     }
@@ -162,6 +228,19 @@ bool Thread::cancel_ipc() {
 }
 
 } // namespace oz
+
+extern "C" [[noreturn]] __attribute__((naked)) void oz::load_context_noreturn(void* next_rsp) {
+    __asm__ volatile(
+        "movq %rdi, %rsp\n"
+        "popq %r15\n"
+        "popq %r14\n"
+        "popq %r13\n"
+        "popq %r12\n"
+        "popq %rbp\n"
+        "popq %rbx\n"
+        "ret\n"
+    );
+}
 
 extern "C" __attribute__((naked)) void oz::switch_context(void** old_rsp, void* new_rsp) {
     __asm__ volatile(

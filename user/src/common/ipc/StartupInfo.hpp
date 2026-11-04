@@ -1,6 +1,7 @@
 #pragma once
 #include <cstdint>
 #include <cstddef>
+#include "syscall.hpp"
 
 namespace oz {
 
@@ -101,6 +102,9 @@ struct ProcessStartupInfo {
     std::uint32_t num_caps{0};
     StartupCapEntry caps[MAX_CAPS]{};
 
+    // InitRD size (passed to VFS)
+    std::size_t   initrd_size{0};
+
     // Command-line arguments
     std::uint32_t argc{0};
     std::uint32_t arg_buf_len{0};
@@ -130,6 +134,10 @@ struct ProcessStartupInfo {
         return 0;
     }
 
+    static constexpr std::uint32_t PREWIRED_SLOT_START = 10;
+    static constexpr std::uint32_t PREWIRED_SLOT_END   = 63;
+    std::uint32_t next_slot{PREWIRED_SLOT_START};
+
     // Helper: add capability to startup info
     bool add_cap(std::uint32_t slot, CapRole role, const char* name_str, CapType type = CapType::STREAM) {
         if (num_caps >= MAX_CAPS) return false;
@@ -144,7 +152,18 @@ struct ProcessStartupInfo {
         }
         caps[num_caps].name[i] = '\0';
         num_caps++;
+        if (slot >= next_slot && slot < PREWIRED_SLOT_END) {
+            next_slot = slot + 1;
+        }
         return true;
+    }
+
+    // Helper: allocate an unused slot in PREWIRED zone and add capability
+    std::uint32_t alloc_and_add_cap(CapRole role, const char* name_str, CapType type = CapType::STREAM) {
+        if (num_caps >= MAX_CAPS || next_slot > PREWIRED_SLOT_END) return 0;
+        std::uint32_t slot = next_slot++;
+        if (!add_cap(slot, role, name_str, type)) return 0;
+        return slot;
     }
 
     // Helper: get argument by index
@@ -248,7 +267,16 @@ extern "C" void sys_exit(int status);
 // 4. Standard entry point macro for capability-aware processes
 // ============================================================================
 #define OZ_PROCESS_ENTRY() \
-    extern "C" void _start_main(const oz::ProcessStartupInfo* info); \
+    static void _oz_user_main(const oz::ProcessStartupInfo* info); \
+    extern "C" void _start_main(const oz::ProcessStartupInfo* info) { \
+        oz::g_slot_allocator.reset(); \
+        if (info && info->magic == oz::ProcessStartupInfo::MAGIC) { \
+            for (std::size_t _i = 0; _i < info->num_caps; ++_i) { \
+                oz::g_slot_allocator.reserve_slot(info->caps[_i].slot); \
+            } \
+        } \
+        _oz_user_main(info); \
+    } \
     extern "C" __attribute__((naked)) void _start() { \
         __asm__ volatile ( \
             "movq (%%rsp), %%rdi\n" \
@@ -259,5 +287,5 @@ extern "C" void sys_exit(int status);
             ::: "memory" \
         ); \
     } \
-    extern "C" void _start_main(const oz::ProcessStartupInfo* info)
+    static void _oz_user_main(const oz::ProcessStartupInfo* info)
 

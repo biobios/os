@@ -1,0 +1,865 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Baton Hierarchical Scheduler Visualizer</title>
+  <style>
+    :root {
+      --bg-dark: #0d1117;
+      --bg-panel: #161b22;
+      --bg-card: #21262d;
+      --bg-subtle: #30363d;
+      --border-color: #30363d;
+      --text-main: #c9d1d9;
+      --text-muted: #8b949e;
+      --text-bright: #f0f6fc;
+      --accent-cyan: #58a6ff;
+      --accent-green: #3fb950;
+      --accent-yellow: #d29922;
+      --accent-red: #f85149;
+      --accent-purple: #bc8cff;
+      --accent-orange: #f0883e;
+      --font-mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, "Liberation Mono", monospace;
+    }
+
+    * {
+      box-sizing: border-box;
+      margin: 0;
+      padding: 0;
+    }
+
+    body {
+      background-color: var(--bg-dark);
+      color: var(--text-main);
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+      line-height: 1.5;
+      padding: 16px;
+      min-height: 100vh;
+    }
+
+    header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      padding-bottom: 14px;
+      margin-bottom: 16px;
+      border-bottom: 1px solid var(--border-color);
+      flex-wrap: wrap;
+      gap: 12px;
+    }
+
+    .header-title {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+    }
+
+    .badge-tag {
+      background: rgba(88, 166, 255, 0.15);
+      color: var(--accent-cyan);
+      border: 1px solid rgba(88, 166, 255, 0.3);
+      padding: 2px 8px;
+      border-radius: 12px;
+      font-size: 0.75rem;
+      font-weight: 600;
+    }
+
+    h1 {
+      font-size: 1.35rem;
+      color: var(--text-bright);
+      font-weight: 700;
+      letter-spacing: -0.02em;
+    }
+
+    .presets-bar {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      flex-wrap: wrap;
+    }
+
+    .btn {
+      background: var(--bg-card);
+      color: var(--text-bright);
+      border: 1px solid var(--border-color);
+      padding: 6px 12px;
+      border-radius: 6px;
+      font-size: 0.82rem;
+      font-weight: 500;
+      cursor: pointer;
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      transition: all 0.15s ease;
+      user-select: none;
+    }
+
+    .btn:hover {
+      background: var(--bg-subtle);
+      border-color: #8b949e;
+    }
+
+    .btn-primary {
+      background: #238636;
+      border-color: rgba(240, 246, 252, 0.1);
+      color: #fff;
+    }
+    .btn-primary:hover {
+      background: #2ea043;
+    }
+
+    .btn-warning {
+      background: #9e6a03;
+      border-color: rgba(240, 246, 252, 0.1);
+      color: #fff;
+    }
+    .btn-warning:hover {
+      background: #bb8009;
+    }
+
+    .btn-danger {
+      background: #da3633;
+      border-color: rgba(240, 246, 252, 0.1);
+      color: #fff;
+    }
+    .btn-danger:hover {
+      background: #f85149;
+    }
+
+    .btn-cyan {
+      background: #1f6feb;
+      border-color: rgba(240, 246, 252, 0.1);
+      color: #fff;
+    }
+    .btn-cyan:hover {
+      background: #388bfd;
+    }
+
+    .btn-orange {
+      background: #bd5c00;
+      border-color: rgba(240, 246, 252, 0.1);
+      color: #fff;
+    }
+    .btn-orange:hover {
+      background: #d86900;
+    }
+
+    .btn-sm {
+      padding: 4px 8px;
+      font-size: 0.76rem;
+    }
+
+    /* Main Grid Layout */
+    .grid-container {
+      display: grid;
+      grid-template-columns: 370px 1fr 340px;
+      gap: 16px;
+      margin-bottom: 16px;
+    }
+
+    @media (max-width: 1300px) {
+      .grid-container {
+        grid-template-columns: 360px 1fr;
+      }
+      .grid-right {
+        grid-column: 1 / -1;
+      }
+    }
+
+    @media (max-width: 900px) {
+      .grid-container {
+        grid-template-columns: 1fr;
+      }
+    }
+
+    .panel {
+      background: var(--bg-panel);
+      border: 1px solid var(--border-color);
+      border-radius: 8px;
+      padding: 14px;
+      display: flex;
+      flex-direction: column;
+      gap: 12px;
+    }
+
+    .panel-header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      border-bottom: 1px solid var(--border-color);
+      padding-bottom: 8px;
+    }
+
+    .panel-title {
+      font-size: 0.95rem;
+      font-weight: 600;
+      color: var(--text-bright);
+      display: flex;
+      align-items: center;
+      gap: 6px;
+    }
+
+    /* Hardware & Timer Status */
+    .lapic-timer-card {
+      background: var(--bg-card);
+      border: 1px solid var(--border-color);
+      border-radius: 6px;
+      padding: 12px;
+    }
+
+    .lapic-timer-header {
+      display: flex;
+      justify-content: space-between;
+      font-size: 0.8rem;
+      color: var(--text-muted);
+      margin-bottom: 6px;
+    }
+
+    .lapic-timer-val {
+      font-family: var(--font-mono);
+      font-size: 1.25rem;
+      font-weight: bold;
+      color: var(--accent-yellow);
+    }
+
+    .progress-bar-bg {
+      background: #0d1117;
+      height: 8px;
+      border-radius: 4px;
+      overflow: hidden;
+      margin-top: 6px;
+      border: 1px solid var(--border-color);
+    }
+
+    .progress-bar-fill {
+      height: 100%;
+      background: linear-gradient(90deg, var(--accent-green), var(--accent-yellow));
+      transition: width 0.2s ease;
+      width: 100%;
+    }
+
+    /* Form inputs */
+    .form-group {
+      display: flex;
+      flex-direction: column;
+      gap: 4px;
+    }
+
+    .form-label {
+      font-size: 0.78rem;
+      color: var(--text-muted);
+      font-weight: 500;
+    }
+
+    .form-row {
+      display: flex;
+      gap: 8px;
+    }
+
+    input, select {
+      background: var(--bg-card);
+      border: 1px solid var(--border-color);
+      color: var(--text-bright);
+      padding: 6px 10px;
+      border-radius: 6px;
+      font-size: 0.85rem;
+      outline: none;
+      font-family: inherit;
+    }
+
+    input:focus, select:focus {
+      border-color: var(--accent-cyan);
+    }
+
+    /* Chain / Call Stack View */
+    .chain-container {
+      background: var(--bg-card);
+      border: 1px solid var(--border-color);
+      border-radius: 6px;
+      padding: 12px;
+      min-height: 90px;
+      display: flex;
+      flex-direction: column;
+      gap: 12px;
+    }
+
+    .chain-flow-row {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      overflow-x: auto;
+      padding: 6px 2px;
+      flex-wrap: nowrap;
+    }
+
+    .chain-node {
+      background: var(--bg-subtle);
+      border: 2px solid var(--border-color);
+      border-radius: 6px;
+      padding: 8px 12px;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      min-width: 110px;
+      position: relative;
+      transition: all 0.2s ease;
+      flex-shrink: 0;
+    }
+
+    .chain-node.running {
+      border-color: var(--accent-green);
+      box-shadow: 0 0 10px rgba(63, 185, 80, 0.4);
+      background: rgba(63, 185, 80, 0.1);
+    }
+
+    .chain-node.wait-return {
+      border-color: var(--accent-cyan);
+      opacity: 0.9;
+    }
+
+    .chain-node.wait-start {
+      border-color: var(--accent-orange);
+      border-style: dashed;
+      background: rgba(240, 136, 62, 0.12);
+    }
+
+    .chain-node.suspended-node {
+      border-color: var(--accent-orange);
+      opacity: 0.85;
+    }
+
+    .chain-node.min-root {
+      position: relative;
+    }
+
+    .chain-node.min-root::after {
+      content: "👑 ROOT (LAPIC)";
+      position: absolute;
+      top: -10px;
+      left: 50%;
+      transform: translateX(-50%);
+      background: var(--accent-yellow);
+      color: #000;
+      font-size: 0.62rem;
+      font-weight: bold;
+      padding: 1px 4px;
+      border-radius: 4px;
+      white-space: nowrap;
+    }
+
+    .chain-node.tail-indicator::after {
+      content: "🎯 TAIL";
+      position: absolute;
+      bottom: -10px;
+      left: 50%;
+      transform: translateX(-50%);
+      background: var(--accent-orange);
+      color: #fff;
+      font-size: 0.60rem;
+      font-weight: bold;
+      padding: 1px 4px;
+      border-radius: 4px;
+      white-space: nowrap;
+    }
+
+    .chain-arrow {
+      color: var(--text-muted);
+      font-size: 1.1rem;
+      font-weight: bold;
+      user-select: none;
+      flex-shrink: 0;
+    }
+
+    /* Split / Severed Chain Break element */
+    .chain-split-break {
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      padding: 4px 8px;
+      background: rgba(248, 81, 73, 0.1);
+      border: 1px dashed var(--accent-red);
+      border-radius: 6px;
+      color: var(--accent-red);
+      font-size: 0.72rem;
+      font-weight: bold;
+      white-space: nowrap;
+      flex-shrink: 0;
+      user-select: none;
+    }
+
+    .suspended-subchain-wrapper {
+      border: 1.5px dashed var(--accent-orange);
+      background: rgba(240, 136, 62, 0.05);
+      border-radius: 6px;
+      padding: 8px 10px;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      flex-shrink: 0;
+    }
+
+    .suspended-subchains-section {
+      background: rgba(240, 136, 62, 0.06);
+      border: 1px dashed var(--accent-orange);
+      border-radius: 6px;
+      padding: 10px 12px;
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+    }
+
+    .suspended-header-info {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      flex-wrap: wrap;
+      gap: 6px;
+      font-size: 0.76rem;
+    }
+
+    /* SVG Canvas for Cartesian Tree */
+    .tree-canvas-wrapper {
+      background: #0f1319;
+      border: 1px solid var(--border-color);
+      border-radius: 6px;
+      position: relative;
+      overflow: hidden;
+      min-height: 450px;
+      display: flex;
+      flex-direction: column;
+    }
+
+    .canvas-legend {
+      position: absolute;
+      top: 8px;
+      left: 10px;
+      display: flex;
+      gap: 12px;
+      font-size: 0.72rem;
+      background: rgba(22, 27, 34, 0.88);
+      padding: 4px 10px;
+      border-radius: 6px;
+      border: 1px solid var(--border-color);
+      backdrop-filter: blur(4px);
+      z-index: 10;
+    }
+
+    .legend-item {
+      display: flex;
+      align-items: center;
+      gap: 5px;
+    }
+
+    .legend-dot {
+      width: 8px;
+      height: 8px;
+      border-radius: 50%;
+    }
+
+    svg.tree-svg {
+      width: 100%;
+      height: 100%;
+      flex: 1;
+    }
+
+    /* Baton State Badges */
+    .state-badge {
+      font-size: 0.65rem;
+      font-weight: 700;
+      padding: 2px 6px;
+      border-radius: 4px;
+      text-transform: uppercase;
+      font-family: var(--font-mono);
+      letter-spacing: 0.03em;
+    }
+
+    .state-READY { background: #30363d; color: #8b949e; }
+    .state-RUNNING { background: rgba(63, 185, 80, 0.2); color: var(--accent-green); border: 1px solid var(--accent-green); }
+    .state-WAIT_RETURN { background: rgba(88, 166, 255, 0.2); color: var(--accent-cyan); border: 1px solid var(--accent-cyan); }
+    .state-WAIT_START { background: rgba(240, 136, 62, 0.2); color: var(--accent-orange); border: 1px solid var(--accent-orange); }
+    .state-BLOCKED { background: rgba(248, 81, 73, 0.2); color: var(--accent-red); border: 1px solid var(--accent-red); }
+
+    /* Console / Logs */
+    .log-terminal {
+      background: #090d13;
+      border: 1px solid var(--border-color);
+      border-radius: 6px;
+      font-family: var(--font-mono);
+      font-size: 0.75rem;
+      padding: 8px;
+      height: 220px;
+      overflow-y: auto;
+      display: flex;
+      flex-direction: column;
+      gap: 4px;
+    }
+
+    .log-line {
+      display: flex;
+      gap: 8px;
+      line-height: 1.4;
+      word-break: break-all;
+    }
+
+    .log-time {
+      color: var(--text-muted);
+      flex-shrink: 0;
+    }
+
+    .log-tag {
+      font-weight: bold;
+      flex-shrink: 0;
+    }
+    .log-tag.SWITCH { color: var(--accent-cyan); }
+    .log-tag.TIMER { color: var(--accent-yellow); }
+    .log-tag.TIMEOUT { color: var(--accent-red); }
+    .log-tag.FORWARD { color: var(--accent-orange); }
+    .log-tag.TREE { color: var(--accent-purple); }
+    .log-tag.FAULT { color: var(--accent-red); }
+    .log-tag.SYNC { color: #a371f7; }
+    .log-tag.INFO { color: var(--accent-green); }
+
+    /* Table */
+    .baton-table {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 0.75rem;
+    }
+
+    .baton-table th, .baton-table td {
+      border: 1px solid var(--border-color);
+      padding: 6px 8px;
+      text-align: left;
+    }
+
+    .baton-table th {
+      background: var(--bg-card);
+      color: var(--text-muted);
+      font-weight: 600;
+    }
+
+    .baton-table tr:hover {
+      background: rgba(255, 255, 255, 0.02);
+    }
+
+    .baton-table tr.selected {
+      background: rgba(88, 166, 255, 0.1);
+    }
+
+    /* Inspector Card */
+    .inspector-box {
+      background: var(--bg-card);
+      border: 1px solid var(--border-color);
+      border-radius: 6px;
+      padding: 10px;
+      font-family: var(--font-mono);
+      font-size: 0.74rem;
+      display: flex;
+      flex-direction: column;
+      gap: 4px;
+    }
+
+    .inspector-row {
+      display: flex;
+      justify-content: space-between;
+    }
+
+    .inspector-key {
+      color: var(--text-muted);
+    }
+    .inspector-val {
+      color: var(--text-bright);
+      font-weight: 600;
+    }
+
+    .callout-box {
+      background: rgba(88, 166, 255, 0.08);
+      border-left: 3px solid var(--accent-cyan);
+      padding: 8px 12px;
+      border-radius: 0 4px 4px 0;
+      font-size: 0.75rem;
+      color: var(--text-main);
+    }
+
+    .notation-guide {
+      background: rgba(210, 153, 34, 0.1);
+      border-left: 3px solid var(--accent-yellow);
+      padding: 8px 12px;
+      border-radius: 0 4px 4px 0;
+      font-size: 0.75rem;
+      color: var(--text-bright);
+    }
+  </style>
+</head>
+<body>
+
+  <!-- Header -->
+  <header>
+    <div class="header-title">
+      <h1>Baton Hierarchical Scheduler Visualizer</h1>
+      <span class="badge-tag">O(1) Cartesian Tree & Tickless One-Shot Sync</span>
+    </div>
+    <div class="presets-bar">
+      <span style="font-size: 0.8rem; color: var(--text-muted); font-weight: 500;">シナリオ:</span>
+      <button class="btn btn-sm" id="btn-preset-1" title="A -> B(10ms) -> C(40ms) -> D(50ms) からの上位Bタイムアウトとフォワーディング再開">
+        📋 設計書 6.1: 上位タイムアウト & フォワーディング
+      </button>
+      <button class="btn btn-sm" id="btn-preset-2" title="6ノード木構造: A(100ms) -> B(10ms) -> C(40ms) -> D(25ms) -> E(15ms) -> F(30ms)">
+        🌲 設計書 3.2: 6ノード・デカルト木構造検証
+      </button>
+      <button class="btn btn-sm" id="btn-preset-3" title="途中ノード例外発生時の親への復帰">
+        ⚠️ 設計書 6.2: 例外 (FAULT) 巻き戻り
+      </button>
+      <button class="btn btn-sm" id="btn-reset">
+        🔄 リセット
+      </button>
+    </div>
+  </header>
+
+  <!-- Notation Explanation Banner -->
+  <div class="notation-guide" style="margin-bottom: 14px;">
+    <strong>💡 時間の表記形式について: <code>実際に記録されている秒数 (概念上の秒数)</code></strong><br>
+    ・<strong>カッコ外（実記録秒数）:</strong> Baton構造体メモリ（<code>baton.remaining</code>）に現在書き込まれている実値です。CPU実行中にはメモリを毎ミリ秒書き換えないため、実行中は変化しません。<br>
+    ・<strong>カッコ内（概念上の秒数）:</strong> LAPICハードウェアタイマー進行に伴う理論上の残り時間です。イベント発生時にのみメモリを一括同期（<code>last_sync_tsc</code>）します。<br>
+    ・<strong>✂️ タイムアウト分断:</strong> 上位バトンが枯渇するとサブチェーンが切り離されて <code>WAIT_START</code> 状態で保持され、再開時に一撃で末尾へジャンプします。
+  </div>
+
+  <!-- Main Container -->
+  <div class="grid-container">
+
+    <!-- LEFT: Controls & Parameters -->
+    <div class="panel">
+      <div class="panel-header">
+        <span class="panel-title">⚙️ 実行制御 & タイマー</span>
+        <span id="system-time" style="font-family: var(--font-mono); font-size: 0.8rem; color: var(--accent-cyan);">T: 0.00 ms</span>
+      </div>
+
+      <div class="callout-box">
+        <strong>Tickless実行:</strong> 物理時間を進めます。メモリ上の構造体は書き換えずにハードウェアタイマーのみ進み、根の概念上の秒数が0になった瞬間にタイマー割り込みが発火してメモリ同期・分断が行われます。
+      </div>
+
+      <div style="display: flex; gap: 8px;">
+        <button class="btn btn-primary" id="btn-step-1ms" style="flex: 1; font-weight: 600;">
+          ⏱️ 1ms 進める
+        </button>
+        <button class="btn" id="btn-step-5ms" title="5ms 進める">
+          +5ms
+        </button>
+        <button class="btn btn-warning" id="btn-step-event" title="次のタイマー発火まで一気にジャンプ" style="flex: 1;">
+          ⏩ 次のイベントへ
+        </button>
+      </div>
+
+      <div style="display: flex; gap: 8px; align-items: center;">
+        <button class="btn" id="btn-auto-play" style="flex: 1;">
+          ▶️ 自動実行
+        </button>
+        <div style="display: flex; align-items: center; gap: 4px; font-size: 0.75rem; color: var(--text-muted);">
+          <span>速度:</span>
+          <select id="select-speed" style="padding: 2px 6px;">
+            <option value="500">遅い</option>
+            <option value="200" selected>普通</option>
+            <option value="50">速い</option>
+          </select>
+        </div>
+      </div>
+
+      <!-- LAPIC Timer Display -->
+      <div class="lapic-timer-card">
+        <div class="lapic-timer-header">
+          <span>LAPIC ワンショットタイマー (ハードウェア)</span>
+          <span id="lapic-target-node" style="color: var(--accent-yellow); font-weight: 600;">Root: --</span>
+        </div>
+        <div class="lapic-timer-val" id="lapic-timer-display">-- ms</div>
+        <div class="progress-bar-bg">
+          <div class="progress-bar-fill" id="lapic-progress-fill" style="width: 100%;"></div>
+        </div>
+        <div style="font-size: 0.72rem; color: var(--text-muted); margin-top: 4px;">
+          デカルト木の根ノードの最小値がワンショット設定されます (完全 O(1))
+        </div>
+      </div>
+
+      <!-- Switch to Baton with Custom Time -->
+      <div class="panel-header" style="margin-top: 8px;">
+        <span class="panel-title">🔀 sys_baton_switch</span>
+      </div>
+
+      <div class="callout-box">
+        <strong>バトンスイッチ:</strong> 好きな時間を設定したバトンへ委譲します。WAIT_START 状態のバトンを選択すると、ちぎれたサブチェーンが再開します。
+      </div>
+
+      <div class="form-group">
+        <label class="form-label">委譲先バトン (Target Baton)</label>
+        <select id="select-switch-target"></select>
+      </div>
+
+      <div class="form-row">
+        <div class="form-group" style="flex: 1;">
+          <label class="form-label">希望クォンタム (ms)</label>
+          <input type="number" id="input-quantum" value="20" min="1" max="1000">
+        </div>
+        <div class="form-group" style="flex: 1;">
+          <label class="form-label">新規作成時の名前</label>
+          <input type="text" id="input-new-name" placeholder="例: Worker2">
+        </div>
+      </div>
+
+      <div style="display: flex; gap: 8px;">
+        <button class="btn btn-cyan" id="btn-do-switch" style="flex: 2; font-weight: 600;">
+          🚀 sys_baton_switch 実行
+        </button>
+        <button class="btn" id="btn-set-quantum" style="flex: 1;" title="sys_baton_set_quantum">
+          設定のみ
+        </button>
+      </div>
+
+      <!-- Currently Running Actions -->
+      <div class="panel-header" style="margin-top: 8px;">
+        <span class="panel-title">⚡ 実行中スレッドのアクション</span>
+      </div>
+
+      <div style="font-size: 0.75rem; color: var(--text-muted);">
+        現在CPUを実行中の末尾ノード: <span id="current-running-label" style="font-weight: bold; color: var(--accent-green);">--</span>
+      </div>
+
+      <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 8px;">
+        <button class="btn" id="btn-act-block" title="自発的ブロック (IPC受信待ちなど)">
+          💤 BLOCKED (ブロック)
+        </button>
+        <button class="btn" id="btn-act-exit" title="スレッドの正常終了">
+          🏁 EXIT (終了)
+        </button>
+        <button class="btn btn-danger" id="btn-act-fault" style="grid-column: 1 / -1;" title="Page Fault / クラッシュ例外">
+          💥 FAULT (例外発生・親へ返却)
+        </button>
+      </div>
+    </div>
+
+    <!-- CENTER: Visualizers (Cartesian Tree & Call Stack) -->
+    <div style="display: flex; flex-direction: column; gap: 16px;">
+
+      <!-- Call Stack / Delegation Chain -->
+      <div class="panel">
+        <div class="panel-header">
+          <span class="panel-title">🔗 階層的委譲チェーン (Call Stack)</span>
+          <span style="font-size: 0.75rem; color: var(--text-muted);">形式: 実記録 (概念) ms</span>
+        </div>
+        <div class="chain-container">
+          <!-- Main visual row containing active chain AND severed chains -->
+          <div class="chain-flow-row" id="chain-flow-container">
+            <!-- Dynamic flow items -->
+          </div>
+
+          <!-- Suspended Subchains Cards (Detail & 1-click Resume) -->
+          <div id="suspended-subchains-panel" class="suspended-subchains-section" style="display: none;">
+            <div class="suspended-header-info">
+              <span style="font-weight: bold; color: var(--accent-orange);">
+                ⏸️ タイムアウトでちぎれたサブチェーン（分断保持中・WAIT_START）
+              </span>
+              <span style="color: var(--text-muted); font-size: 0.72rem;">
+                上位ノードのクォンタム枯渇により一時停止。状態・最短キャッシュ・末尾ポインタを保持中
+              </span>
+            </div>
+            <div id="suspended-cards-list" style="display: flex; flex-direction: column; gap: 8px;">
+              <!-- Dynamic subchain cards -->
+            </div>
+          </div>
+
+          <div id="forwarding-banner" style="display: none; font-size: 0.75rem; color: var(--accent-orange); background: rgba(240, 136, 62, 0.1); border: 1px solid var(--accent-orange); padding: 4px 8px; border-radius: 4px;">
+            ⚡ <strong>Direct Forwarding:</strong> WAIT_START のバトンが呼ばれたため、中間ノードをスキップして末尾スレッドに O(1) 直接ジャンプしました。
+          </div>
+        </div>
+      </div>
+
+      <!-- Cartesian Tree Canvas -->
+      <div class="panel" style="flex: 1; min-height: 450px;">
+        <div class="panel-header">
+          <div style="display: flex; align-items: center; gap: 8px;">
+            <span class="panel-title">🌲 デカルト木 (Cartesian Tree)</span>
+            <span class="badge-tag">O(1) 最小値追跡</span>
+          </div>
+          <span style="font-size: 0.75rem; color: var(--text-muted);">
+            ノード表示: 実記録 (概念) ms
+          </span>
+        </div>
+
+        <div class="tree-canvas-wrapper" id="tree-canvas-wrapper">
+          <div class="canvas-legend">
+            <div class="legend-item"><span class="legend-dot" style="background: var(--accent-yellow);"></span> 根: 全体最短 (タイマー)</div>
+            <div class="legend-item"><span class="legend-dot" style="background: var(--accent-green);"></span> RUNNING (実行中)</div>
+            <div class="legend-item"><span class="legend-dot" style="background: var(--accent-cyan);"></span> WAIT_RETURN (親)</div>
+            <div class="legend-item"><span class="legend-dot" style="background: var(--accent-orange);"></span> cartesian_right: 下流最短 ★</div>
+          </div>
+          <svg class="tree-svg" id="tree-svg"></svg>
+        </div>
+      </div>
+
+      <!-- System Call & Preemption Event Log -->
+      <div class="panel" style="min-height: 200px;">
+        <div class="panel-header">
+          <span class="panel-title">📜 カーネル・スケジューラ動作ログ</span>
+          <button class="btn btn-sm" id="btn-clear-log">消去</button>
+        </div>
+        <div class="log-terminal" id="log-terminal">
+          <!-- Dynamic logs -->
+        </div>
+      </div>
+
+    </div>
+
+    <!-- RIGHT: Inspector & Baton Pool Table -->
+    <div class="panel grid-right">
+      <div class="panel-header">
+        <span class="panel-title">🔍 バトン・インスペクター</span>
+      </div>
+
+      <div class="inspector-box" id="inspector-content">
+        <div style="color: var(--text-muted); text-align: center; padding: 12px 0;">
+          バトンをクリックすると詳細ポインタが表示されます
+        </div>
+      </div>
+
+      <div class="panel-header" style="margin-top: 10px;">
+        <span class="panel-title">📋 システム内バトン一覧</span>
+      </div>
+
+      <div style="overflow-x: auto; max-height: 320px; overflow-y: auto;">
+        <table class="baton-table" id="baton-table">
+          <thead>
+            <tr>
+              <th>ID/名</th>
+              <th>状態</th>
+              <th>実記録 (概念) / 設</th>
+              <th>親</th>
+              <th>末尾</th>
+            </tr>
+          </thead>
+          <tbody id="baton-table-body">
+            <!-- Dynamic rows -->
+          </tbody>
+        </table>
+      </div>
+
+      <!-- Architecture Insights Box -->
+      <div class="callout-box" style="margin-top: auto; border-color: var(--accent-purple);">
+        <strong style="color: var(--accent-purple);">💡 分断保持とダイレクト・フォワーディング:</strong><br>
+        多段委譲（$A \to B \to C \to D$）の途中で $B$ がタイムアウトしても、配下のサブチェーン $[B \to C \to D]$ は破棄されずにそのまま保持されます。<br>
+        $A$ が再び $B$ を再開した際、中間ノードを一切経由せず、末尾 $D$ に $O(1)$ で直接ジャンプして復帰します。
+      </div>
+    </div>
+
+  </div>
+
+  <script src="scheduler.js"></script>
+  <script src="visualizer.js"></script>
+  <script>
+    window.addEventListener('DOMContentLoaded', () => {
+      const scheduler = new BatonScheduler();
+      const visualizer = new BatonVisualizer(scheduler);
+      visualizer.init();
+    });
+  </script>
+</body>
+</html>

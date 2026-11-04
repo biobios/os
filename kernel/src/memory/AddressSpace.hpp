@@ -51,6 +51,10 @@ public:
         return arch_ctx.installPageTable(virt_addr, pt_phys, level);
     }
 
+    bool uninstallPageTable(std::uintptr_t virt_addr, std::uintptr_t expected_pt_phys, std::uint8_t level) {
+        return arch_ctx.uninstallPageTable(virt_addr, expected_pt_phys, level);
+    }
+
     std::uint8_t getMissingTableLevel(std::uintptr_t virt_addr) const {
         return arch_ctx.getMissingTableLevel(virt_addr);
     }

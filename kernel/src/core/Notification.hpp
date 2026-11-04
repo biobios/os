@@ -23,6 +23,10 @@ private:
     Notification* next_sibling_{nullptr};
     Notification* prev_sibling_{nullptr};
 
+    // Global registry intrusive list
+    Notification* reg_prev_{nullptr};
+    Notification* reg_next_{nullptr};
+
 public:
     explicit Notification(bool untyped = false);
     ~Notification() override;
@@ -46,7 +50,10 @@ public:
     // Waiter queue management
     void add_waiter(Thread* t);
     Thread* pop_waiter();
+    bool remove_waiter(Thread* t);
     bool has_waiters() const { return waiter_head_ != nullptr; }
+
+    friend void remove_thread_from_all_notifications(Thread* t);
 
     // Multi-stage Notification methods
     Notification* get_parent() const { return parent_; }
@@ -64,5 +71,7 @@ private:
     void add_child_internal(Notification* child);
     void remove_child_internal(Notification* child);
 };
+
+void remove_thread_from_all_notifications(Thread* t);
 
 } // namespace oz

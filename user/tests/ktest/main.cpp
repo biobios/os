@@ -1,19 +1,16 @@
 #include "syscall.hpp"
 #include "../common/test_harness.hpp"
+static void print_hex(std::uint64_t val) {
+    char buf[17];
+    for (int i = 15; i >= 0; --i) {
+        int nibble = (val >> (i * 4)) & 0xF;
+        buf[15 - i] = (nibble < 10) ? ('0' + nibble) : ('A' + nibble - 10);
+    }
+    buf[16] = '\0';
+    oz::sys_debug_print(buf);
+}
 
 namespace oz::ktest {
-
-static volatile bool g_once_server_received = false;
-static std::uint32_t g_once_server_ep = 0;
-static void test_once_server_thread() {
-    oz::IPCMessage req{};
-    oz::IPCMessage rep{};
-    rep.data[0] = 0x5555;
-    oz::ReplyToken tok = oz::sys_reply_recv(oz::INVALID_REPLY_TOKEN, g_once_server_ep, nullptr, &req);
-    g_once_server_received = (tok != oz::INVALID_REPLY_TOKEN);
-    oz::sys_reply_recv(tok, g_once_server_ep, &rep, &req);
-    oz::sys_exit(0);
-}
 
 // =============================================================================
 // 1. Capability Semantics Tests
@@ -63,6 +60,17 @@ static void run_capability_semantics_tests() {
     // linear2 went out of scope, slot 51 should be deleted automatically
     TEST_REPORT("KTEST", "C++ LinearCap RAII destructor cleanup", oz::sys_cap_delete(51) != 0);
 
+    // Test ScopedCap reset & double free prevention
+    {
+        std::uint32_t r_ep0 = 0, r_ep1 = 0;
+        if (oz::sys_channel_create(oz::CAP_UNTYPED, &r_ep0, &r_ep1)) {
+            oz::ScopedCap<> scoped(r_ep0);
+            scoped.reset();
+            TEST_REPORT("KTEST", "ScopedCap reset idempotency & double free prevention", !scoped.isValid() && oz::sys_cap_delete(r_ep0) != 0);
+            oz::sys_cap_delete(r_ep1);
+        }
+    }
+
     // Test Notification Object & Bound Notification
     std::uint32_t notif_cap = oz::sys_notification_create(oz::CAP_UNTYPED);
     if (notif_cap != oz::INVALID_CAP_ID) {
@@ -91,38 +99,6 @@ static void run_capability_semantics_tests() {
         oz::sys_cap_delete(notif_cap);
     } else {
         TEST_REPORT("KTEST", "Notification creation", false);
-    }
-
-    // Test Once Capability Auto-consumption
-    std::uint32_t o_ep0 = 0, o_ep1 = 0;
-    if (oz::sys_channel_create(oz::CAP_UNTYPED, &o_ep0, &o_ep1)) {
-        g_once_server_ep = o_ep1;
-
-        std::uint32_t s_tcb = oz::sys_untyped_retype(oz::CAP_UNTYPED, static_cast<std::uint32_t>(oz::ObjectType::TCB), 0);
-        std::uint32_t s_stack = oz::sys_frame_alloc(oz::CAP_UNTYPED, 4);
-        std::uint64_t s_stack_top = 0x700060000000ULL + 16384;
-        oz::sys_vspace_map_with_pagetables(oz::CAP_SELF_VSPACE, oz::CAP_UNTYPED, s_stack, 0x700060000000ULL, 0x03, 16384);
-        oz::sys_tcb_configure(s_tcb, oz::CAP_SELF_CSPACE, oz::CAP_SELF_VSPACE,
-                              reinterpret_cast<std::uint64_t>(test_once_server_thread), s_stack_top);
-
-        std::uint32_t s_baton = oz::sys_untyped_retype(oz::CAP_UNTYPED, static_cast<std::uint32_t>(oz::ObjectType::Baton), 0);
-        oz::sys_baton_inject(s_baton, 50000);
-        oz::sys_tcb_bind_baton(s_tcb, s_baton);
-        oz::sys_baton_switch(s_baton);
-
-        std::uint32_t once_cap = oz::sys_cap_mint(o_ep0, static_cast<std::uint32_t>(oz::CapRights::WRITE | oz::CapRights::ONCE));
-        if (once_cap != oz::INVALID_CAP_ID) {
-            oz::IPCMessage req{};
-            oz::IPCMessage rep{};
-            req.data[0] = 0x1234;
-            bool call_ok = oz::sys_call(once_cap, &req, &rep);
-            bool slot_deleted = (oz::sys_cap_delete(once_cap) != 0);
-            TEST_REPORT("KTEST", "Once Capability auto-consumption on sys_call", call_ok && slot_deleted && rep.data[0] == 0x5555);
-        } else {
-            TEST_REPORT("KTEST", "Once Capability auto-consumption on sys_call", false);
-        }
-        oz::sys_cap_delete(o_ep0);
-        oz::sys_cap_delete(o_ep1);
     }
 
     // Test Rights and Boundary Checks
@@ -222,7 +198,7 @@ static void test_abort_worker_thread() {
     g_abort_worker_ran = true;
     oz::IPCMessage msg{};
     std::int64_t ret = static_cast<std::int64_t>(
-        oz::syscall(2, g_abort_ep, reinterpret_cast<std::uint64_t>(&msg), 0, 0, 0, 0));
+        oz::sys_reply_and_recv(g_abort_ep, nullptr, &msg));
     g_abort_result = static_cast<int>(ret);
     oz::sys_exit(0);
 }
@@ -252,7 +228,7 @@ static volatile std::uint64_t g_pf_fault_addr = 0;
 static volatile bool g_pf_client_success = false;
 static std::uint32_t g_pf_pager_ep = 0;
 static std::uint32_t g_pf_frame_cap = 0;
-static constexpr std::uint64_t FAULT_TEST_VADDR = 0x65000000ULL;
+static constexpr std::uint64_t FAULT_TEST_VADDR = 0x650000000000ULL;
 
 static void test_pf_pager_thread() {
     oz::IPCMessage req{};
@@ -1216,9 +1192,681 @@ static void run_hierarchical_cartesian_scheduling_tests() {
     oz::sys_cap_delete(cr_baton);
 }
 
+// =============================================================================
+// 5. Capability Lifecycle New Spec Tests (Phase 6)
+// =============================================================================
+static volatile bool g_lazy_ipc_cancelled = false;
+static std::uint32_t g_lazy_ipc_ep = 0;
+static std::uint32_t g_lazy_transferred_cap = 0;
+
+static void test_lazy_ipc_sender_thread() {
+    oz::IPCMessage req{};
+    oz::IPCMessage rep{};
+    req.data[0] = 0x8888;
+    req.has_cap = true;
+    req.transferred_cap = g_lazy_transferred_cap;
+    bool call_ok = oz::sys_call(g_lazy_ipc_ep, &req, &rep);
+    if (!call_ok) {
+        g_lazy_ipc_cancelled = true;
+    }
+    for (;;) {
+        oz::sys_yield();
+    }
+}
+
+static volatile bool g_self_destruct_ran = false;
+static volatile bool g_self_destruct_cspace_survived = false;
+static void test_self_destruct_thread() {
+    g_self_destruct_ran = true;
+    // 1. Delete own CSpaceCap: thread should survive and continue execution in user mode
+    int del_res = oz::sys_cap_delete(oz::CAP_SELF_CSPACE);
+    // After CSpaceCap is deleted, further cap syscalls return error because slot is null!
+    int res = oz::sys_cap_delete(oz::CAP_SELF_CSPACE);
+    if (del_res == 0 && res != 0) {
+        g_self_destruct_cspace_survived = true;
+    }
+    oz::sys_yield();
+    oz::sys_baton_exit(0);
+}
+
+static volatile bool g_tcb_destruct_ran = false;
+static std::uint32_t g_tcb_self_destruct_ut = 0;
+static void test_tcb_self_destruct_thread() {
+    g_tcb_destruct_ran = true;
+    // Revoke the Untyped containing our own TCB!
+    oz::sys_untyped_revoke(g_tcb_self_destruct_ut);
+    // Should never reach here because TCB was destroyed and abandonCurrentContextTo executed!
+    for (;;) {
+        oz::sys_yield();
+    }
+}
+
+static volatile bool g_drop_server_ran = false;
+static oz::IPCMessage g_drop_server_recv_msg{};
+static std::uint32_t g_drop_server_ep = 0;
+static void test_drop_on_fail_server_thread() {
+    g_drop_server_ran = true;
+    // IPC_RECV_SLOT_NONE で受信待機（受取先スロット未指定 / 拒否）
+    oz::sys_reply_and_recv(g_drop_server_ep, nullptr, &g_drop_server_recv_msg, 0, oz::IPC_RECV_SLOT_NONE);
+    // クライアントへ返信
+    oz::IPCMessage rep{};
+    rep.data[0] = 0xABCD;
+    oz::sys_reply_and_recv(0, &rep, nullptr);
+    for (;;) {
+        oz::sys_yield();
+    }
+}
+
+static void run_capability_lifecycle_new_spec_tests() {
+    oz::sys_debug_print("\n\r--- 5. Capability Lifecycle New Spec Tests (Phase 6) ---\n\r");
+
+    // 1. Hierarchical CDT & Reparenting
+    {
+        std::uint32_t ut_child = oz::sys_untyped_retype(
+            oz::CAP_UNTYPED, static_cast<std::uint32_t>(oz::ObjectType::UntypedMemory), 64 * 1024);
+        if (ut_child != oz::INVALID_CAP_ID) {
+            std::uint32_t notif_child = oz::sys_notification_create(ut_child);
+            if (notif_child != oz::INVALID_CAP_ID) {
+                std::uint32_t notif_copy = oz::sys_cap_mint(notif_child, static_cast<std::uint32_t>(oz::CapRights::ALL));
+                if (notif_copy != oz::INVALID_CAP_ID) {
+                    // Delete intermediate node (notif_child)
+                    // notif_copy should be reparented to ut_child and remain functional
+                    int del_res = oz::sys_cap_delete(notif_child);
+                    oz::sys_notification_signal(notif_copy, 0x123);
+                    std::uint64_t polled = 0;
+                    int poll_res = oz::sys_notification_poll(notif_copy, &polled);
+                    bool reparent_ok = (del_res == 0 && poll_res == 0 && polled == 0x123);
+
+                    // Revoke root of subtree (ut_child)
+                    // notif_copy should be pruned
+                    oz::sys_untyped_revoke(ut_child);
+                    bool pruned_ok = (oz::sys_notification_signal(notif_copy, 0x456) != 0);
+
+                    TEST_REPORT("KTEST", "Hierarchical CDT reparenting & subtree revoke", reparent_ok && pruned_ok);
+                } else {
+                    TEST_REPORT("KTEST", "Hierarchical CDT reparenting & subtree revoke", false);
+                    oz::sys_cap_delete(notif_child);
+                }
+            } else {
+                TEST_REPORT("KTEST", "Hierarchical CDT reparenting & subtree revoke", false);
+            }
+            oz::sys_cap_delete(ut_child);
+        } else {
+            TEST_REPORT("KTEST", "Hierarchical CDT reparenting & subtree revoke", false);
+        }
+    }
+
+    // 2. Untyped Linear Allocation & Auto-reset
+    {
+        std::uint32_t u_test = oz::sys_untyped_retype(
+            oz::CAP_UNTYPED, static_cast<std::uint32_t>(oz::ObjectType::UntypedMemory), 64 * 1024);
+        if (u_test != oz::INVALID_CAP_ID) {
+            // Linear prevention check
+            std::uint32_t dup = oz::sys_cap_mint(u_test, static_cast<std::uint32_t>(oz::CapRights::ALL));
+            bool linear_ok = (dup == oz::INVALID_CAP_ID);
+
+            // Allocate 16 pages of frames (64KB total)
+            std::uint32_t frames[16];
+            bool alloc_ok = true;
+            for (int i = 0; i < 16; ++i) {
+                frames[i] = oz::sys_frame_alloc(u_test, 1);
+                if (frames[i] == oz::INVALID_CAP_ID) {
+                    alloc_ok = false;
+                }
+            }
+            // 17th allocation must fail
+            std::uint32_t overflow_frame = oz::sys_frame_alloc(u_test, 1);
+            bool overflow_ok = (overflow_frame == oz::INVALID_CAP_ID);
+
+            // Delete all 16 frames -> auto-reset watermark to 0
+            for (int i = 0; i < 16; ++i) {
+                if (frames[i] != oz::INVALID_CAP_ID) {
+                    oz::sys_cap_delete(frames[i]);
+                }
+            }
+
+            // Verify capacity recovered: allocating a new frame succeeds!
+            std::uint32_t re_frame = oz::sys_frame_alloc(u_test, 1);
+            bool recovered_ok = (re_frame != oz::INVALID_CAP_ID);
+            if (re_frame != oz::INVALID_CAP_ID) {
+                oz::sys_cap_delete(re_frame);
+            }
+
+            TEST_REPORT("KTEST", "Untyped linear allocation & auto-reset watermark",
+                        linear_ok && alloc_ok && overflow_ok && recovered_ok);
+            oz::sys_cap_delete(u_test);
+        } else {
+            TEST_REPORT("KTEST", "Untyped linear allocation & auto-reset watermark", false);
+        }
+    }
+
+    // 3. Frame Mapping Lifecycle & Automatic Unmap on Delete
+    {
+        std::uint32_t f = oz::sys_frame_alloc(oz::CAP_UNTYPED, 1);
+        if (f != oz::INVALID_CAP_ID) {
+            constexpr std::uint64_t TEST_VA = 0x600050000000ULL;
+            int map_res = oz::sys_vspace_map_with_pagetables(
+                oz::CAP_SELF_VSPACE, oz::CAP_UNTYPED, f, TEST_VA, 0x01, 4096);
+            if (map_res == 0) {
+                *reinterpret_cast<volatile std::uint64_t*>(TEST_VA) = 0xDEADBEEFCAFEBABEULL;
+                bool read_ok = (*reinterpret_cast<volatile std::uint64_t*>(TEST_VA) == 0xDEADBEEFCAFEBABEULL);
+
+                // Delete frame capability -> kernel automatically unmaps
+                int del_res = oz::sys_cap_delete(f);
+
+                // Unmapping the virtual address now must fail (already unmapped)
+                int unmap_again = oz::sys_vspace_unmap(oz::CAP_SELF_VSPACE, TEST_VA);
+                bool auto_unmapped = (del_res == 0 && unmap_again != 0);
+
+                TEST_REPORT("KTEST", "Frame mapping lifecycle & auto-unmap on delete", read_ok && auto_unmapped);
+            } else {
+                TEST_REPORT("KTEST", "Frame mapping lifecycle & auto-unmap on delete", false);
+                oz::sys_cap_delete(f);
+            }
+        } else {
+            TEST_REPORT("KTEST", "Frame mapping lifecycle & auto-unmap on delete", false);
+        }
+    }
+
+    // 4. Inline Caps & CSpace Teardown
+    {
+        std::uint32_t cs = oz::sys_cspace_create(oz::CAP_UNTYPED);
+        if (cs != oz::INVALID_CAP_ID) {
+            // Create child IOPort inside child CSpace
+            std::uint32_t io_child = oz::sys_ioport_create(oz::CAP_ROOT_IOPORT, oz::CAP_UNTYPED, 0x3F8, 8);
+            bool io_created = (io_child != oz::INVALID_CAP_ID);
+            if (io_created) {
+                oz::sys_cspace_cap_move(cs, 10, io_child);
+            }
+
+            // Create IRQHandler for vector 0x48 inside child CSpace
+            std::uint32_t irq_h = oz::sys_irq_handler_create(oz::CAP_UNTYPED, 0x48, 0);
+            bool irq_created = (irq_h != oz::INVALID_CAP_ID);
+            if (irq_created) {
+                oz::sys_cspace_cap_move(cs, 11, irq_h);
+            }
+
+            // Tear down entire child CSpace: must reverse-unbind and free without panic or leak
+            int cs_del = oz::sys_cap_delete(cs);
+
+            // Verify vector 0x48 is reset and can be registered again without collision
+            std::uint32_t irq_h2 = oz::sys_irq_handler_create(oz::CAP_UNTYPED, 0x48, 0);
+            bool irq_recreated = (irq_h2 != oz::INVALID_CAP_ID);
+            if (irq_recreated) {
+                oz::sys_cap_delete(irq_h2);
+            }
+
+            TEST_REPORT("KTEST", "Inline caps & CSpace teardown reverse cleanup",
+                        io_created && irq_created && cs_del == 0 && irq_recreated);
+        } else {
+            TEST_REPORT("KTEST", "Inline caps & CSpace teardown reverse cleanup", false);
+        }
+    }
+
+    // 5. IPC Lazy Move on Cancel
+    {
+        std::uint32_t lep0 = 0, lep1 = 0;
+        if (oz::sys_channel_create(oz::CAP_UNTYPED, &lep0, &lep1)) {
+            g_lazy_ipc_ep = lep0;
+            g_lazy_transferred_cap = oz::sys_notification_create(oz::CAP_UNTYPED);
+
+            std::uint32_t sender_tcb = oz::sys_untyped_retype(oz::CAP_UNTYPED, static_cast<std::uint32_t>(oz::ObjectType::TCB), 0);
+            std::uint32_t sender_stack = oz::sys_frame_alloc(oz::CAP_UNTYPED, 4);
+            std::uint64_t sender_stack_top = 0x700070000000ULL + 16384;
+            oz::sys_vspace_map_with_pagetables(oz::CAP_SELF_VSPACE, oz::CAP_UNTYPED, sender_stack, 0x700070000000ULL, 0x03, 16384);
+            oz::sys_tcb_configure(sender_tcb, oz::CAP_SELF_CSPACE, oz::CAP_SELF_VSPACE,
+                                  reinterpret_cast<std::uint64_t>(test_lazy_ipc_sender_thread), sender_stack_top);
+            std::uint32_t sender_baton = oz::sys_untyped_retype(oz::CAP_UNTYPED, static_cast<std::uint32_t>(oz::ObjectType::Baton), 0);
+            oz::sys_baton_inject(sender_baton, 50000);
+            oz::sys_tcb_bind_baton(sender_tcb, sender_baton);
+
+            // Switch to sender: sender calls sys_call with transferred cap and blocks because lep1 has no receiver
+            oz::sys_baton_switch(sender_baton);
+
+            // Cancel sender's IPC while blocked
+            oz::sys_tcb_cancel_ipc(sender_tcb);
+
+            // Switch back to sender so sys_call unblocks with error
+            oz::sys_baton_switch(sender_baton);
+
+            // Verify: transferred cap is still in CSpace and functional!
+            oz::sys_notification_signal(g_lazy_transferred_cap, 0x777);
+            std::uint64_t polled_lazy = 0;
+            bool cap_intact = (oz::sys_notification_poll(g_lazy_transferred_cap, &polled_lazy) == 0 && polled_lazy == 0x777);
+
+            TEST_REPORT("KTEST", "IPC lazy capability transfer preserved on cancel",
+                        g_lazy_ipc_cancelled && cap_intact);
+
+            oz::sys_cap_delete(g_lazy_transferred_cap);
+            oz::sys_cap_delete(sender_tcb);
+            oz::sys_cap_delete(sender_baton);
+            oz::sys_vspace_unmap(oz::CAP_SELF_VSPACE, sender_stack);
+            oz::sys_cap_delete(sender_stack);
+            oz::sys_cap_delete(lep0);
+            oz::sys_cap_delete(lep1);
+        } else {
+            TEST_REPORT("KTEST", "IPC lazy capability transfer preserved on cancel", false);
+        }
+    }
+
+    // 6. Self-destruction Graceful Transition
+    {
+        g_self_destruct_ran = false;
+        g_self_destruct_cspace_survived = false;
+        std::uint32_t sd_cs = oz::sys_cspace_create(oz::CAP_UNTYPED);
+        std::uint32_t sd_tcb = oz::sys_untyped_retype(oz::CAP_UNTYPED, static_cast<std::uint32_t>(oz::ObjectType::TCB), 0);
+        std::uint32_t sd_stack = oz::sys_frame_alloc(oz::CAP_UNTYPED, 4);
+        std::uint64_t sd_stack_top = 0x700080000000ULL + 16384;
+        oz::sys_vspace_map_with_pagetables(oz::CAP_SELF_VSPACE, oz::CAP_UNTYPED, sd_stack, 0x700080000000ULL, 0x03, 16384);
+
+        // Put sd_cs into its own CSpace at CAP_SELF_CSPACE (245)
+        oz::sys_cspace_cap_insert(sd_cs, oz::CAP_SELF_CSPACE, sd_cs, static_cast<std::uint32_t>(oz::CapRights::ALL));
+
+        oz::sys_tcb_configure(sd_tcb, sd_cs, oz::CAP_SELF_VSPACE,
+                              reinterpret_cast<std::uint64_t>(test_self_destruct_thread), sd_stack_top);
+        std::uint32_t sd_baton = oz::sys_untyped_retype(oz::CAP_UNTYPED, static_cast<std::uint32_t>(oz::ObjectType::Baton), 0);
+        oz::sys_baton_inject(sd_baton, 50000);
+        oz::sys_tcb_bind_baton(sd_tcb, sd_baton);
+
+        // Switch to self-destruct thread
+        auto switch_res = oz::sys_baton_switch(sd_baton);
+
+        bool cspace_destruct_ok = g_self_destruct_ran && g_self_destruct_cspace_survived;
+
+        oz::sys_cap_delete(sd_tcb);
+        oz::sys_cap_delete(sd_baton);
+        oz::sys_cap_delete(sd_cs);
+        oz::sys_vspace_unmap(oz::CAP_SELF_VSPACE, 0x700080000000ULL);
+        oz::sys_cap_delete(sd_stack);
+
+        // Now test TCB self-destruction via abandonCurrentContextTo
+        g_tcb_destruct_ran = false;
+        std::uint32_t ut_tcb = oz::sys_untyped_retype(oz::CAP_UNTYPED, static_cast<std::uint32_t>(oz::ObjectType::UntypedMemory), 64 * 1024);
+        std::uint32_t tcb2 = oz::sys_untyped_retype(ut_tcb, static_cast<std::uint32_t>(oz::ObjectType::TCB), 0);
+        std::uint32_t b2 = oz::sys_untyped_retype(oz::CAP_UNTYPED, static_cast<std::uint32_t>(oz::ObjectType::Baton), 0);
+        oz::sys_baton_inject(b2, 50000);
+        std::uint32_t stack2 = oz::sys_frame_alloc(oz::CAP_UNTYPED, 4);
+        std::uint64_t stack2_top = 0x700088000000ULL + 16384;
+        oz::sys_vspace_map_with_pagetables(oz::CAP_SELF_VSPACE, oz::CAP_UNTYPED, stack2, 0x700088000000ULL, 0x03, 16384);
+
+        g_tcb_self_destruct_ut = ut_tcb;
+        oz::sys_tcb_configure(tcb2, oz::CAP_SELF_CSPACE, oz::CAP_SELF_VSPACE,
+                              reinterpret_cast<std::uint64_t>(test_tcb_self_destruct_thread), stack2_top);
+        oz::sys_tcb_bind_baton(tcb2, b2);
+
+        auto switch2_res = oz::sys_baton_switch(b2);
+        bool tcb_destruct_ok = g_tcb_destruct_ran && (switch2_res.reason != oz::SchedReason::NONE);
+
+        // Untyped should have auto-reset watermark because tcb2 was pruned
+        std::uint32_t re_alloc_frame = oz::sys_frame_alloc(ut_tcb, 1);
+        bool ut_reset_ok = (re_alloc_frame != oz::INVALID_CAP_ID);
+        if (re_alloc_frame != oz::INVALID_CAP_ID) {
+            oz::sys_cap_delete(re_alloc_frame);
+        }
+
+        oz::sys_cap_delete(b2);
+        oz::sys_vspace_unmap(oz::CAP_SELF_VSPACE, 0x700088000000ULL);
+        oz::sys_cap_delete(stack2);
+        oz::sys_cap_delete(ut_tcb);
+
+        TEST_REPORT("KTEST", "Self-destruction graceful transition & context abandonment",
+                    cspace_destruct_ok && tcb_destruct_ok && ut_reset_ok);
+    }
+
+    // 7. IPC Capability Drop-on-Fail (Invalid/Zero Slot drops cap but delivers message)
+    {
+        g_drop_server_ran = false;
+        g_drop_server_recv_msg = {};
+        std::uint32_t dep0 = 0, dep1 = 0;
+        if (oz::sys_channel_create(oz::CAP_UNTYPED, &dep0, &dep1)) {
+            g_drop_server_ep = dep1;
+            std::uint32_t notif_cap = oz::sys_notification_create(oz::CAP_UNTYPED);
+
+            std::uint32_t s_tcb = oz::sys_untyped_retype(oz::CAP_UNTYPED, static_cast<std::uint32_t>(oz::ObjectType::TCB), 0);
+            std::uint32_t s_stack = oz::sys_frame_alloc(oz::CAP_UNTYPED, 4);
+            constexpr std::uint64_t S_STACK_VA = 0x700090000000ULL;
+            oz::sys_vspace_map_with_pagetables(oz::CAP_SELF_VSPACE, oz::CAP_UNTYPED, s_stack, S_STACK_VA, 0x03, 16384);
+            oz::sys_tcb_configure(s_tcb, oz::CAP_SELF_CSPACE, oz::CAP_SELF_VSPACE,
+                                  reinterpret_cast<std::uint64_t>(test_drop_on_fail_server_thread), S_STACK_VA + 16384);
+            std::uint32_t s_baton = oz::sys_untyped_retype(oz::CAP_UNTYPED, static_cast<std::uint32_t>(oz::ObjectType::Baton), 0);
+            oz::sys_baton_inject(s_baton, 50000);
+            oz::sys_tcb_bind_baton(s_tcb, s_baton);
+
+            // Switch to server: server enters sys_reply_and_recv with recv_slot = 0
+            oz::sys_baton_switch(s_baton);
+
+            // Client sends message with has_cap = true
+            oz::IPCMessage send_msg{};
+            send_msg.data[0] = 0x1234;
+            send_msg.has_cap = true;
+            send_msg.transferred_cap = notif_cap;
+            oz::IPCMessage recv_rep{};
+
+            bool call_res = oz::sys_call(dep0, &send_msg, &recv_rep);
+
+            // Verify:
+            // 1. sys_call succeeded (return true) and received reply
+            bool call_ok = (call_res && recv_rep.data[0] == 0xABCD);
+            // 2. Server received message data, but cap was dropped
+            bool server_ok = g_drop_server_ran &&
+                             (g_drop_server_recv_msg.data[0] == 0x1234) &&
+                             (!g_drop_server_recv_msg.has_cap) &&
+                             (g_drop_server_recv_msg.transferred_cap == 0);
+            // 3. Sender cap was destroyed in CSpace (delete fails)
+            int del_after_drop = oz::sys_cap_delete(notif_cap);
+            bool cap_destroyed = (del_after_drop != 0);
+
+            TEST_REPORT("KTEST", "IPC drop capability on slot failure but deliver message",
+                        call_ok && server_ok && cap_destroyed);
+
+            oz::sys_cap_delete(s_tcb);
+            oz::sys_cap_delete(s_baton);
+            oz::sys_vspace_unmap(oz::CAP_SELF_VSPACE, S_STACK_VA);
+            oz::sys_cap_delete(s_stack);
+            oz::sys_cap_delete(dep0);
+            oz::sys_cap_delete(dep1);
+        } else {
+            TEST_REPORT("KTEST", "IPC drop capability on slot failure but deliver message", false);
+        }
+    }
+
+    // 8. IPC transfer slot 0 protection (transferred_cap=0 does not destroy CAP_SELF_VSPACE)
+    {
+        std::uint32_t ep0 = 0, ep1 = 0;
+        if (oz::sys_channel_create(oz::CAP_UNTYPED, &ep0, &ep1)) {
+            oz::IPCMessage send_msg{};
+            send_msg.has_cap = true;
+            send_msg.transferred_cap = 0; // slot 0
+            oz::IPCMessage recv_rep{};
+            bool call_res = oz::sys_call(ep0, &send_msg, &recv_rep);
+            oz::CapInfo info{};
+            bool vspace_intact = (oz::sys_cap_identify(oz::CAP_SELF_VSPACE, &info) == 0 && info.type != 0);
+            TEST_REPORT("KTEST", "IPC transfer slot 0 protection (CAP_SELF_VSPACE preserved)", !call_res && vspace_intact);
+            oz::sys_cap_delete(ep0);
+            oz::sys_cap_delete(ep1);
+        } else {
+            TEST_REPORT("KTEST", "IPC transfer slot 0 protection (CAP_SELF_VSPACE preserved)", false);
+        }
+    }
+
+    // 9. IPC transfer non-TRANSFER cap rejected without deleting source cap
+    {
+        std::uint32_t ep0 = 0, ep1 = 0;
+        if (oz::sys_channel_create(oz::CAP_UNTYPED, &ep0, &ep1)) {
+            std::uint32_t notif_cap = oz::sys_notification_create(oz::CAP_UNTYPED);
+            // Mint with READ | REVOKE (no TRANSFER)
+            std::uint32_t no_xfer = oz::sys_cap_mint(notif_cap, static_cast<std::uint32_t>(oz::CapRights::READ | oz::CapRights::REVOKE));
+            if (no_xfer != oz::INVALID_CAP_ID) {
+                oz::IPCMessage send_msg{};
+                send_msg.has_cap = true;
+                send_msg.transferred_cap = no_xfer;
+                oz::IPCMessage recv_rep{};
+                bool call_res = oz::sys_call(ep0, &send_msg, &recv_rep);
+                // Cap must still exist
+                bool cap_survived = (oz::sys_cap_delete(no_xfer) == 0);
+                TEST_REPORT("KTEST", "IPC non-TRANSFER cap transfer rejected and source preserved", !call_res && cap_survived);
+            } else {
+                TEST_REPORT("KTEST", "IPC non-TRANSFER cap transfer rejected and source preserved", false);
+            }
+            oz::sys_cap_delete(notif_cap);
+            oz::sys_cap_delete(ep0);
+            oz::sys_cap_delete(ep1);
+        } else {
+            TEST_REPORT("KTEST", "IPC non-TRANSFER cap transfer rejected and source preserved", false);
+        }
+    }
+
+    // 10. IPC transfer reserved slot protection
+    {
+        std::uint32_t ep0 = 0, ep1 = 0;
+        if (oz::sys_channel_create(oz::CAP_UNTYPED, &ep0, &ep1)) {
+            oz::IPCMessage send_msg{};
+            send_msg.has_cap = true;
+            send_msg.transferred_cap = oz::CAP_UNTYPED; // 240
+            oz::IPCMessage recv_rep{};
+            bool call_res = oz::sys_call(ep0, &send_msg, &recv_rep);
+            oz::CapInfo info{};
+            bool untyped_survived = (oz::sys_cap_identify(oz::CAP_UNTYPED, &info) == 0 && info.type != 0);
+            TEST_REPORT("KTEST", "IPC reserved slot transfer rejected and CAP_UNTYPED preserved", !call_res && untyped_survived);
+            oz::sys_cap_delete(ep0);
+            oz::sys_cap_delete(ep1);
+        } else {
+            TEST_REPORT("KTEST", "IPC reserved slot transfer rejected and CAP_UNTYPED preserved", false);
+        }
+    }
+
+    // 11. Abolished syscall 5 returns SYS_ERR_INVALID
+    {
+        std::int64_t sys5_res = static_cast<std::int64_t>(oz::syscall(5, 0, 0, 0, 0, 0, 0));
+        TEST_REPORT("KTEST", "Abolished syscall 5 returns SYS_ERR_INVALID", sys5_res == oz::SYS_ERR_INVALID);
+    }
+}
+
+// =============================================================================
+// 6. Hierarchical PageTable & VSpace Integration Tests
+// =============================================================================
+static void run_hierarchical_pagetable_tests() {
+    oz::sys_debug_print("\n\r--- 6. Hierarchical PageTable & VSpace Integration Tests ---\n\r");
+
+    // 1. test_separated_untyped_zero_padding
+    {
+        // 64KB (16 frames) Untyped A and 4KB Untyped B
+        std::uint32_t ut_A = oz::sys_untyped_retype(oz::CAP_UNTYPED, static_cast<std::uint32_t>(oz::ObjectType::UntypedMemory), 64 * 1024);
+        std::uint32_t ut_B = oz::sys_untyped_retype(oz::CAP_UNTYPED, static_cast<std::uint32_t>(oz::ObjectType::UntypedMemory), 4096);
+
+        bool setup_ok = (ut_A != oz::INVALID_CAP_ID && ut_B != oz::INVALID_CAP_ID);
+
+        // Allocate 16 frames from ut_A with zero padding waste
+        std::uint32_t frames[16] = {};
+        bool all_frames_ok = true;
+        for (int i = 0; i < 16; ++i) {
+            frames[i] = oz::sys_frame_alloc(ut_A, 1);
+            if (frames[i] == oz::INVALID_CAP_ID) {
+                all_frames_ok = false;
+                break;
+            }
+            // In between, create a 56B PageTableObject from ut_B (backed by a frame from CAP_UNTYPED)
+            if (i == 4) {
+                std::uint32_t bk = oz::sys_frame_alloc(oz::CAP_UNTYPED, 1);
+                std::uint32_t pt = oz::sys_pagetable_create(ut_B, bk, 1);
+                if (pt == oz::INVALID_CAP_ID) all_frames_ok = false;
+                oz::sys_cap_delete(pt);
+                oz::sys_cap_delete(bk);
+            }
+        }
+
+        // ut_A should now be completely full (allocating one more must fail)
+        std::uint32_t extra = oz::sys_frame_alloc(ut_A, 1);
+        bool full_ok = (extra == oz::INVALID_CAP_ID);
+
+        for (int i = 0; i < 16; ++i) {
+            if (frames[i] != oz::INVALID_CAP_ID) oz::sys_cap_delete(frames[i]);
+        }
+        oz::sys_cap_delete(ut_A);
+        oz::sys_cap_delete(ut_B);
+
+        TEST_REPORT("KTEST", "Zero padding waste with separated physical/kernel untypeds", setup_ok && all_frames_ok && full_ok);
+    }
+
+    // 2. test_pt_backing_frame_exclusivity
+    {
+        std::uint32_t f_orig = oz::sys_frame_alloc(oz::CAP_UNTYPED, 1);
+        std::uint32_t f_copy = oz::sys_cap_mint(f_orig, static_cast<std::uint32_t>(oz::CapRights::ALL));
+
+        // Both f_orig (has child) and f_copy (not original) must be rejected
+        std::uint32_t pt_bad1 = oz::sys_pagetable_create(oz::CAP_UNTYPED, f_orig, 1);
+        std::uint32_t pt_bad2 = oz::sys_pagetable_create(oz::CAP_UNTYPED, f_copy, 1);
+
+        bool copy_rejected = (pt_bad1 == oz::INVALID_CAP_ID && pt_bad2 == oz::INVALID_CAP_ID);
+
+        // Delete f_orig to reparent f_copy to Untyped root
+        oz::sys_cap_delete(f_orig);
+
+        // Reparented f_copy still lacks SLOT_FLAG_ORIGINAL -> must be rejected
+        std::uint32_t pt_bad3 = oz::sys_pagetable_create(oz::CAP_UNTYPED, f_copy, 1);
+        bool reparent_rejected = (pt_bad3 == oz::INVALID_CAP_ID);
+        oz::sys_cap_delete(f_copy);
+
+        // Valid original frame
+        std::uint32_t f_valid = oz::sys_frame_alloc(oz::CAP_UNTYPED, 1);
+        std::uint32_t pt_valid = oz::sys_pagetable_create(oz::CAP_UNTYPED, f_valid, 1);
+        bool valid_created = (pt_valid != oz::INVALID_CAP_ID);
+
+        // While bound, f_valid cannot be mapped or duplicated
+        int map_bound = oz::sys_pagetable_map_frame(pt_valid, 0, f_valid, 0x01);
+        std::uint32_t mint_bound = oz::sys_cap_mint(f_valid, static_cast<std::uint32_t>(oz::CapRights::ALL));
+        bool bound_exclusive = (map_bound != 0 && mint_bound == oz::INVALID_CAP_ID);
+
+        oz::sys_cap_delete(pt_valid);
+        oz::sys_cap_delete(f_valid);
+
+        TEST_REPORT("KTEST", "Backing frame exclusivity & reparenting elevation prevention",
+                    copy_rejected && reparent_rejected && valid_created && bound_exclusive);
+    }
+
+    // 3. test_shared_pagetable_mapping
+    {
+        std::uint32_t bk_shared = oz::sys_frame_alloc(oz::CAP_UNTYPED, 1);
+        std::uint32_t pt_shared = oz::sys_pagetable_create(oz::CAP_UNTYPED, bk_shared, 1);
+
+        std::uint32_t data_frame = oz::sys_frame_alloc(oz::CAP_UNTYPED, 1);
+        oz::sys_pagetable_map_frame(pt_shared, 0, data_frame, 0x03);
+
+        // Mint read-only copy (drop WRITE right)
+        std::uint32_t pt_ro = oz::sys_cap_mint(pt_shared,
+            static_cast<std::uint32_t>(oz::CapRights::READ | oz::CapRights::GRANT));
+
+        constexpr std::uint64_t VA_RW = 0x380000000000ULL;
+        constexpr std::uint64_t VA_RO = 0x380000200000ULL; // 2MB offset (same Level 2 PD)
+
+        int map_rw = oz::sys_vspace_map_with_pagetables(oz::CAP_SELF_VSPACE, oz::CAP_UNTYPED, pt_shared, VA_RW, 0x01, 4096);
+        int map_ro = oz::sys_vspace_map_with_pagetables(oz::CAP_SELF_VSPACE, oz::CAP_UNTYPED, pt_ro, VA_RO, 0x00, 4096);
+
+        bool map_both_ok = (map_rw == 0 && map_ro == 0);
+
+        // Write via RW alias, read via RO alias
+        *reinterpret_cast<volatile std::uint32_t*>(VA_RW) = 0xBEEFCAFE;
+        std::uint32_t read_back = *reinterpret_cast<volatile std::uint32_t*>(VA_RO);
+        bool shared_data_ok = (read_back == 0xBEEFCAFE);
+
+        // Attempting to map frame through pt_ro must fail due to missing WRITE right
+        std::uint32_t extra_frame = oz::sys_frame_alloc(oz::CAP_UNTYPED, 1);
+        int ro_map_attempt = oz::sys_pagetable_map_frame(pt_ro, 1, extra_frame, 0x01);
+        bool ro_enforced = (ro_map_attempt != 0);
+
+        oz::sys_cap_unmap(pt_shared);
+        oz::sys_cap_unmap(pt_ro);
+
+        oz::sys_cap_delete(pt_shared);
+        oz::sys_cap_delete(pt_ro);
+        oz::sys_cap_delete(data_frame);
+        oz::sys_cap_delete(extra_frame);
+        oz::sys_cap_delete(bk_shared);
+
+        TEST_REPORT("KTEST", "Shared PageTable mapping & cross-hierarchy privilege protection",
+                    map_both_ok && shared_data_ok && ro_enforced);
+    }
+
+    // 4. test_hierarchical_pt_lifecycle_and_unlimited_vspace
+    {
+        // 4.1 Single-slot unmap and remap
+        std::uint32_t f = oz::sys_frame_alloc(oz::CAP_UNTYPED, 1);
+        constexpr std::uint64_t VA1 = 0x390000000000ULL;
+        constexpr std::uint64_t VA2 = 0x390000001000ULL;
+
+        int m1 = oz::sys_vspace_map_with_pagetables(oz::CAP_SELF_VSPACE, oz::CAP_UNTYPED, f, VA1, 0x01, 4096);
+        int u1 = oz::sys_cap_unmap(f);
+        int m2 = oz::sys_vspace_map_with_pagetables(oz::CAP_SELF_VSPACE, oz::CAP_UNTYPED, f, VA2, 0x01, 4096);
+        int u2 = oz::sys_cap_unmap(f);
+        oz::sys_cap_delete(f);
+        bool remap_ok = (m1 == 0 && u1 == 0 && m2 == 0 && u2 == 0);
+
+        // 4.2 Pattern 1: Delete PageTable releases backing frame
+        std::uint32_t bk1 = oz::sys_frame_alloc(oz::CAP_UNTYPED, 1);
+        std::uint32_t pt1 = oz::sys_pagetable_create(oz::CAP_UNTYPED, bk1, 1);
+        oz::sys_cap_delete(pt1); // Disconnects backing frame
+        // Now bk1 can be mapped as normal data frame
+        int m_bk1 = oz::sys_vspace_map_with_pagetables(oz::CAP_SELF_VSPACE, oz::CAP_UNTYPED, bk1, 0x390000002000ULL, 0x01, 4096);
+        *reinterpret_cast<volatile std::uint32_t*>(0x390000002000ULL) = 0x12345678;
+        bool p1_ok = (m_bk1 == 0 && *reinterpret_cast<volatile std::uint32_t*>(0x390000002000ULL) == 0x12345678);
+        oz::sys_cap_unmap(bk1);
+        oz::sys_cap_delete(bk1);
+
+        // 4.3 Pattern 2: Delete backing frame unbinds and unmaps PT
+        std::uint32_t bk2 = oz::sys_frame_alloc(oz::CAP_UNTYPED, 1);
+        std::uint32_t pt2 = oz::sys_pagetable_create(oz::CAP_UNTYPED, bk2, 1);
+        int m_pt2 = oz::sys_vspace_map_with_pagetables(oz::CAP_SELF_VSPACE, oz::CAP_UNTYPED, pt2, 0x390000200000ULL, 0x01, 4096);
+        oz::sys_cap_delete(bk2); // Backing deleted -> PT unbound and unmapped from parent
+        // Subsequent map of pt2 must fail
+        int m_pt2_again = oz::sys_vspace_map_with_pagetables(oz::CAP_SELF_VSPACE, oz::CAP_UNTYPED, pt2, 0x390000400000ULL, 0x01, 4096);
+        bool p2_ok = (m_pt2 == 0 && m_pt2_again != 0);
+        oz::sys_cap_delete(pt2);
+
+        // 4.4 Unlimited VSpace allocation (> 256 instances)
+        bool unlimited_ok = true;
+        for (int i = 0; i < 270; ++i) {
+            std::uint32_t vs = oz::sys_vspace_create(oz::CAP_UNTYPED);
+            if (vs == oz::INVALID_CAP_ID) {
+                unlimited_ok = false;
+                break;
+            }
+            oz::sys_cap_delete(vs);
+        }
+
+        TEST_REPORT("KTEST", "Hierarchical PageTable lifecycle & unlimited VSpace table",
+                    remap_ok && p1_ok && p2_ok && unlimited_ok);
+    }
+
+    // 5. test_integer_truncation_rejection_and_none_rights
+    {
+        // 5.1 Integer truncation test on sys_pagetable_map_frame (Syscall 4)
+        std::uint32_t bk = oz::sys_frame_alloc(oz::CAP_UNTYPED, 1);
+        std::uint32_t pt = oz::sys_pagetable_create(oz::CAP_UNTYPED, bk, 1);
+        std::uint32_t f = oz::sys_frame_alloc(oz::CAP_UNTYPED, 1);
+
+        // index = 65536 (0x10000), 512: must be rejected with -1
+        int res_trunc1 = oz::sys_pagetable_map_frame(pt, 65536, f, 0x01);
+        int res_trunc2 = oz::sys_pagetable_map_frame(pt, 512, f, 0x01);
+        bool trunc_map_frame_rejected = (res_trunc1 == -1 && res_trunc2 == -1);
+
+        // Valid map at 0 works
+        int res_valid = oz::sys_pagetable_map_frame(pt, 0, f, 0x01);
+        bool valid_map_ok = (res_valid == 0);
+
+        // 5.2 Integer truncation test on sys_pagetable_map (Syscall 25)
+        std::uint32_t bk_pd = oz::sys_frame_alloc(oz::CAP_UNTYPED, 1);
+        std::uint32_t pd = oz::sys_pagetable_create(oz::CAP_UNTYPED, bk_pd, 2);
+        int res_trunc_pd = oz::sys_pagetable_map(pd, 65536, pt);
+        int res_trunc_pd512 = oz::sys_pagetable_map(pd, 512, pt);
+        bool trunc_map_pd_rejected = (res_trunc_pd == -1 && res_trunc_pd512 == -1);
+
+        // 5.3 CapRights::NONE mint rights check
+        std::uint32_t f_none = oz::sys_cap_mint(f, static_cast<std::uint32_t>(oz::CapRights::NONE));
+        oz::CapInfo info_none{};
+        int id_res = oz::sys_cap_identify(f_none, &info_none);
+        bool none_rights_ok = (id_res == 0 && info_none.rights == 0);
+
+        // Attempting to map f_none (which lacks READ right) must fail
+        int map_none_attempt = oz::sys_pagetable_map_frame(pt, 1, f_none, 0x01);
+        bool none_rejected = (map_none_attempt != 0);
+
+        oz::sys_cap_unmap(f);
+        oz::sys_cap_delete(f_none);
+        oz::sys_cap_delete(f);
+        oz::sys_cap_delete(pt);
+        oz::sys_cap_delete(bk);
+        oz::sys_cap_delete(pd);
+        oz::sys_cap_delete(bk_pd);
+
+        TEST_REPORT("KTEST", "Truncation guard on 64-bit index & CapRights::NONE enforcement",
+                    trunc_map_frame_rejected && valid_map_ok && trunc_map_pd_rejected && none_rights_ok && none_rejected);
+    }
+}
+
 } // namespace oz::ktest
 
 extern "C" void _start() {
+    oz::g_slot_allocator.reset();
     oz::sys_debug_print("\n\r========================================================\n\r");
     oz::sys_debug_print(" [OZ_OS] Standalone Kernel Test Runner (ktest)\n\r");
     oz::sys_debug_print("========================================================\n\r");
@@ -1227,6 +1875,8 @@ extern "C" void _start() {
     oz::ktest::run_baton_scheduling_tests();
     oz::ktest::run_dual_baton_nonblocking_ipc_tests();
     oz::ktest::run_hierarchical_cartesian_scheduling_tests();
+    oz::ktest::run_capability_lifecycle_new_spec_tests();
+    oz::ktest::run_hierarchical_pagetable_tests();
 
     oz::test::print_summary("KTEST");
     oz::test::exit_qemu();

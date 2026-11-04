@@ -53,14 +53,14 @@ public:
         }
         fb_ = reinterpret_cast<Pixel*>(FB_VADDR);
 
-        // 2. Allocate and map BackBuffer (RAM)
+        // 2. Allocate and map BackBuffer (RAM) via batch frame allocation
         std::uint64_t num_pages = (size + 4095) / 4096;
-        std::uint32_t back_cap = oz::sys_frame_alloc(oz::CAP_UNTYPED, num_pages);
-        if (back_cap == oz::INVALID_CAP_ID) {
-            oz::sys_debug_print("[Display] ERROR: Failed to allocate BackBuffer frame!\n\r");
+        std::uint32_t start_frame = oz::sys_frame_alloc(oz::CAP_UNTYPED, 0, num_pages);
+        if (start_frame == oz::INVALID_CAP_ID) {
+            oz::sys_debug_print("[Display] ERROR: Failed to allocate BackBuffer frames!\n\r");
             return false;
         }
-        res = oz::sys_vspace_map_with_pagetables(oz::CAP_SELF_VSPACE, oz::CAP_UNTYPED, back_cap, BACK_BUF_VADDR, 0x01, size);
+        res = oz::sys_vspace_map_with_pagetables(oz::CAP_SELF_VSPACE, oz::CAP_UNTYPED, start_frame, BACK_BUF_VADDR, 0x01, size);
         if (res != 0) {
             oz::sys_debug_print("[Display] ERROR: Failed to map BackBuffer!\n\r");
             return false;
@@ -643,7 +643,7 @@ OZ_PROCESS_ENTRY() {
             res_req.data[1] = 3; // FRAMEBUFFER
             res_req.data[2] = 0;
             oz::IPCMessage res_resp{};
-            bool res_ok = oz::sys_call(drivman_cap, &res_req, &res_resp);
+            bool res_ok = oz::sys_call_recv_cap(drivman_cap, &res_req, &res_resp);
             oz::sys_debug_print("[Display] GET_DEVICE_RESOURCE call=");
             oz::sys_debug_print(res_ok ? "ok" : "fail");
             oz::sys_debug_print(" status=");
@@ -673,7 +673,7 @@ OZ_PROCESS_ENTRY() {
             const char* dname = "fb";
             for (int i = 0; i < 2; ++i) reinterpret_cast<char*>(&fb_req.data[1])[i] = dname[i];
             oz::IPCMessage fb_resp{};
-            if (oz::sys_call(drivman_cap, &fb_req, &fb_resp) && fb_resp.data[0] == 0 && fb_resp.has_cap) {
+            if (oz::sys_call_recv_cap(drivman_cap, &fb_req, &fb_resp) && fb_resp.data[0] == 0 && fb_resp.has_cap) {
                 width = static_cast<std::uint32_t>(fb_resp.data[1] >> 32);
                 height = static_cast<std::uint32_t>(fb_resp.data[1] & 0xFFFFFFFFULL);
                 size = static_cast<std::size_t>(fb_resp.data[2]);
@@ -784,7 +784,7 @@ OZ_PROCESS_ENTRY() {
                         if (slot >= 0 && w > 0 && h > 0) {
                             std::size_t surf_size = ((w * h * sizeof(Pixel)) + 4095) & ~4095ULL;
                             std::uint64_t num_pages = surf_size / 4096;
-                            std::uint32_t frame_cap = oz::sys_frame_alloc(oz::CAP_UNTYPED, num_pages);
+                            std::uint32_t frame_cap = oz::sys_alloc_shared_pt(oz::CAP_UNTYPED, num_pages, 0x01);
 
                             if (frame_cap != oz::INVALID_CAP_ID) {
                                 std::uint64_t virt = SURFACE_BUF_BASE_VIRT + slot * 0x1000000ULL;
@@ -804,12 +804,18 @@ OZ_PROCESS_ENTRY() {
                                         g_surfaces[slot].buffer[p] = Pixel{0x20, 0x20, 0x20, 0};
                                     }
 
-                                    resp.data[0] = 0; // success
-                                    resp.data[1] = slot + 1; // surface_id
-                                    resp.data[2] = surf_size;
-                                    resp.transferred_cap = frame_cap;
-                                    resp.has_cap = true;
-                                    oz::sys_debug_print("[Display] Created Surface successfully!\n\r");
+                                    // Mint an unmapped copy to transfer to the client (1-slot-1-mapping compliant)
+                                    std::uint32_t client_frame_cap = oz::sys_cap_mint(frame_cap, static_cast<std::uint32_t>(oz::CapRights::ALL));
+                                    if (client_frame_cap != oz::INVALID_CAP_ID) {
+                                        resp.data[0] = 0; // success
+                                        resp.data[1] = slot + 1; // surface_id
+                                        resp.data[2] = surf_size;
+                                        resp.transferred_cap = client_frame_cap;
+                                        resp.has_cap = true;
+                                        oz::sys_debug_print("[Display] Created Surface successfully!\n\r");
+                                    } else {
+                                        resp.data[0] = 3;
+                                    }
                                 } else {
                                     resp.data[0] = 2; // map failed
                                 }
@@ -891,6 +897,10 @@ OZ_PROCESS_ENTRY() {
                         std::uint32_t id = static_cast<std::uint32_t>(req.data[1]);
                         if (id > 0 && id <= MAX_SURFACES) {
                             std::size_t idx = id - 1;
+                            if (g_surfaces[idx].frame_cap != 0) {
+                                oz::sys_cap_delete(g_surfaces[idx].frame_cap);
+                                g_surfaces[idx].frame_cap = 0;
+                            }
                             g_surfaces[idx].id = 0;
                             g_surfaces[idx].visible = false;
                             g_surfaces[idx].buffer = nullptr;

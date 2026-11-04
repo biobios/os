@@ -21,6 +21,33 @@ inline void user_thread_entry(void* arg) {
     enter_user_mode(t->user_rip, t->user_rsp, 0x202);
 }
 
+inline bool configure_execution_context(ExecutionContext* ctx, CSpace* cspace, VSpace* vspace, std::uint64_t rip, std::uint64_t user_rsp) {
+    if (!ctx) return false;
+    if (!vspace || !vspace->is_bound() || vspace->level() != 4) {
+        return false;
+    }
+    ctx->cspace = cspace;
+    ctx->pml4_phys = vspace->getPhysicalPML4();
+    ctx->user_rip = rip;
+    ctx->user_rsp = user_rsp;
+    ctx->state = ThreadState::Blocked;
+
+    std::uint64_t rsp = reinterpret_cast<std::uint64_t>(ctx->stack_base) + ctx->stack_size;
+    rsp &= ~15ULL;
+    rsp -= sizeof(ThreadContext);
+    ctx->rsp = reinterpret_cast<void*>(rsp);
+
+    ThreadContext* tctx = reinterpret_cast<ThreadContext*>(rsp);
+    tctx->rip = reinterpret_cast<std::uint64_t>(&thread_stub);
+    tctx->r12 = reinterpret_cast<std::uint64_t>(&user_thread_entry);
+    tctx->rbx = reinterpret_cast<std::uint64_t>(ctx);
+    tctx->r13 = 0;
+    tctx->r14 = 0;
+    tctx->r15 = 0;
+    tctx->rbp = 0;
+    return true;
+}
+
 class TCB : public KernelObject, public PhysicalAddressProvider {
 private:
     Thread* thread_;
@@ -45,10 +72,22 @@ public:
 
     ~TCB() override {
         if (thread_) {
-            thread_->state = ThreadState::Dead;
-        }
-        if (owned_ && thread_ && !is_untyped_backed_) {
-            delete thread_;
+            Thread* t = thread_;
+            if (owned_) {
+                if (!is_untyped_backed_) {
+                    delete t;
+                    thread_ = nullptr;
+                    return;
+                } else {
+                    t->~Thread();
+                }
+            } else {
+                t->cancel_ipc();
+                unregister_thread(t);
+            }
+            t->is_dead = true;
+            t->state = ThreadState::Dead;
+            thread_ = nullptr;
         }
     }
 
@@ -139,32 +178,7 @@ public:
 
     // Configure: associate VSpace, CSpace, and execution context
     bool configure(CSpace* cspace, VSpace* vspace, std::uint64_t rip, std::uint64_t user_rsp) {
-        if (!thread_) return false;
-        thread_->cspace = cspace;
-        if (vspace && vspace->getPhysicalPML4() != 0) {
-            thread_->pml4_phys = createPhysicalAddress<PageTable>(vspace->getPhysicalPML4());
-        }
-        thread_->user_rip = rip;
-        thread_->user_rsp = user_rsp;
-        thread_->state = ThreadState::Blocked;
-
-        // Set up stack for switch_context
-        std::uint64_t rsp = reinterpret_cast<std::uint64_t>(thread_->stack_base) + thread_->stack_size;
-        rsp &= ~15ULL; // 16-byte align
-
-        rsp -= sizeof(ThreadContext);
-        thread_->rsp = reinterpret_cast<void*>(rsp);
-
-        ThreadContext* ctx = reinterpret_cast<ThreadContext*>(rsp);
-        ctx->rip = reinterpret_cast<std::uint64_t>(&thread_stub);
-        ctx->r12 = reinterpret_cast<std::uint64_t>(&user_thread_entry);
-        ctx->rbx = reinterpret_cast<std::uint64_t>(thread_);
-        ctx->r13 = 0;
-        ctx->r14 = 0;
-        ctx->r15 = 0;
-        ctx->rbp = 0;
-
-        return true;
+        return configure_execution_context(thread_, cspace, vspace, rip, user_rsp);
     }
 
     bool configure(void* process_ptr) {

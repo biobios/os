@@ -45,6 +45,14 @@ static void to_hex_str(std::uint64_t val, char* out) {
     out[16] = '\0';
 }
 
+static void free_staging_frames(std::uint32_t start_cap, std::size_t pages) {
+    if (start_cap == oz::INVALID_CAP_ID || start_cap == 0) return;
+    for (std::size_t p = 0; p < pages; ++p) {
+        oz::sys_cap_unmap(start_cap + static_cast<std::uint32_t>(p));
+        oz::sys_cap_delete(start_cap + static_cast<std::uint32_t>(p));
+    }
+}
+
 // ===== Helper: Memory Manager Client =====
 static std::uint32_t memman_alloc_untyped(std::size_t size) {
     oz::IPCMessage req{};
@@ -52,7 +60,7 @@ static std::uint32_t memman_alloc_untyped(std::size_t size) {
     req.data[1] = size;
 
     oz::IPCMessage resp{};
-    if (!oz::sys_call(CAP_MEMMAN_SEND, &req, &resp)) return oz::INVALID_CAP_ID;
+    if (!oz::sys_call_recv_cap(CAP_MEMMAN_SEND, &req, &resp)) return oz::INVALID_CAP_ID;
 
     if (resp.data[0] == 0 && resp.has_cap) {
         return resp.transferred_cap;
@@ -259,7 +267,7 @@ static void check_dag_spawn() {
             }
 
             if (oz::sys_vspace_map_with_pagetables(oz::CAP_SELF_VSPACE, g_procman_work_untyped, buf_frame, STAGING_ADDR, 0x01, pages * 4096) != 0) {
-                oz::sys_cap_delete(buf_frame);
+                free_staging_frames(buf_frame, pages);
                 vfs_close(fd);
                 break;
             }
@@ -272,10 +280,7 @@ static void check_dag_spawn() {
             bool has_manifest = oz::loader::get_elf_manifest(reinterpret_cast<const std::uint8_t*>(staging), sz, manifest);
 
             if (has_manifest && (manifest.required & ~g_active_services) != 0) {
-                for (std::size_t p = 0; p < pages; ++p) {
-                    oz::sys_vspace_unmap(oz::CAP_SELF_VSPACE, STAGING_ADDR + p * 4096);
-                }
-                oz::sys_cap_delete(buf_frame);
+                free_staging_frames(buf_frame, pages);
                 continue;
             }
 
@@ -290,19 +295,18 @@ static void check_dag_spawn() {
             std::uint32_t child_untyped = memman_alloc_untyped(child_ut_size);
 
             oz::ProcessStartupInfo startup_info{};
-            std::uint32_t next_slot = 10;
 
             if (has_manifest && manifest.requires_service(oz::ServiceId::CONSOLE)) {
-                startup_info.add_cap(next_slot++, oz::CapRole::STDOUT, "stdout", oz::CapType::STREAM);
+                startup_info.alloc_and_add_cap(oz::CapRole::STDOUT, "stdout", oz::CapType::STREAM);
             }
             if (has_manifest && manifest.requires_service(oz::ServiceId::DISPLAY)) {
-                startup_info.add_cap(next_slot++, oz::CapRole::DISPLAY, "display", oz::CapType::STREAM);
+                startup_info.alloc_and_add_cap(oz::CapRole::DISPLAY, "display", oz::CapType::STREAM);
             }
             if (has_manifest && manifest.requires_service(oz::ServiceId::WM)) {
-                startup_info.add_cap(next_slot++, oz::CapRole::WM, "wm", oz::CapType::STREAM);
+                startup_info.alloc_and_add_cap(oz::CapRole::WM, "wm", oz::CapType::STREAM);
             }
             if (has_manifest && manifest.requires_service(oz::ServiceId::VFS_ROOT)) {
-                startup_info.add_cap(next_slot++, oz::CapRole::ROOT_DIR, "/", oz::CapType::DIR);
+                startup_info.alloc_and_add_cap(oz::CapRole::ROOT_DIR, "/", oz::CapType::DIR);
             }
 
             auto proc = oz::loader::spawn_process(
@@ -311,10 +315,7 @@ static void check_dag_spawn() {
                 0x550000000000ULL, &startup_info, false
             );
 
-            for (std::size_t p = 0; p < pages; ++p) {
-                oz::sys_vspace_unmap(oz::CAP_SELF_VSPACE, STAGING_ADDR + p * 4096);
-            }
-            oz::sys_cap_delete(buf_frame);
+            free_staging_frames(buf_frame, pages);
 
             if (!proc.success) {
                 oz::sys_write("[ProcMan] ERROR: Failed to spawn component!\n\r");
@@ -339,7 +340,7 @@ static void check_dag_spawn() {
                 oz::sys_cspace_cap_insert(proc.cspace_cap, 1, g_cons_send, static_cast<std::uint32_t>(oz::CapRights::WRITE | oz::CapRights::GRANT));
                 oz::sys_cspace_cap_insert(proc.cspace_cap, 2, g_disp_cmd_send, static_cast<std::uint32_t>(oz::CapRights::WRITE | oz::CapRights::GRANT));
                 oz::sys_cspace_cap_insert(proc.cspace_cap, startup_info.find_slot(oz::CapRole::DISPLAY), g_disp_cmd_send, static_cast<std::uint32_t>(oz::CapRights::WRITE | oz::CapRights::GRANT));
-                oz::sys_cspace_cap_insert(proc.cspace_cap, 4, g_wm_req_recv, static_cast<std::uint32_t>(oz::CapRights::READ));
+                oz::sys_cspace_cap_insert(proc.cspace_cap, 4, g_wm_req_recv, static_cast<std::uint32_t>(oz::CapRights::READ | oz::CapRights::GRANT_REPLY));
                 oz::sys_cspace_cap_insert(proc.cspace_cap, 5, g_kbd_ring_frame, static_cast<std::uint32_t>(oz::CapRights::ALL));
                 oz::sys_cspace_cap_insert(proc.cspace_cap, 6, g_notif_wm_kbd, static_cast<std::uint32_t>(oz::CapRights::ALL));
                 g_active_services |= static_cast<std::uint32_t>(oz::ServiceId::WM);
@@ -368,20 +369,25 @@ static void check_dag_spawn() {
                 std::size_t ut_size = streq(name, "wm") ? (8 * 1024 * 1024) : (4 * 1024 * 1024);
                 std::uint32_t app_untyped = memman_alloc_untyped(ut_size);
                 if (app_untyped != oz::INVALID_CAP_ID) {
-                    oz::sys_cspace_cap_insert(proc.cspace_cap, oz::CAP_UNTYPED, app_untyped, static_cast<std::uint32_t>(oz::CapRights::ALL));
+                    oz::sys_cspace_cap_move(proc.cspace_cap, oz::CAP_UNTYPED, app_untyped);
                 }
             }
 
-            oz::IPCMessage reg_msg{};
-            reg_msg.data[0] = static_cast<uint64_t>(oz::ipc::SchedCmd::REGISTER_THREAD);
-            reg_msg.data[1] = 1;
-            reg_msg.data[2] = 10000;
-            constexpr std::uint32_t TCB_COPY_SLOT = 160;
-            oz::sys_cap_copy(TCB_COPY_SLOT, proc.tcb_cap, static_cast<std::uint32_t>(oz::CapRights::ALL));
-            reg_msg.has_cap = true;
-            reg_msg.transferred_cap = TCB_COPY_SLOT;
-            oz::IPCMessage reg_resp{};
-            oz::sys_call(g_sched_cap, &reg_msg, &reg_resp);
+            std::uint32_t tcb_copy_slot = oz::g_slot_allocator.allocate_one();
+            if (tcb_copy_slot != oz::INVALID_CAP_ID) {
+                if (oz::sys_cap_copy(tcb_copy_slot, proc.tcb_cap, static_cast<std::uint32_t>(oz::CapRights::ALL)) == 0) {
+                    oz::IPCMessage reg_msg{};
+                    reg_msg.data[0] = static_cast<uint64_t>(oz::ipc::SchedCmd::REGISTER_THREAD);
+                    reg_msg.data[1] = 1;
+                    reg_msg.data[2] = 10000;
+                    reg_msg.has_cap = true;
+                    reg_msg.transferred_cap = tcb_copy_slot;
+                    oz::IPCMessage reg_resp{};
+                    oz::sys_call(g_sched_cap, &reg_msg, &reg_resp);
+                }
+                oz::sys_cap_delete(tcb_copy_slot);
+                oz::g_slot_allocator.free(tcb_copy_slot);
+            }
 
             oz::sys_tcb_resume(proc.tcb_cap);
             oz::sys_write("[ProcMan] Process resumed and registered with Sched: ");
@@ -422,7 +428,7 @@ static int handle_spawn_driver(const char* raw_path, std::uint32_t dev_id, std::
     }
 
     if (oz::sys_vspace_map_with_pagetables(oz::CAP_SELF_VSPACE, g_procman_work_untyped, buf_frame, STAGING_ADDR, 0x01, pages * 4096) != 0) {
-        oz::sys_cap_delete(buf_frame);
+        free_staging_frames(buf_frame, pages);
         vfs_close(fd);
         return 2;
     }
@@ -432,8 +438,7 @@ static int handle_spawn_driver(const char* raw_path, std::uint32_t dev_id, std::
     vfs_close(fd);
 
     if (read_bytes < sz) {
-        for (std::size_t p = 0; p < pages; ++p) oz::sys_vspace_unmap(oz::CAP_SELF_VSPACE, STAGING_ADDR + p * 4096);
-        oz::sys_cap_delete(buf_frame);
+        free_staging_frames(buf_frame, pages);
         return 1;
     }
 
@@ -444,28 +449,25 @@ static int handle_spawn_driver(const char* raw_path, std::uint32_t dev_id, std::
     while (child_ut_size < sz + 512 * 1024) child_ut_size <<= 1;
     std::uint32_t child_untyped = memman_alloc_untyped(child_ut_size);
     if (child_untyped == oz::INVALID_CAP_ID) {
-        for (std::size_t p = 0; p < pages; ++p) oz::sys_vspace_unmap(oz::CAP_SELF_VSPACE, STAGING_ADDR + p * 4096);
-        oz::sys_cap_delete(buf_frame);
+        free_staging_frames(buf_frame, pages);
         return 2;
     }
 
     oz::ProcessStartupInfo startup_info{};
-    std::uint32_t next_slot = 10;
 
-    std::uint32_t dm_slot = next_slot++;
-    startup_info.add_cap(dm_slot, oz::CapRole::DRIVMAN, "drivman", oz::CapType::STREAM);
+    std::uint32_t dm_slot = startup_info.alloc_and_add_cap(oz::CapRole::DRIVMAN, "drivman", oz::CapType::STREAM);
 
     if (has_manifest && manifest.requires_service(oz::ServiceId::CONSOLE)) {
-        startup_info.add_cap(next_slot++, oz::CapRole::STDOUT, "stdout", oz::CapType::STREAM);
+        startup_info.alloc_and_add_cap(oz::CapRole::STDOUT, "stdout", oz::CapType::STREAM);
     }
     if (has_manifest && manifest.requires_service(oz::ServiceId::DISPLAY)) {
-        startup_info.add_cap(next_slot++, oz::CapRole::DISPLAY, "display", oz::CapType::STREAM);
+        startup_info.alloc_and_add_cap(oz::CapRole::DISPLAY, "display", oz::CapType::STREAM);
     }
     if (has_manifest && manifest.requires_service(oz::ServiceId::WM)) {
-        startup_info.add_cap(next_slot++, oz::CapRole::WM, "wm", oz::CapType::STREAM);
+        startup_info.alloc_and_add_cap(oz::CapRole::WM, "wm", oz::CapType::STREAM);
     }
     if (has_manifest && manifest.requires_service(oz::ServiceId::VFS_ROOT)) {
-        startup_info.add_cap(next_slot++, oz::CapRole::ROOT_DIR, "/", oz::CapType::DIR);
+        startup_info.alloc_and_add_cap(oz::CapRole::ROOT_DIR, "/", oz::CapType::DIR);
     }
 
     auto proc = oz::loader::spawn_process(
@@ -474,8 +476,7 @@ static int handle_spawn_driver(const char* raw_path, std::uint32_t dev_id, std::
         0x550000000000ULL, &startup_info, false
     );
 
-    for (std::size_t p = 0; p < pages; ++p) oz::sys_vspace_unmap(oz::CAP_SELF_VSPACE, STAGING_ADDR + p * 4096);
-    oz::sys_cap_delete(buf_frame);
+    free_staging_frames(buf_frame, pages);
 
     if (!proc.success) {
         memman_revoke_untyped(child_untyped);
@@ -512,8 +513,8 @@ static int handle_spawn_driver(const char* raw_path, std::uint32_t dev_id, std::
         oz::sys_channel_create(g_procman_work_untyped, &g_disp_cmd_send, &g_disp_cmd_recv);
         oz::sys_channel_create(g_procman_work_untyped, &g_disp_txt_send, &g_disp_txt_recv);
         oz::sys_cspace_cap_insert(proc.cspace_cap, 1, CAP_CONSOLE_WRITE, static_cast<std::uint32_t>(oz::CapRights::WRITE | oz::CapRights::GRANT));
-        oz::sys_cspace_cap_insert(proc.cspace_cap, 2, g_disp_txt_recv, static_cast<std::uint32_t>(oz::CapRights::READ));
-        oz::sys_cspace_cap_insert(proc.cspace_cap, 3, g_disp_cmd_recv, static_cast<std::uint32_t>(oz::CapRights::READ));
+        oz::sys_cspace_cap_insert(proc.cspace_cap, 2, g_disp_txt_recv, static_cast<std::uint32_t>(oz::CapRights::READ | oz::CapRights::GRANT_REPLY));
+        oz::sys_cspace_cap_insert(proc.cspace_cap, 3, g_disp_cmd_recv, static_cast<std::uint32_t>(oz::CapRights::READ | oz::CapRights::GRANT_REPLY));
         g_active_services |= static_cast<std::uint32_t>(oz::ServiceId::DISPLAY);
     } else if (has_manifest && manifest.provides_service(oz::ServiceId::BLOCK_DEV)) {
         if (g_cons_send != 0) oz::sys_cspace_cap_insert(proc.cspace_cap, 1, g_cons_send, static_cast<std::uint32_t>(oz::CapRights::WRITE | oz::CapRights::GRANT));
@@ -539,7 +540,7 @@ static int handle_spawn_driver(const char* raw_path, std::uint32_t dev_id, std::
         std::size_t ut_size = streq(path, "display") ? (16 * 1024 * 1024) : (4 * 1024 * 1024);
         app_untyped = memman_alloc_untyped(ut_size);
         if (app_untyped != oz::INVALID_CAP_ID) {
-            oz::sys_cspace_cap_insert(proc.cspace_cap, oz::CAP_UNTYPED, app_untyped, static_cast<std::uint32_t>(oz::CapRights::ALL));
+            oz::sys_cspace_cap_move(proc.cspace_cap, oz::CAP_UNTYPED, app_untyped);
         }
     }
 
@@ -551,16 +552,21 @@ static int handle_spawn_driver(const char* raw_path, std::uint32_t dev_id, std::
 
     // Register with Sched
     if (g_sched_cap != 0) {
-        oz::IPCMessage reg_msg{};
-        reg_msg.data[0] = static_cast<uint64_t>(oz::ipc::SchedCmd::REGISTER_THREAD);
-        reg_msg.data[1] = 1;
-        reg_msg.data[2] = 10000;
-        constexpr std::uint32_t TCB_COPY_SLOT = 160;
-        oz::sys_cap_copy(TCB_COPY_SLOT, proc.tcb_cap, static_cast<std::uint32_t>(oz::CapRights::ALL));
-        reg_msg.has_cap = true;
-        reg_msg.transferred_cap = TCB_COPY_SLOT;
-        oz::IPCMessage reg_resp{};
-        oz::sys_call(g_sched_cap, &reg_msg, &reg_resp);
+        std::uint32_t tcb_copy_slot = oz::g_slot_allocator.allocate_one();
+        if (tcb_copy_slot != oz::INVALID_CAP_ID) {
+            if (oz::sys_cap_copy(tcb_copy_slot, proc.tcb_cap, static_cast<std::uint32_t>(oz::CapRights::ALL)) == 0) {
+                oz::IPCMessage reg_msg{};
+                reg_msg.data[0] = static_cast<uint64_t>(oz::ipc::SchedCmd::REGISTER_THREAD);
+                reg_msg.data[1] = 1;
+                reg_msg.data[2] = 10000;
+                reg_msg.has_cap = true;
+                reg_msg.transferred_cap = tcb_copy_slot;
+                oz::IPCMessage reg_resp{};
+                oz::sys_call(g_sched_cap, &reg_msg, &reg_resp);
+            }
+            oz::sys_cap_delete(tcb_copy_slot);
+            oz::g_slot_allocator.free(tcb_copy_slot);
+        }
     }
 
     oz::sys_tcb_resume(proc.tcb_cap);
@@ -665,11 +671,22 @@ OZ_PROCESS_ENTRY() {
     oz::ReplyToken token = oz::INVALID_REPLY_TOKEN;
     oz::IPCMessage resp{};
     oz::IPCMessage req{};
+    std::uint32_t recv_slot = oz::g_slot_allocator.allocate_one();
+    std::uint32_t pending_resp_cap = oz::INVALID_CAP_ID;
 
     while (true) {
-        token = oz::sys_reply_recv(token, CAP_PROCMAN_RECV, (token != oz::INVALID_REPLY_TOKEN) ? &resp : nullptr, &req);
+        token = oz::sys_reply_recv(token, CAP_PROCMAN_RECV, (token != oz::INVALID_REPLY_TOKEN) ? &resp : nullptr, &req, recv_slot);
+        if (pending_resp_cap != oz::INVALID_CAP_ID) {
+            oz::sys_cap_delete(pending_resp_cap);
+            oz::g_slot_allocator.free(pending_resp_cap);
+            pending_resp_cap = oz::INVALID_CAP_ID;
+        }
         if (token == oz::INVALID_REPLY_TOKEN) {
             continue;
+        }
+
+        if (req.has_cap) {
+            recv_slot = oz::g_slot_allocator.allocate_one();
         }
 
         auto cmd = static_cast<oz::ipc::ProcCmd>(req.data[0]);
@@ -775,7 +792,7 @@ OZ_PROCESS_ENTRY() {
             int map_res = oz::sys_vspace_map_with_pagetables(oz::CAP_SELF_VSPACE, g_procman_work_untyped, buf_frame, STAGING_ADDR, 0x01, pages * 4096);
             if (map_res != 0) {
                 oz::sys_write("[ProcMan] ERROR: sys_vspace_map_with_pagetables failed for staging buffer!\n\r");
-                oz::sys_cap_delete(buf_frame);
+                free_staging_frames(buf_frame, pages);
                 vfs_close(fd);
                 memman_revoke_untyped(child_untyped);
                 resp.data[0] = 5;
@@ -788,10 +805,7 @@ OZ_PROCESS_ENTRY() {
 
             if (read_bytes < sz) {
                 oz::sys_write("[ProcMan] ERROR: Failed to read complete ELF\n\r");
-                for (std::size_t p = 0; p < pages; ++p) {
-                    oz::sys_vspace_unmap(oz::CAP_SELF_VSPACE, STAGING_ADDR + p * 4096);
-                }
-                oz::sys_cap_delete(buf_frame);
+                free_staging_frames(buf_frame, pages);
                 memman_revoke_untyped(child_untyped);
                 resp.data[0] = 6;
                 continue;
@@ -858,10 +872,7 @@ OZ_PROCESS_ENTRY() {
             );
 
             // Clean staging
-            for (std::size_t p = 0; p < pages; ++p) {
-                oz::sys_vspace_unmap(oz::CAP_SELF_VSPACE, STAGING_ADDR + p * 4096);
-            }
-            oz::sys_cap_delete(buf_frame);
+            free_staging_frames(buf_frame, pages);
 
             if (!proc.success) {
                 oz::sys_write("[ProcMan] ERROR: loader::spawn_process failed!\n\r");
@@ -896,8 +907,7 @@ OZ_PROCESS_ENTRY() {
             if (has_manifest && manifest.needs_untyped) {
                 std::uint32_t app_untyped = memman_alloc_untyped(2 * 1024 * 1024);
                 if (app_untyped != oz::INVALID_CAP_ID) {
-                    oz::sys_cspace_cap_insert(proc.cspace_cap, oz::CAP_UNTYPED, app_untyped,
-                        static_cast<std::uint32_t>(oz::CapRights::ALL));
+                    oz::sys_cspace_cap_move(proc.cspace_cap, oz::CAP_UNTYPED, app_untyped);
                 }
             }
 
@@ -935,16 +945,21 @@ OZ_PROCESS_ENTRY() {
             // 9. Register with Sched daemon if present
             std::uint32_t sched_cap = oz::LocalNamespace::get_cap("sched", CAP_SCHED_SEND);
             if (sched_cap != 0) {
-                oz::IPCMessage reg_msg{};
-                reg_msg.data[0] = static_cast<uint64_t>(oz::ipc::SchedCmd::REGISTER_THREAD);
-                reg_msg.data[1] = 1;
-                reg_msg.data[2] = 10000;
-                constexpr std::uint32_t S_TCB_SLOT = 160;
-                oz::sys_cap_copy(S_TCB_SLOT, proc.tcb_cap, static_cast<std::uint32_t>(oz::CapRights::ALL));
-                reg_msg.has_cap = true;
-                reg_msg.transferred_cap = S_TCB_SLOT;
-                oz::IPCMessage reg_resp{};
-                oz::sys_call(sched_cap, &reg_msg, &reg_resp);
+                std::uint32_t s_tcb_slot = oz::g_slot_allocator.allocate_one();
+                if (s_tcb_slot != oz::INVALID_CAP_ID) {
+                    if (oz::sys_cap_copy(s_tcb_slot, proc.tcb_cap, static_cast<std::uint32_t>(oz::CapRights::ALL)) == 0) {
+                        oz::IPCMessage reg_msg{};
+                        reg_msg.data[0] = static_cast<uint64_t>(oz::ipc::SchedCmd::REGISTER_THREAD);
+                        reg_msg.data[1] = 1;
+                        reg_msg.data[2] = 10000;
+                        reg_msg.has_cap = true;
+                        reg_msg.transferred_cap = s_tcb_slot;
+                        oz::IPCMessage reg_resp{};
+                        oz::sys_call(sched_cap, &reg_msg, &reg_resp);
+                    }
+                    oz::sys_cap_delete(s_tcb_slot);
+                    oz::g_slot_allocator.free(s_tcb_slot);
+                }
             }
 
             // 10. Resume process
@@ -956,13 +971,23 @@ OZ_PROCESS_ENTRY() {
             g_session.reset();
 
             // Copy TCB cap to a temporary slot to transfer it to caller (e.g. Init)
-            constexpr std::uint32_t PROCMAN_COPY_TCB_SLOT = 150;
-            oz::sys_cap_copy(PROCMAN_COPY_TCB_SLOT, proc.tcb_cap, static_cast<std::uint32_t>(oz::CapRights::ALL));
-
-            resp.data[0] = 0; // Success
-            resp.data[1] = pid;
-            resp.has_cap = true;
-            resp.transferred_cap = PROCMAN_COPY_TCB_SLOT;
+            std::uint32_t copy_tcb = oz::g_slot_allocator.allocate_one();
+            if (copy_tcb != oz::INVALID_CAP_ID &&
+                oz::sys_cap_copy(copy_tcb, proc.tcb_cap, static_cast<std::uint32_t>(oz::CapRights::ALL)) == 0) {
+                resp.data[0] = 0; // Success
+                resp.data[1] = pid;
+                resp.has_cap = true;
+                resp.transferred_cap = copy_tcb;
+                pending_resp_cap = copy_tcb;
+            } else {
+                if (copy_tcb != oz::INVALID_CAP_ID) {
+                    oz::sys_cap_delete(copy_tcb);
+                    oz::g_slot_allocator.free(copy_tcb);
+                }
+                resp.data[0] = 0;
+                resp.data[1] = pid;
+                resp.has_cap = false;
+            }
 
         } else if (cmd == oz::ipc::ProcCmd::WAIT) {
             std::uint32_t pid = static_cast<std::uint32_t>(req.data[1]);
@@ -1016,6 +1041,7 @@ OZ_PROCESS_ENTRY() {
                 resp.data[1] = pipe_w;
                 resp.has_cap = true;
                 resp.transferred_cap = pipe_r;
+                pending_resp_cap = pipe_r;
             } else {
                 resp.data[0] = 1; // Failed
                 resp.has_cap = false;
@@ -1035,10 +1061,19 @@ OZ_PROCESS_ENTRY() {
             resp.data[0] = static_cast<std::uint64_t>(status);
             if (status == 0) {
                 resp.data[1] = out_pid;
-                resp.has_cap = true;
-                constexpr std::uint32_t EXIT_NOTIF_COPY = 155;
-                oz::sys_cap_copy(EXIT_NOTIF_COPY, out_exit_notif, static_cast<std::uint32_t>(oz::CapRights::ALL));
-                resp.transferred_cap = EXIT_NOTIF_COPY;
+                std::uint32_t exit_notif_copy = oz::g_slot_allocator.allocate_one();
+                if (exit_notif_copy != oz::INVALID_CAP_ID &&
+                    oz::sys_cap_copy(exit_notif_copy, out_exit_notif, static_cast<std::uint32_t>(oz::CapRights::ALL)) == 0) {
+                    resp.has_cap = true;
+                    resp.transferred_cap = exit_notif_copy;
+                    pending_resp_cap = exit_notif_copy;
+                } else {
+                    if (exit_notif_copy != oz::INVALID_CAP_ID) {
+                        oz::sys_cap_delete(exit_notif_copy);
+                        oz::g_slot_allocator.free(exit_notif_copy);
+                    }
+                    resp.has_cap = false;
+                }
             } else {
                 resp.has_cap = false;
             }

@@ -21,10 +21,9 @@ struct IPCMessage {
 };
 
 // Internal message transferred between endpoints (kernel-side only)
-// Carries the actual Capability object when a cap is being transferred
+// Uses lazy capability transfer: slot index is preserved and moved on rendezvous
 struct InternalIPCMessage {
     IPCMessage user_msg{};
-    Capability attached_cap{}; // Valid only when user_msg.has_cap is true
 };
 
 // Forward declaration
@@ -56,10 +55,16 @@ private:
     Notification* bound_notification_{nullptr};
     std::uint64_t bound_badge_{0};
 
+    // Global registry intrusive list
+    ChannelEndpoint* reg_prev_{nullptr};
+    ChannelEndpoint* reg_next_{nullptr};
+
 public:
-    explicit ChannelEndpoint(bool untyped = false) : KernelObject(ObjectType::ChannelEndpoint, untyped) {}
+    explicit ChannelEndpoint(bool untyped = false);
     
     ~ChannelEndpoint() override;
+
+    friend void unbind_notification_from_all_channels(Notification* notif);
 
     void set_peer(ChannelEndpoint* p) {
         peer = p;
@@ -81,12 +86,14 @@ public:
     // Recv waiter management
     void add_recv_waiter(Thread* thread);
     Thread* pop_recv_waiter();
+    Thread* peek_recv_waiter() const { return recv_waiter_head; }
     bool remove_recv_waiter(Thread* thread);
     bool has_recv_waiters() const { return recv_waiter_head != nullptr; }
 
     // Send waiter management
     void add_send_waiter(Thread* thread);
     Thread* pop_send_waiter();
+    Thread* peek_send_waiter() const { return send_waiter_head; }
     bool remove_send_waiter(Thread* thread);
     bool has_send_waiters() const { return send_waiter_head != nullptr; }
 
@@ -131,6 +138,8 @@ public:
     Notification* get_bound_notification() const { return bound_notification_; }
     std::uint64_t get_bound_badge() const { return bound_badge_; }
 };
+
+void unbind_notification_from_all_channels(Notification* notif);
 
 } // namespace oz
 

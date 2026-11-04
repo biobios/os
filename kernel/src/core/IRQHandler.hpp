@@ -14,32 +14,33 @@ namespace oz {
 // Associates an IRQ vector with a Notification or channel endpoint.
 // When the interrupt fires, the kernel signals the Notification (pure notification,
 // no CPU time theft) and temporarily masks the IRQ line until acknowledged.
-class IRQHandler : public KernelObject {
+class IRQHandler {
 public:
     std::uint8_t vector{0};
     Thread* handler_thread{nullptr};             // Bound IRQ handler thread for Baton Model
     Baton* assigned_irq_baton{nullptr};          // irq_baton to lend on next interrupt
     bool is_masked{false};                       // Hardware line mask state
     bool pending{false};                         // Pending IRQ arrived while masked
-
-private:
     ChannelEndpoint* notification_ep_{nullptr};  // Endpoint to send notification to (legacy)
     Notification* notif_{nullptr};               // Bound Notification object
     std::uint64_t badge_{0};                     // Badge to signal on interrupt
+
+private:
     bool acknowledged_{true};                    // Whether the last interrupt was acknowledged
     bool is_registered_{false};
 
     // Function pointers for interrupt management (set by Kernel.hpp)
-    void (*register_fn_)(std::uint8_t vector, IRQHandler* handler);
-    void (*unregister_fn_)(std::uint8_t vector, IRQHandler* handler);
+    void (*register_fn_)(std::uint8_t vector, IRQHandler* handler){nullptr};
+    void (*unregister_fn_)(std::uint8_t vector, IRQHandler* handler){nullptr};
 
 public:
+    IRQHandler() = default;
+
     IRQHandler(std::uint8_t vec,
                void (*register_fn)(std::uint8_t, IRQHandler*) = nullptr,
                void (*unregister_fn)(std::uint8_t, IRQHandler*) = nullptr,
                void (*eoi_fn)() = nullptr)
-        : KernelObject(ObjectType::IRQHandler),
-          vector(vec),
+        : vector(vec),
           handler_thread(nullptr), assigned_irq_baton(nullptr),
           is_masked(false), pending(false),
           notification_ep_(nullptr),
@@ -49,7 +50,7 @@ public:
         (void)eoi_fn;
     }
 
-    ~IRQHandler() override {
+    ~IRQHandler() {
         unregisterHandler();
         if (handler_thread && handler_thread->bound_irq_handler == this) {
             handler_thread->bound_irq_handler = nullptr;
@@ -155,6 +156,23 @@ public:
         is_registered_ = false;
         return true;
     }
+
+    void unregisterAndReset() {
+        unregisterHandler();
+        if (handler_thread && handler_thread->bound_irq_handler == this) {
+            handler_thread->bound_irq_handler = nullptr;
+        }
+        handler_thread = nullptr;
+        assigned_irq_baton = nullptr;
+        notif_ = nullptr;
+        notification_ep_ = nullptr;
+        badge_ = 0;
+        acknowledged_ = true;
+        is_masked = false;
+        pending = false;
+    }
 };
+
+extern IRQHandler g_irq_handlers[256];
 
 } // namespace oz

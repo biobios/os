@@ -16,7 +16,7 @@ namespace {
     BlockHeader* block_list_head = nullptr;
     BlockHeader* block_list_tail = nullptr;
 
-    std::uint64_t heap_virt = 0x100000000000; // Virtual address bump pointer for heap
+    std::uint64_t heap_virt = 0x008000000000ULL; // Virtual address bump pointer for heap (PML4[1])
     
     static constexpr std::uint32_t CAP_SELF_VSPACE = 0;
     static constexpr std::uint32_t CAP_UNTYPED = 240;
@@ -70,13 +70,15 @@ void* malloc(std::size_t size) {
     if (pages < 16) pages = 16; // alloc chunks of 16 pages (64KB)
     std::uint64_t alloc_bytes = pages * 4096;
 
-    // Allocate Frame from UntypedMemory capability
-    std::uint32_t frame_cap = oz::sys_frame_alloc(CAP_UNTYPED, pages);
-    if (frame_cap == 0xFFFFFFFF) return nullptr;
+    // Allocate Frame batch from UntypedMemory capability
+    std::uint32_t start_slot = oz::sys_frame_alloc(CAP_UNTYPED, 0, pages);
+    if (start_slot == 0xFFFFFFFF) return nullptr;
 
-    // Map Frame into our VSpace
-    if (oz::sys_vspace_map_with_pagetables(CAP_SELF_VSPACE, CAP_UNTYPED, frame_cap, heap_virt, 0x01, alloc_bytes) != 0) {
-        return nullptr; // 0x01 = writable
+    // Map each 4KB Frame into our VSpace
+    for (std::uint64_t i = 0; i < pages; ++i) {
+        if (oz::sys_vspace_map_with_pagetables(CAP_SELF_VSPACE, CAP_UNTYPED, start_slot + i, heap_virt + i * 4096, 0x01, 4096) != 0) {
+            return nullptr; // 0x01 = writable
+        }
     }
 
     auto* new_chunk = reinterpret_cast<BlockHeader*>(heap_virt);

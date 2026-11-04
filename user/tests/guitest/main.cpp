@@ -28,7 +28,7 @@ static void run_display_tests(std::uint32_t cap_display_send) {
     req_surf.data[2] = 120;
 
     oz::IPCMessage resp_surf{};
-    bool ok = oz::sys_call(cap_display_send, &req_surf, &resp_surf) && resp_surf.data[0] == 0 && resp_surf.has_cap;
+    bool ok = oz::sys_call_recv_cap(cap_display_send, &req_surf, &resp_surf) && resp_surf.data[0] == 0 && resp_surf.has_cap;
     TEST_REPORT("GUITEST", "Display create_surface (FrameCap Transfer)", ok);
 
     if (ok) {
@@ -82,7 +82,7 @@ static void run_wm_tests(std::uint32_t cap_wm_send) {
     req_win1.data[1] = 380;
     req_win1.data[2] = 260;
     oz::IPCMessage resp_win1{};
-    bool ok1 = oz::sys_call(cap_wm_send, &req_win1, &resp_win1) && resp_win1.data[0] == 0 && resp_win1.has_cap;
+    bool ok1 = oz::sys_call_recv_cap(cap_wm_send, &req_win1, &resp_win1) && resp_win1.data[0] == 0 && resp_win1.has_cap;
     TEST_REPORT("GUITEST", "WM create_window 1 (Tiling BSP Root)", ok1);
 
     if (ok1) {
@@ -107,7 +107,7 @@ static void run_wm_tests(std::uint32_t cap_wm_send) {
         req_win2.data[1] = 380;
         req_win2.data[2] = 260;
         oz::IPCMessage resp_win2{};
-        bool ok2 = oz::sys_call(cap_wm_send, &req_win2, &resp_win2) && resp_win2.data[0] == 0 && resp_win2.has_cap;
+        bool ok2 = oz::sys_call_recv_cap(cap_wm_send, &req_win2, &resp_win2) && resp_win2.data[0] == 0 && resp_win2.has_cap;
         TEST_REPORT("GUITEST", "WM create_window 2 (BSP Auto-Split)", ok2);
 
         if (ok2) {
@@ -260,8 +260,9 @@ extern "C" void _start() {
 
     oz::sys_cspace_cap_insert(disp_proc.cspace_cap, 1, cons_send, static_cast<std::uint32_t>(oz::CapRights::WRITE | oz::CapRights::GRANT));
     oz::sys_cspace_cap_insert(disp_proc.cspace_cap, 2, disp_init_recv, static_cast<std::uint32_t>(oz::CapRights::READ));
-    oz::sys_cspace_cap_insert(disp_proc.cspace_cap, 3, disp_cmd_recv, static_cast<std::uint32_t>(oz::CapRights::READ));
-    oz::sys_cspace_cap_insert(disp_proc.cspace_cap, oz::CAP_UNTYPED, oz::CAP_UNTYPED, static_cast<std::uint32_t>(oz::CapRights::ALL));
+    oz::sys_cspace_cap_insert(disp_proc.cspace_cap, 3, disp_cmd_recv, static_cast<std::uint32_t>(oz::CapRights::READ | oz::CapRights::GRANT_REPLY));
+    std::uint32_t disp_ut = oz::sys_untyped_retype(oz::CAP_UNTYPED, static_cast<std::uint32_t>(oz::ObjectType::UntypedMemory), 16 * 1024 * 1024);
+    oz::sys_cspace_cap_move(disp_proc.cspace_cap, oz::CAP_UNTYPED, disp_ut);
     oz::sys_cspace_cap_insert(disp_proc.cspace_cap, oz::CAP_FRAMEBUFFER, oz::CAP_FRAMEBUFFER, static_cast<std::uint32_t>(oz::CapRights::ALL));
 
     oz::sys_tcb_resume(disp_proc.tcb_cap);
@@ -275,8 +276,6 @@ extern "C" void _start() {
     config_msg.data[3] = boot_info->fb_phys_addr;
     oz::IPCMessage config_resp{};
     oz::sys_call(init_disp_send, &config_msg, &config_resp);
-
-    oz::sys_cspace_cap_insert(oz::CAP_SELF_CSPACE, oz::guitest::CAP_DISPLAY_SEND, disp_cmd_send, static_cast<std::uint32_t>(oz::CapRights::WRITE | oz::CapRights::GRANT));
 
     // 2. Spawn Window Manager (WM)
     oz::loader::TarFile wm_file = oz::loader::tar_find_file(initrd_ptr, initrd_size, "wm");
@@ -298,23 +297,21 @@ extern "C" void _start() {
     std::uint32_t notif_wm_kbd = oz::sys_notification_create(oz::CAP_UNTYPED);
     std::uint32_t kbd_ring_frame = oz::sys_frame_alloc(oz::CAP_UNTYPED, 1);
 
-    oz::sys_cspace_cap_insert(wm_proc.cspace_cap, 0, wm_proc.vspace_cap, static_cast<std::uint32_t>(oz::CapRights::ALL));
     oz::sys_cspace_cap_insert(wm_proc.cspace_cap, 1, cons_send, static_cast<std::uint32_t>(oz::CapRights::WRITE | oz::CapRights::GRANT));
     oz::sys_cspace_cap_insert(wm_proc.cspace_cap, 2, disp_cmd_send, static_cast<std::uint32_t>(oz::CapRights::WRITE | oz::CapRights::GRANT));
     oz::sys_cspace_cap_insert(wm_proc.cspace_cap, 3, wm_disp_reply_recv, static_cast<std::uint32_t>(oz::CapRights::READ));
-    oz::sys_cspace_cap_insert(wm_proc.cspace_cap, 4, wm_req_recv, static_cast<std::uint32_t>(oz::CapRights::READ));
+    oz::sys_cspace_cap_insert(wm_proc.cspace_cap, 4, wm_req_recv, static_cast<std::uint32_t>(oz::CapRights::READ | oz::CapRights::GRANT_REPLY));
     oz::sys_cspace_cap_insert(wm_proc.cspace_cap, 5, kbd_ring_frame, static_cast<std::uint32_t>(oz::CapRights::ALL));
     oz::sys_cspace_cap_insert(wm_proc.cspace_cap, 6, notif_wm_kbd, static_cast<std::uint32_t>(oz::CapRights::ALL));
-    oz::sys_cspace_cap_insert(wm_proc.cspace_cap, oz::CAP_UNTYPED, oz::CAP_UNTYPED, static_cast<std::uint32_t>(oz::CapRights::ALL));
+    std::uint32_t wm_ut = oz::sys_untyped_retype(oz::CAP_UNTYPED, static_cast<std::uint32_t>(oz::ObjectType::UntypedMemory), 16 * 1024 * 1024);
+    oz::sys_cspace_cap_move(wm_proc.cspace_cap, oz::CAP_UNTYPED, wm_ut);
 
     oz::sys_tcb_resume(wm_proc.tcb_cap);
     init_coroutine(wm_proc.tcb_cap);
 
-    oz::sys_cspace_cap_insert(oz::CAP_SELF_CSPACE, oz::guitest::CAP_WM_SEND, wm_req_send, static_cast<std::uint32_t>(oz::CapRights::WRITE | oz::CapRights::GRANT));
-
     // Run Tests
-    oz::guitest::run_display_tests(oz::guitest::CAP_DISPLAY_SEND);
-    oz::guitest::run_wm_tests(oz::guitest::CAP_WM_SEND);
+    oz::guitest::run_display_tests(disp_cmd_send);
+    oz::guitest::run_wm_tests(wm_req_send);
 
     oz::test::print_summary("GUITEST");
     oz::test::exit_qemu();

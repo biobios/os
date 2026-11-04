@@ -99,7 +99,7 @@ public:
             IPCMessage req{};
             req.data[0] = static_cast<std::uint64_t>(ipc::BlockCmd::GET_INFO);
             IPCMessage resp{};
-            if (sys_call(send_cap, &req, &resp)) {
+            if (sys_call_recv_cap(send_cap, &req, &resp)) {
                 if (resp.data[0] == 0) {
                     sector_sz = static_cast<std::uint32_t>(resp.data[1]);
                     if (sector_sz == 0) sector_sz = 512;

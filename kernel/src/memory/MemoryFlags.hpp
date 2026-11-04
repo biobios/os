@@ -4,7 +4,7 @@
 #include "utils/FlagClass.hpp"
 
 namespace oz {
-class MemoryFlags : public utils::FlagClass<std::uint64_t, MemoryFlags> {
+class MemoryFlags : public ::utils::FlagClass<std::uint64_t, MemoryFlags> {
     constexpr MemoryFlags(std::uint64_t flags) : FlagClass(flags) {}
 public:
     static const MemoryFlags None;

@@ -333,7 +333,7 @@ static bool spawn_driver(DeviceEntry& dev) {
     }
 
     oz::IPCMessage resp{};
-    if (oz::sys_call(CAP_PROCMAN_SEND, &req, &resp) && resp.data[0] == 0) {
+    if (oz::sys_call_recv_cap(CAP_PROCMAN_SEND, &req, &resp) && resp.data[0] == 0) {
         dev.pid = static_cast<std::uint32_t>(resp.data[1]);
         dev.exit_notif_cap = resp.has_cap ? resp.transferred_cap : oz::INVALID_CAP_ID;
         dev.state = DeviceState::STARTING;
@@ -659,11 +659,16 @@ static void drivman_ipc_worker() {
     oz::ReplyToken tok = oz::INVALID_REPLY_TOKEN;
     oz::IPCMessage req{};
     oz::IPCMessage resp{};
+    std::uint32_t recv_slot = oz::g_slot_allocator.allocate_one();
 
     while (true) {
-        tok = oz::sys_reply_recv(tok, CAP_DRIVMAN_RECV, (tok != oz::INVALID_REPLY_TOKEN) ? &resp : nullptr, &req);
+        tok = oz::sys_reply_recv(tok, CAP_DRIVMAN_RECV, (tok != oz::INVALID_REPLY_TOKEN) ? &resp : nullptr, &req, recv_slot);
         if (tok == oz::INVALID_REPLY_TOKEN) {
             continue;
+        }
+
+        if (req.has_cap) {
+            recv_slot = oz::g_slot_allocator.allocate_one();
         }
 
         resp = oz::IPCMessage{};

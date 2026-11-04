@@ -2,6 +2,9 @@
 #include "core/IRQHandler.hpp"
 
 namespace oz {
+
+IRQHandler g_irq_handlers[256];
+
 namespace irq {
 
 static IRQHandler* dispatch_table[256] = {};

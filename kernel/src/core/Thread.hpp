@@ -26,8 +26,10 @@ public:
 
     // For blocking IPC recv
     CapID recv_cap_id{0};
+    CapID recv_slot{0};
     IPCMessage* recv_msg_buf{nullptr};
     bool recv_result{false};
+    int ipc_error{0};
 
     ChannelEndpoint* fault_ep{nullptr};
 
@@ -75,6 +77,18 @@ void register_thread(Thread* t);
 void unregister_thread(Thread* t);
 Thread* get_thread_by_id(std::uint64_t id);
 void dump_threads();
+
+void for_each_registered_thread_impl(void (*callback)(Thread*, void*), void* data);
+
+template <typename Fn>
+inline void for_each_registered_thread(Fn&& fn) {
+    auto cb = [](Thread* t, void* user) {
+        (*reinterpret_cast<std::decay_t<Fn>*>(user))(t);
+    };
+    for_each_registered_thread_impl(cb, const_cast<void*>(reinterpret_cast<const void*>(&fn)));
+}
+
+extern "C" [[noreturn]] void load_context_noreturn(void* next_rsp);
 
 extern "C" void switch_context(void** old_rsp, void* new_rsp);
 extern "C" void thread_stub();

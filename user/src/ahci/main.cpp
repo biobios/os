@@ -54,7 +54,7 @@ OZ_PROCESS_ENTRY() {
             res_req.data[1] = 1; // MMIO_BAR
             res_req.data[2] = 0; // ABAR
             oz::IPCMessage res_resp{};
-            if (oz::sys_call(drivman_cap, &res_req, &res_resp) && res_resp.data[0] == 0 && res_resp.has_cap) {
+            if (oz::sys_call_recv_cap(drivman_cap, &res_req, &res_resp) && res_resp.data[0] == 0 && res_resp.has_cap) {
                 mmio_cap = res_resp.transferred_cap;
                 oz::sys_write("[AHCI] Obtained ABAR MMIO frame from DrivMan.\n\r");
             } else {
@@ -68,7 +68,7 @@ OZ_PROCESS_ENTRY() {
             const char* dname = "ahci";
             for (int i = 0; i < 4; ++i) reinterpret_cast<char*>(&req.data[1])[i] = dname[i];
             oz::IPCMessage resp{};
-            if (oz::sys_call(drivman_cap, &req, &resp) && resp.data[0] == 0 && resp.has_cap) {
+            if (oz::sys_call_recv_cap(drivman_cap, &req, &resp) && resp.data[0] == 0 && resp.has_cap) {
                 mmio_cap = resp.transferred_cap;
                 oz::sys_write("[AHCI] Obtained MMIO frame from DrivMan (legacy).\n\r");
             } else {
@@ -117,16 +117,16 @@ OZ_PROCESS_ENTRY() {
     
     // Map shared buffer for block I/O
     static constexpr std::uint64_t SHARED_BUF_VIRT = 0x210000000000;
-    std::uint32_t shared_buf_frame = oz::INVALID_CAP_ID;
+    std::uint32_t shared_buf_pt_cap = oz::INVALID_CAP_ID;
 
     // Check if slot 242 is already present (e.g. in vtest)
     if (oz::sys_vspace_map_with_pagetables(oz::CAP_SELF_VSPACE, oz::CAP_UNTYPED, 242, SHARED_BUF_VIRT, 0x01, 16 * 4096) == 0) {
-        shared_buf_frame = 242;
+        shared_buf_pt_cap = 242;
     } else {
-        // Allocate 16 pages for shared block buffer
-        shared_buf_frame = oz::sys_frame_alloc(oz::CAP_UNTYPED, 16);
-        if (shared_buf_frame != oz::INVALID_CAP_ID) {
-            oz::sys_vspace_map_with_pagetables(oz::CAP_SELF_VSPACE, oz::CAP_UNTYPED, shared_buf_frame, SHARED_BUF_VIRT, 0x01, 16 * 4096);
+        // Allocate 16 pages for shared block buffer as a shared Level 1 PageTable
+        shared_buf_pt_cap = oz::sys_alloc_shared_pt(oz::CAP_UNTYPED, 16, 0x01);
+        if (shared_buf_pt_cap != oz::INVALID_CAP_ID) {
+            oz::sys_vspace_map_with_pagetables(oz::CAP_SELF_VSPACE, oz::CAP_UNTYPED, shared_buf_pt_cap, SHARED_BUF_VIRT, 0x01, 16 * 4096);
         }
     }
 
@@ -211,11 +211,11 @@ OZ_PROCESS_ENTRY() {
                             } else if (cmd == oz::ipc::BlockCmd::GET_INFO) {
                                 legacy_resp.data[0] = 0;
                                 legacy_resp.data[1] = dev->getSectorSize();
-                                if (shared_buf_frame != oz::INVALID_CAP_ID) {
-                                    constexpr std::uint32_t BUF_XFER_SLOT = 60;
-                                    if (oz::sys_cap_copy(BUF_XFER_SLOT, shared_buf_frame, static_cast<std::uint32_t>(oz::CapRights::ALL)) == 0) {
+                                if (shared_buf_pt_cap != oz::INVALID_CAP_ID) {
+                                    std::uint32_t minted = oz::sys_cap_mint(shared_buf_pt_cap, static_cast<std::uint32_t>(oz::CapRights::ALL));
+                                    if (minted != oz::INVALID_CAP_ID) {
                                         legacy_resp.has_cap = true;
-                                        legacy_resp.transferred_cap = BUF_XFER_SLOT;
+                                        legacy_resp.transferred_cap = minted;
                                     }
                                 }
                             } else {
@@ -289,11 +289,11 @@ OZ_PROCESS_ENTRY() {
                     case oz::ipc::BlockCmd::GET_INFO: {
                         resp.data[0] = 0;
                         resp.data[1] = dev->getSectorSize();
-                        if (shared_buf_frame != oz::INVALID_CAP_ID) {
-                            constexpr std::uint32_t BUF_XFER_SLOT = 60;
-                            if (oz::sys_cap_copy(BUF_XFER_SLOT, shared_buf_frame, static_cast<std::uint32_t>(oz::CapRights::ALL)) == 0) {
+                        if (shared_buf_pt_cap != oz::INVALID_CAP_ID) {
+                            std::uint32_t minted = oz::sys_cap_mint(shared_buf_pt_cap, static_cast<std::uint32_t>(oz::CapRights::ALL));
+                            if (minted != oz::INVALID_CAP_ID) {
                                 resp.has_cap = true;
-                                resp.transferred_cap = BUF_XFER_SLOT;
+                                resp.transferred_cap = minted;
                             }
                         }
                         break;
