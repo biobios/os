@@ -2,10 +2,9 @@
 #include "core/Thread.hpp"
 #include "core/Notification.hpp"
 #include "core/IRQHandler.hpp"
+#include "core/KernelUtils.hpp"
 
 namespace oz {
-
-extern void (*g_unblock_thread_func)(Thread*);
 
 static ChannelEndpoint* s_channel_list_head = nullptr;
 
@@ -38,12 +37,12 @@ ChannelEndpoint::~ChannelEndpoint() {
     while (Thread* t = pop_recv_waiter()) {
         t->ipc_cancelled = true;
         t->state = ThreadState::Ready;
-        if (g_unblock_thread_func) g_unblock_thread_func(t);
+        oz::unblock_thread(t);
     }
     while (Thread* t = pop_send_waiter()) {
         t->ipc_cancelled = true;
         t->state = ThreadState::Ready;
-        if (g_unblock_thread_func) g_unblock_thread_func(t);
+        oz::unblock_thread(t);
     }
 
     // 逆引き強制アンバインド
@@ -68,12 +67,12 @@ void ChannelEndpoint::on_peer_closed() {
     while (Thread* t = pop_recv_waiter()) {
         t->ipc_cancelled = true;
         t->state = ThreadState::Ready;
-        if (g_unblock_thread_func) g_unblock_thread_func(t);
+        oz::unblock_thread(t);
     }
     while (Thread* t = pop_send_waiter()) {
         t->ipc_cancelled = true;
         t->state = ThreadState::Ready;
-        if (g_unblock_thread_func) g_unblock_thread_func(t);
+        oz::unblock_thread(t);
     }
 }
 

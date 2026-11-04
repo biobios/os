@@ -3,7 +3,8 @@
 #include <cstdint>
 #include <memory>
 
-#include "../../user/src/common/utils/BootInfo.hpp"
+#include <oz/BootInfo.hpp>
+#include "core/KernelUtils.hpp"
 #include "core/Channel.hpp"
 #include "core/IRQDispatch.hpp"
 #include "core/IRQHandler.hpp"
@@ -48,55 +49,7 @@ Kernel::Kernel(oz_boot::PlatformInfo* platformInfo)
 void Kernel::initSyscallAndStubs() {
     oz::x86_64::initIRQStubs();
     
-    oz::g_exit_thread_func = []() {
-        Kernel::instance().scheduler.exitThread();
-    };
-    oz::g_get_current_cspace_func = []() -> CSpace* {
-        auto* ctx = Kernel::instance().scheduler.getCurrentContext();
-        return ctx ? ctx->cspace : nullptr;
-    };
-    oz::g_get_current_thread_func = []() -> Thread* {
-        return Kernel::instance().scheduler.getCurrentThread();
-    };
-    oz::g_get_current_context_func = []() -> ExecutionContext* {
-        return Kernel::instance().scheduler.getCurrentContext();
-    };
-    oz::g_block_thread_func = []() {
-        Kernel::instance().scheduler.schedule();
-    };
-    oz::g_unblock_thread_func = [](Thread* t) {
-        if (!t) return;
-        t->is_blocked = false;
-        t->state = ThreadState::Ready;
-        if (t->baton) {
-            t->baton->notify_if_runnable();
-        }
-        if (t->sched_notif && t->sched_badge != 0) {
-            t->sched_notif->signal(t->sched_badge);
-        }
-    };
-    oz::g_queue_thread_func = [](Thread* t) {
-        if (!t) return;
-        t->is_blocked = false;
-        t->state = ThreadState::Ready;
-        if (t->baton) {
-            t->baton->notify_if_runnable();
-        }
-        if (t->sched_notif && t->sched_badge != 0) {
-            t->sched_notif->signal(t->sched_badge);
-        }
-    };
-    oz::irq::setUnblockFn([](Thread* t) {
-        if (!t) return;
-        t->is_blocked = false;
-        t->state = ThreadState::Ready;
-        if (t->baton) {
-            t->baton->notify_if_runnable();
-        }
-        if (t->sched_notif && t->sched_badge != 0) {
-            t->sched_notif->signal(t->sched_badge);
-        }
-    });
+    oz::irq::setUnblockFn(oz::unblock_thread);
     oz::irq::setTimerTickFn([]() {
         Kernel::instance().scheduler.tick();
     });
@@ -317,11 +270,11 @@ void Kernel::setupRootServerCaps(Thread* init_thread, UntypedMemory& boot_untype
     }
 
     // 2.5 Transfer all remaining physical memory to Init as UntypedMemory capabilities (Slots 200..)
-    std::uint32_t untyped_start_slot = 200;
+    std::uint32_t untyped_start_slot = CAP_RESERVED_SYSTEM_START;
     std::uint32_t untyped_count = 0;
     fm.forEachRemainingRegion([&](std::uintptr_t base, std::size_t size) {
         if (size < 64 * 1024) return;
-        if (untyped_start_slot + untyped_count >= 240) return;
+        if (untyped_start_slot + untyped_count >= CAP_UNTYPED) return;
         init_untyped_slot(init_cspace->getSlot(untyped_start_slot + untyped_count), base, size, false);
         untyped_count++;
     });
@@ -331,20 +284,20 @@ void Kernel::setupRootServerCaps(Thread* init_thread, UntypedMemory& boot_untype
         bootinfo_virt->untyped_cap_start = untyped_start_slot;
         bootinfo_virt->untyped_cap_count = untyped_count;
 
-        init_frame_slot(init_cspace->getSlot(243), bootinfo_phys, 4096, CapRights::ALL);
+        init_frame_slot(init_cspace->getSlot(CAP_BOOTINFO), bootinfo_phys, 4096, CapRights::ALL);
         dprint("[Kernel] BootInfo capability created.\n\r");
     }
 
     // 3. AHCI MMIO Frame (Slot 241)
     if (devices.ahci_abar_phys != 0) {
-        init_frame_slot(init_cspace->getSlot(241), devices.ahci_abar_phys, 4096, CapRights::ALL, true);
+        init_frame_slot(init_cspace->getSlot(CAP_AHCI_MMIO), devices.ahci_abar_phys, 4096, CapRights::ALL, true);
     }
 
     // 4. xHCI MMIO PageTable (Slot 242, 64KB = 16 pages)
     if (devices.xhci_bar_phys != 0) {
         auto* xhci_pt = create_mmio_pt(boot_untyped, devices.xhci_bar_phys, 16);
         if (xhci_pt) {
-            init_pagetable_object_slot(init_cspace->getSlot(242), xhci_pt, 1, CapRights::ALL);
+            init_pagetable_object_slot(init_cspace->getSlot(CAP_XHCI_MMIO), xhci_pt, 1, CapRights::ALL);
             dprint("[Kernel] xHCI MMIO PageTable capability created (Slot 242).\n\r");
         }
     }
@@ -356,14 +309,14 @@ void Kernel::setupRootServerCaps(Thread* init_thread, UntypedMemory& boot_untype
         std::size_t initrd_pages = (initrd_file->size + initrd_offset + 4095) / 4096;
         auto* initrd_pd = create_shared_pd(boot_untyped, initrd_aligned_phys, initrd_pages, /*writable=*/false, /*nocache=*/false);
         if (initrd_pd) {
-            init_pagetable_object_slot(init_cspace->getSlot(244), initrd_pd, 2, CapRights::ALL);
+            init_pagetable_object_slot(init_cspace->getSlot(CAP_INITRD), initrd_pd, 2, CapRights::ALL);
             dprint("[Kernel] InitRD PD capability created (Slot 244).\n\r");
         }
     }
 
     // 7. Setup Self CSpace capability (Slot 245)
     auto* cs_cap_obj = boot_untyped.allocateObject<CSpaceCap>(init_cspace, false);
-    init_kernel_object_slot(init_cspace->getSlot(245), cs_cap_obj, CapRights::ALL);
+    init_kernel_object_slot(init_cspace->getSlot(CAP_SELF_CSPACE), cs_cap_obj, CapRights::ALL);
 
     // 8. Setup FrameBuffer Level 2 PD capability (Slot 246)
     std::uintptr_t fb_phys = reinterpret_cast<std::uintptr_t>(platform_info_->frame_buffer_base) - oz::DIRECT_MAP_OFFSET;
@@ -372,13 +325,13 @@ void Kernel::setupRootServerCaps(Thread* init_thread, UntypedMemory& boot_untype
         std::size_t fb_pages = (fb_size + 4095) / 4096;
         auto* fb_pd = create_shared_pd(boot_untyped, fb_phys, fb_pages, /*writable=*/true, /*nocache=*/true);
         if (fb_pd) {
-            init_pagetable_object_slot(init_cspace->getSlot(246), fb_pd, 2, CapRights::ALL);
+            init_pagetable_object_slot(init_cspace->getSlot(CAP_FRAMEBUFFER), fb_pd, 2, CapRights::ALL);
             dprint("[Kernel] FrameBuffer PD capability created (Slot 246).\n\r");
         }
     }
 
     // 9. Setup Root IOPort capability (Slot 247)
-    init_ioport_slot(init_cspace->getSlot(247), 0x0000, 0x10000);
+    init_ioport_slot(init_cspace->getSlot(CAP_ROOT_IOPORT), 0x0000, 0x10000);
     dprint("[Kernel] Root IOPort capability created (Slot 247).\n\r");
 
     // 10. Setup Root Baton capability (Slot 248)
@@ -394,11 +347,11 @@ void Kernel::setupRootServerCaps(Thread* init_thread, UntypedMemory& boot_untype
         init_thread->baton = root_baton;
         Kernel::instance().getScheduler().cartesian_root = root_baton;
         Kernel::instance().getScheduler().running_baton = root_baton;
-        init_kernel_object_slot(init_cspace->getSlot(248), root_baton, CapRights::ALL);
+        init_kernel_object_slot(init_cspace->getSlot(CAP_ROOT_BATON), root_baton, CapRights::ALL);
         dprint("[Kernel] Root Baton capability created (Slot 248).\n\r");
 
         // 11. Setup Root IRQBatonControl capability (Slot 249)
-        init_irq_control_slot(init_cspace->getSlot(249));
+        init_irq_control_slot(init_cspace->getSlot(CAP_IRQ_CONTROL));
         dprint("[Kernel] Root IRQBatonControl capability created (Slot 249).\n\r");
 
         int test_res = test_cartesian_tree_algorithms();
@@ -554,7 +507,7 @@ Thread* Kernel::loadProcessFromElfBuffer(UntypedMemory& boot_untyped, const std:
     vspace->bind_direct_phys(init_pml4_phys, 4);
     init_pagetable_object_slot(init_cspace->getSlot(0), vspace, 4, CapRights::ALL);
 
-    TCB* user_tcb = boot_untyped.retypeTCB(g_queue_thread_func);
+    TCB* user_tcb = boot_untyped.retypeTCB(oz::unblock_thread);
     if (!user_tcb) return nullptr;
     Thread* user_thread = user_tcb->getThread();
 

@@ -3,10 +3,9 @@
 #include "core/Baton.hpp"
 #include "core/Channel.hpp"
 #include "core/IRQHandler.hpp"
+#include "core/KernelUtils.hpp"
 
 namespace oz {
-
-extern void (*g_unblock_thread_func)(Thread*);
 
 static Notification* s_notification_list_head = nullptr;
 
@@ -37,9 +36,7 @@ Notification::~Notification() {
     // Wake up all waiters on destruction
     while (Thread* t = pop_waiter()) {
         t->state = ThreadState::Ready;
-        if (g_unblock_thread_func) {
-            g_unblock_thread_func(t);
-        }
+        oz::unblock_thread(t);
     }
 
     // 逆引き強制アンバインド
@@ -210,9 +207,7 @@ Thread* Notification::signal(std::uint64_t badge) {
     Thread* unblocked = pop_waiter();
     if (unblocked) {
         unblocked->state = ThreadState::Ready;
-        if (g_unblock_thread_func) {
-            g_unblock_thread_func(unblocked);
-        }
+        oz::unblock_thread(unblocked);
     } else if (last_waiter_ && !last_waiter_->is_dead && !last_waiter_->is_blocked) {
         unblocked = last_waiter_;
     }

@@ -78,24 +78,21 @@ extern "C" void _start() {
     bool info_ok = oz::sys_call(mem_req_send, &info_req, &info_resp) && (info_resp.data[0] == 0);
     TEST_REPORT("PTEST", "MemMan GET_INFO IPC query", info_ok);
 
-    // Test 1.2: MemCmd::ALLOC_UNTYPED
-    oz::IPCMessage alloc_req{};
-    alloc_req.data[0] = static_cast<std::uint64_t>(oz::ipc::MemCmd::ALLOC_UNTYPED);
-    alloc_req.data[1] = 2 * 1024 * 1024; // 2MB
-    oz::IPCMessage alloc_resp{};
-    bool alloc_ok = oz::sys_call_recv_cap(mem_req_send, &alloc_req, &alloc_resp) && (alloc_resp.data[0] == 0) && alloc_resp.has_cap;
-    TEST_REPORT("PTEST", "MemMan ALLOC_UNTYPED cap transfer", alloc_ok && alloc_resp.transferred_cap != oz::INVALID_CAP_ID);
+    // Test 1.2: MemCmd::ALLOC_UNTYPED (using type-safe marshalling)
+    oz::IPCMessage alloc_req = oz::ipc::MemAllocReq{2 * 1024 * 1024}.encode(); // 2MB
+    oz::IPCMessage alloc_resp_msg{};
+    bool alloc_ok = oz::sys_call_recv_cap(mem_req_send, &alloc_req, &alloc_resp_msg);
+    auto alloc_resp = oz::ipc::MemAllocResp::decode(alloc_resp_msg);
+    alloc_ok = alloc_ok && (alloc_resp.status == 0) && (alloc_resp.untyped_cap != 0);
+    TEST_REPORT("PTEST", "MemMan ALLOC_UNTYPED cap transfer", alloc_ok && alloc_resp.untyped_cap != oz::INVALID_CAP_ID);
 
-    std::uint32_t child_untyped = alloc_resp.transferred_cap;
+    std::uint32_t child_untyped = alloc_resp.untyped_cap;
 
-    // Test 1.3: MemCmd::REVOKE_UNTYPED
+    // Test 1.3: MemCmd::REVOKE_UNTYPED (using type-safe marshalling)
     if (alloc_ok) {
-        oz::IPCMessage rev_req{};
-        rev_req.data[0] = static_cast<std::uint64_t>(oz::ipc::MemCmd::REVOKE_UNTYPED);
-        rev_req.has_cap = true;
-        rev_req.transferred_cap = child_untyped;
-        oz::IPCMessage rev_resp{};
-        bool rev_ok = oz::sys_call(mem_req_send, &rev_req, &rev_resp) && (rev_resp.data[0] == 0);
+        oz::IPCMessage rev_req = oz::ipc::MemRevokeReq{child_untyped}.encode();
+        oz::IPCMessage rev_resp_msg{};
+        bool rev_ok = oz::sys_call(mem_req_send, &rev_req, &rev_resp_msg) && (rev_resp_msg.data[0] == 0);
         TEST_REPORT("PTEST", "MemMan REVOKE_UNTYPED cap reclaim", rev_ok);
     }
 
@@ -139,16 +136,17 @@ extern "C" void _start() {
             oz::sys_tcb_resume(procman_proc.tcb_cap);
             init_coroutine(procman_proc.tcb_cap);
 
-            // Test 2.1: ProcCmd::CREATE_PIPE
+            // Test 2.1: ProcCmd::CREATE_PIPE (using type-safe marshalling)
             oz::IPCMessage pipe_req{};
             pipe_req.data[0] = static_cast<std::uint64_t>(oz::ipc::ProcCmd::CREATE_PIPE);
-            oz::IPCMessage pipe_resp{};
-            bool pipe_ok = oz::sys_call_recv_cap(proc_req_send, &pipe_req, &pipe_resp) &&
-                           (pipe_resp.data[0] == 0) && pipe_resp.has_cap;
-            TEST_REPORT("PTEST", "ProcMan CREATE_PIPE IPC", pipe_ok && pipe_resp.transferred_cap != oz::INVALID_CAP_ID);
+            oz::IPCMessage pipe_resp_msg{};
+            bool pipe_ok = oz::sys_call_recv_cap(proc_req_send, &pipe_req, &pipe_resp_msg);
+            auto pipe_resp = oz::ipc::ProcCreatePipeResp::decode(pipe_resp_msg);
+            pipe_ok = pipe_ok && (pipe_resp.status == 0) && (pipe_resp.read_cap != oz::INVALID_CAP_ID);
+            TEST_REPORT("PTEST", "ProcMan CREATE_PIPE IPC", pipe_ok && pipe_resp.read_cap != oz::INVALID_CAP_ID);
 
-            if (pipe_ok && pipe_resp.transferred_cap != oz::INVALID_CAP_ID) {
-                oz::sys_cap_delete(pipe_resp.transferred_cap);
+            if (pipe_ok && pipe_resp.read_cap != oz::INVALID_CAP_ID) {
+                oz::sys_cap_delete(pipe_resp.read_cap);
             }
         }
     }

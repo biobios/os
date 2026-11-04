@@ -79,17 +79,17 @@ enum class CapRole : std::uint32_t {
     DRIVMAN      = 9, // Driver Manager Broker channel
 };
 
-enum class CapType : std::uint32_t {
+enum class StartupNodeType : std::uint32_t {
     STREAM  = 0, // Byte stream channel (Pipe, Console, STDIN/STDOUT)
     FILE    = 1, // Dedicated VFS File Channel (RPC FileCmd)
     DIR     = 2, // Directory Channel
 };
 
 struct StartupCapEntry {
-    std::uint32_t slot{0};       // Slot ID in child's CSpace
-    CapRole       role{CapRole::NONE};
-    CapType       type{CapType::STREAM};
-    char          name[32]{};    // Logical name (e.g. "stdin", "/", "memo.txt")
+    std::uint32_t   slot{0};       // Slot ID in child's CSpace
+    CapRole         role{CapRole::NONE};
+    StartupNodeType type{StartupNodeType::STREAM};
+    char            name[32]{};    // Logical name (e.g. "stdin", "/", "memo.txt")
 };
 
 struct ProcessStartupInfo {
@@ -139,7 +139,7 @@ struct ProcessStartupInfo {
     std::uint32_t next_slot{PREWIRED_SLOT_START};
 
     // Helper: add capability to startup info
-    bool add_cap(std::uint32_t slot, CapRole role, const char* name_str, CapType type = CapType::STREAM) {
+    bool add_cap(std::uint32_t slot, CapRole role, const char* name_str, StartupNodeType type = StartupNodeType::STREAM) {
         if (num_caps >= MAX_CAPS) return false;
         caps[num_caps].slot = slot;
         caps[num_caps].role = role;
@@ -159,7 +159,7 @@ struct ProcessStartupInfo {
     }
 
     // Helper: allocate an unused slot in PREWIRED zone and add capability
-    std::uint32_t alloc_and_add_cap(CapRole role, const char* name_str, CapType type = CapType::STREAM) {
+    std::uint32_t alloc_and_add_cap(CapRole role, const char* name_str, StartupNodeType type = StartupNodeType::STREAM) {
         if (num_caps >= MAX_CAPS || next_slot > PREWIRED_SLOT_END) return 0;
         std::uint32_t slot = next_slot++;
         if (!add_cap(slot, role, name_str, type)) return 0;
@@ -220,12 +220,12 @@ public:
         return (slot != 0) ? slot : fallback;
     }
 
-    static CapType get_cap_type(std::uint32_t slot) {
-        if (!g_info) return CapType::STREAM;
+    static StartupNodeType get_cap_type(std::uint32_t slot) {
+        if (!g_info) return StartupNodeType::STREAM;
         for (std::size_t i = 0; i < g_info->num_caps; ++i) {
             if (g_info->caps[i].slot == slot) return g_info->caps[i].type;
         }
-        return CapType::STREAM;
+        return StartupNodeType::STREAM;
     }
 
     static const StartupCapEntry* get_cap_entry(CapRole role) {

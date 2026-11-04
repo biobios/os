@@ -2,8 +2,6 @@
 
 namespace oz {
 
-constinit CSpaceSlotAllocator g_slot_allocator;
-
 extern "C" {
 
 std::uint64_t syscall(std::uint64_t number, std::uint64_t arg1, std::uint64_t arg2, std::uint64_t arg3, std::uint64_t arg4, std::uint64_t arg5, std::uint64_t arg6) {
@@ -22,18 +20,18 @@ std::uint64_t syscall(std::uint64_t number, std::uint64_t arg1, std::uint64_t ar
 }
 
 void sys_exit(int status) {
-    syscall(60, static_cast<std::uint64_t>(status), 0, 0, 0, 0, 0);
+    syscall(Syscall::Exit, static_cast<std::uint64_t>(status), 0, 0, 0, 0, 0);
     while (1) {
         __asm__ volatile("pause");
     }
 }
 
 int sys_yield() {
-    return static_cast<int>(syscall(44, 0, 0, 0, 0, 0, 0));
+    return static_cast<int>(syscall(Syscall::Yield, 0, 0, 0, 0, 0, 0));
 }
 
 int sys_untyped_retype_bulk(std::uint32_t untyped_cap, ObjectType target_type, std::uint64_t size_or_arg, std::uint32_t target_cspace, std::uint32_t start_slot, std::size_t count) {
-    return static_cast<int>(syscall(59, untyped_cap, static_cast<std::uint64_t>(target_type), size_or_arg, target_cspace, start_slot, count));
+    return static_cast<int>(syscall(Syscall::UntypedRetypeBulk, untyped_cap, static_cast<std::uint64_t>(target_type), size_or_arg, target_cspace, start_slot, count));
 }
 
 int sys_channel_create(std::uint32_t untyped_cap,
@@ -41,7 +39,7 @@ int sys_channel_create(std::uint32_t untyped_cap,
                        std::uint32_t target_cs1, std::uint32_t slot1,
                        ChannelMode mode0, ChannelMode mode1) {
     std::uint64_t modes = static_cast<std::uint32_t>(mode0) | (static_cast<std::uint64_t>(mode1) << 32);
-    return static_cast<int>(syscall(3, untyped_cap, target_cs0, slot0, target_cs1, slot1, modes));
+    return static_cast<int>(syscall(Syscall::ChannelCreate, untyped_cap, target_cs0, slot0, target_cs1, slot1, modes));
 }
 
 bool sys_call(std::uint32_t cap_id, const IPCMessage* send_msg, IPCMessage* recv_msg, std::uint32_t recv_slot) {
@@ -74,7 +72,7 @@ bool sys_call_recv_cap(std::uint32_t cap_id, const IPCMessage* send_msg, IPCMess
 int sys_call_ext(std::uint32_t cap_id, const IPCMessage* send_msg, IPCMessage* recv_msg, std::uint32_t flags, std::uint32_t recv_slot) {
     std::uint32_t effective_slot = (recv_slot == IPC_RECV_SLOT_NONE) ? 0 : recv_slot;
 
-    return static_cast<int>(syscall(27, cap_id,
+    return static_cast<int>(syscall(Syscall::Call, cap_id,
                                     reinterpret_cast<std::uint64_t>(send_msg),
                                     reinterpret_cast<std::uint64_t>(recv_msg),
                                     flags,
@@ -85,7 +83,7 @@ int sys_call_ext(std::uint32_t cap_id, const IPCMessage* send_msg, IPCMessage* r
 int sys_reply_and_recv(std::uint32_t ep_cap, const IPCMessage* reply_msg, IPCMessage* recv_msg, std::uint32_t flags, std::uint32_t recv_slot) {
     std::uint32_t effective_slot = (recv_slot == IPC_RECV_SLOT_NONE) ? 0 : recv_slot;
 
-    return static_cast<int>(syscall(28, ep_cap,
+    return static_cast<int>(syscall(Syscall::ReplyAndRecv, ep_cap,
                                     reinterpret_cast<std::uint64_t>(reply_msg),
                                     reinterpret_cast<std::uint64_t>(recv_msg),
                                     flags,
@@ -156,23 +154,23 @@ static void cache_insert(std::uint32_t vspace_cap, std::uint8_t level, std::uint
 }
 
 int sys_pagetable_create(std::uint32_t untyped_cap, std::uint32_t frame_cap, std::uint32_t level, std::uint32_t target_cspace, std::uint32_t target_slot) {
-    return static_cast<int>(syscall(17, untyped_cap, frame_cap, level, target_cspace, target_slot, 0));
+    return static_cast<int>(syscall(Syscall::PageTableCreate, untyped_cap, frame_cap, level, target_cspace, target_slot, 0));
 }
 
 int sys_pagetable_map(std::uint32_t parent_pt_cap, std::uint32_t index, std::uint32_t child_pt_cap) {
-    return static_cast<int>(syscall(25, parent_pt_cap, index, child_pt_cap, 0, 0, 0));
+    return static_cast<int>(syscall(Syscall::PageTableMapChild, parent_pt_cap, index, child_pt_cap, 0, 0, 0));
 }
 
 int sys_pagetable_map_frame(std::uint32_t pt_cap, std::uint32_t index, std::uint32_t frame_cap, std::uint64_t flags) {
-    return static_cast<int>(syscall(4, pt_cap, index, frame_cap, flags, 0, 0));
+    return static_cast<int>(syscall(Syscall::PageTableMapFrame, pt_cap, index, frame_cap, flags, 0, 0));
 }
 
 int sys_cap_unmap(std::uint32_t mapped_cap) {
-    return static_cast<int>(syscall(7, mapped_cap, 0, 0, 0, 0, 0));
+    return static_cast<int>(syscall(Syscall::PageTableUnmap, mapped_cap, 0, 0, 0, 0, 0));
 }
 
 int sys_cap_identify(std::uint32_t cap_id, CapInfo* info) {
-    return static_cast<int>(syscall(58, cap_id, reinterpret_cast<std::uint64_t>(info), 0, 0, 0, 0));
+    return static_cast<int>(syscall(Syscall::CapIdentify, cap_id, reinterpret_cast<std::uint64_t>(info), 0, 0, 0, 0));
 }
 
 std::uint32_t sys_pagetable_alloc(std::uint32_t untyped_cap, std::uint32_t level) {
@@ -333,7 +331,7 @@ int sys_vspace_map_with_pagetables(std::uint32_t vspace_cap, std::uint32_t untyp
 
 int sys_vspace_map(std::uint32_t vspace_cap, std::uint32_t frame_cap,
                    std::uint64_t virt_addr, std::uint64_t flags) {
-    return sys_vspace_map_with_pagetables(vspace_cap, 240, frame_cap, virt_addr, flags, 4096);
+    return sys_vspace_map_with_pagetables(vspace_cap, CAP_UNTYPED, frame_cap, virt_addr, flags, 4096);
 }
 
 int sys_vspace_unmap(std::uint32_t vspace_cap, std::uint64_t virt_addr_or_cap) {
@@ -346,27 +344,27 @@ int sys_vspace_unmap(std::uint32_t vspace_cap, std::uint64_t virt_addr_or_cap) {
 }
 
 std::uint64_t sys_frame_phys_addr(std::uint32_t frame_cap) {
-    return syscall(8, frame_cap, 0, 0, 0, 0, 0);
+    return syscall(Syscall::FrameGetPhys, frame_cap, 0, 0, 0, 0, 0);
 }
 
 std::uint64_t sys_frame_size(std::uint32_t frame_cap) {
-    return syscall(26, frame_cap, 0, 0, 0, 0, 0);
+    return syscall(Syscall::FrameGetSize, frame_cap, 0, 0, 0, 0, 0);
 }
 
 void sys_debug_print(const char* str) {
-    syscall(6, reinterpret_cast<std::uint64_t>(str), 0, 0, 0, 0, 0);
+    syscall(Syscall::Write, reinterpret_cast<std::uint64_t>(str), 0, 0, 0, 0, 0);
 }
 
 int sys_cap_mint(std::uint32_t target_cspace, std::uint32_t target_slot, std::uint32_t src_cap, std::uint32_t new_rights, std::uint64_t badge) {
-    return static_cast<int>(syscall(9, target_cspace, target_slot, src_cap, new_rights, badge, 0));
+    return static_cast<int>(syscall(Syscall::CapMint, target_cspace, target_slot, src_cap, new_rights, badge, 0));
 }
 
 int sys_cap_revoke(std::uint32_t cap_id) {
-    return static_cast<int>(syscall(55, cap_id, 0, 0, 0, 0, 0));
+    return static_cast<int>(syscall(Syscall::CapRevoke, cap_id, 0, 0, 0, 0, 0));
 }
 
 int sys_cap_delete(std::uint32_t cap_id) {
-    int res = static_cast<int>(syscall(10, cap_id, 0, 0, 0, 0, 0));
+    int res = static_cast<int>(syscall(Syscall::CapDelete, cap_id, 0, 0, 0, 0, 0));
     if (res == 0) {
         g_slot_allocator.free(cap_id);
     }
@@ -376,28 +374,28 @@ int sys_cap_delete(std::uint32_t cap_id) {
 int sys_tcb_configure(std::uint32_t tcb_cap, std::uint32_t cspace_cap,
                       std::uint32_t vspace_cap, std::uint64_t rip,
                       std::uint64_t user_rsp) {
-    return static_cast<int>(syscall(11, tcb_cap, cspace_cap, vspace_cap, rip, user_rsp, 0));
+    return static_cast<int>(syscall(Syscall::TcbConfigure, tcb_cap, cspace_cap, vspace_cap, rip, user_rsp, 0));
 }
 
 int sys_tcb_resume(std::uint32_t tcb_cap) {
-    return static_cast<int>(syscall(13, tcb_cap, 0, 0, 0, 0, 0));
+    return static_cast<int>(syscall(Syscall::TcbResume, tcb_cap, 0, 0, 0, 0, 0));
 }
 
 int sys_tcb_suspend(std::uint32_t tcb_cap) {
-    return static_cast<int>(syscall(14, tcb_cap, 0, 0, 0, 0, 0));
+    return static_cast<int>(syscall(Syscall::TcbSuspend, tcb_cap, 0, 0, 0, 0, 0));
 }
 
 int sys_tcb_set_fault_endpoint(std::uint32_t tcb_cap, std::uint32_t ep_cap) {
-    return static_cast<int>(syscall(29, tcb_cap, ep_cap, 0, 0, 0, 0));
+    return static_cast<int>(syscall(Syscall::TcbSetFaultEndpoint, tcb_cap, ep_cap, 0, 0, 0, 0));
 }
 
 int sys_tcb_set_exit_notification(std::uint32_t tcb_cap, std::uint32_t notif_cap, std::uint64_t badge) {
-    return static_cast<int>(syscall(39, tcb_cap, notif_cap, badge, 0, 0, 0));
+    return static_cast<int>(syscall(Syscall::TcbBindNotification, tcb_cap, notif_cap, badge, 0, 0, 0));
 }
 
 int sys_cspace_cap_insert(std::uint32_t cspace_cap, std::uint32_t target_slot,
                           std::uint32_t src_cap, std::uint32_t rights) {
-    return static_cast<int>(syscall(16, cspace_cap, target_slot, src_cap, rights, 0, 0));
+    return static_cast<int>(syscall(Syscall::CapCopy, cspace_cap, target_slot, src_cap, rights, 0, 0));
 }
 
 std::uint32_t sys_vspace_create(std::uint32_t untyped_cap) {
@@ -405,89 +403,89 @@ std::uint32_t sys_vspace_create(std::uint32_t untyped_cap) {
 }
 
 int sys_irq_handler_create(std::uint32_t untyped_cap, std::uint8_t vector, std::uint32_t notification_ep_cap, std::uint32_t target_cspace, std::uint32_t target_slot) {
-    return static_cast<int>(syscall(18, untyped_cap, vector, notification_ep_cap, target_cspace, target_slot, 0));
+    return static_cast<int>(syscall(Syscall::IrqHandlerCreate, untyped_cap, vector, notification_ep_cap, target_cspace, target_slot, 0));
 }
 
 int sys_irq_ack(std::uint32_t irq_handler_cap) {
-    return static_cast<int>(syscall(47, irq_handler_cap, 0, 0, 0, 0, 0));
+    return static_cast<int>(syscall(Syscall::IrqAck, irq_handler_cap, 0, 0, 0, 0, 0));
 }
 
 int sys_ioport_create(std::uint32_t parent_ioport_cap, std::uint16_t base_port, std::uint32_t port_count, std::uint32_t target_cspace, std::uint32_t target_slot) {
-    return static_cast<int>(syscall(20, parent_ioport_cap, base_port, port_count, target_cspace, target_slot, 0));
+    return static_cast<int>(syscall(Syscall::IOPortCreate, parent_ioport_cap, base_port, port_count, target_cspace, target_slot, 0));
 }
 
 std::uint64_t sys_ioport_read(std::uint32_t ioport_cap, std::uint16_t port, std::uint32_t width) {
-    return syscall(21, ioport_cap, port, width, 0, 0, 0);
+    return syscall(Syscall::IOPortIn, ioport_cap, port, width, 0, 0, 0);
 }
 
 int sys_ioport_write(std::uint32_t ioport_cap, std::uint16_t port, std::uint64_t value, std::uint32_t width) {
-    return static_cast<int>(syscall(22, ioport_cap, port, value, width, 0, 0));
+    return static_cast<int>(syscall(Syscall::IOPortOut, ioport_cap, port, value, width, 0, 0));
 }
 
 int sys_untyped_revoke(std::uint32_t untyped_cap) {
-    return static_cast<int>(syscall(24, untyped_cap, 0, 0, 0, 0, 0));
+    return static_cast<int>(syscall(Syscall::UntypedRetype, untyped_cap, 0, 0, 0, 0, 0));
 }
 
 int sys_cap_move(std::uint32_t dest_slot, std::uint32_t src_slot) {
-    return static_cast<int>(syscall(30, dest_slot, src_slot, 0, 0, 0, 0));
+    return static_cast<int>(syscall(Syscall::CapMove, dest_slot, src_slot, 0, 0, 0, 0));
 }
 
 int sys_cspace_cap_move(std::uint32_t target_cspace_cap, std::uint32_t target_slot, std::uint32_t src_slot) {
-    return static_cast<int>(syscall(31, target_cspace_cap, target_slot, src_slot, 0, 0, 0));
+    return static_cast<int>(syscall(Syscall::CapMoveRemote, target_cspace_cap, target_slot, src_slot, 0, 0, 0));
 }
 
 int sys_cap_copy(std::uint32_t dest_slot, std::uint32_t src_slot, std::uint32_t rights) {
-    return static_cast<int>(syscall(32, dest_slot, src_slot, rights, 0, 0, 0));
+    return static_cast<int>(syscall(Syscall::CapDerive, dest_slot, src_slot, rights, 0, 0, 0));
 }
 
 int sys_notification_signal(std::uint32_t notif_cap, std::uint64_t badge) {
-    return static_cast<int>(syscall(35, notif_cap, badge, 0, 0, 0, 0));
+    return static_cast<int>(syscall(Syscall::NotificationSignal, notif_cap, badge, 0, 0, 0, 0));
 }
 
 int sys_notification_wait(std::uint32_t notif_cap, std::uint64_t* out_badge) {
-    return static_cast<int>(syscall(36, notif_cap, reinterpret_cast<std::uint64_t>(out_badge), 0, 0, 0, 0));
+    return static_cast<int>(syscall(Syscall::NotificationWait, notif_cap, reinterpret_cast<std::uint64_t>(out_badge), 0, 0, 0, 0));
 }
 
 int sys_channel_bind_notification(std::uint32_t ep_cap, std::uint32_t notif_cap, std::uint64_t badge) {
-    return static_cast<int>(syscall(37, ep_cap, notif_cap, badge, 0, 0, 0));
+    return static_cast<int>(syscall(Syscall::ChannelBindNotification, ep_cap, notif_cap, badge, 0, 0, 0));
 }
 
 int sys_notification_poll(std::uint32_t notif_cap, std::uint64_t* out_badge) {
-    return static_cast<int>(syscall(38, notif_cap, reinterpret_cast<std::uint64_t>(out_badge), 0, 0, 0, 0));
+    return static_cast<int>(syscall(Syscall::NotificationPoll, notif_cap, reinterpret_cast<std::uint64_t>(out_badge), 0, 0, 0, 0));
 }
 
 int sys_notification_bind_parent(std::uint32_t child_notif_cap, std::uint32_t parent_notif_cap, std::uint64_t badge) {
-    return static_cast<int>(syscall(51, child_notif_cap, parent_notif_cap, badge, 0, 0, 0));
+    return static_cast<int>(syscall(Syscall::NotificationDelegate, child_notif_cap, parent_notif_cap, badge, 0, 0, 0));
 }
 
 int sys_notification_unbind_parent(std::uint32_t child_notif_cap) {
-    return static_cast<int>(syscall(52, child_notif_cap, 0, 0, 0, 0, 0));
+    return static_cast<int>(syscall(Syscall::NotificationUndelegate, child_notif_cap, 0, 0, 0, 0, 0));
 }
 
 int sys_tcb_cancel_ipc(std::uint32_t tcb_cap) {
-    return static_cast<int>(syscall(40, tcb_cap, 0, 0, 0, 0, 0));
+    return static_cast<int>(syscall(Syscall::TcbGetBudget, tcb_cap, 0, 0, 0, 0, 0)); // 40
 }
 
 int sys_tcb_get_cpu_time(std::uint32_t tcb_cap, std::uint64_t* out_cycles) {
-    return static_cast<int>(syscall(41, tcb_cap, reinterpret_cast<std::uint64_t>(out_cycles), 0, 0, 0, 0));
+    return static_cast<int>(syscall(Syscall::TcbGetConsumption, tcb_cap, reinterpret_cast<std::uint64_t>(out_cycles), 0, 0, 0, 0));
 }
 
 int sys_tcb_set_sched_notification(std::uint32_t tcb_cap, std::uint32_t notif_cap, std::uint64_t badge) {
-    return static_cast<int>(syscall(46, tcb_cap, notif_cap, badge, 0, 0, 0));
+    return static_cast<int>(syscall(Syscall::TcbSetTimeoutNotification, tcb_cap, notif_cap, badge, 0, 0, 0));
 }
 
 int sys_tcb_bind_baton(std::uint32_t tcb_cap, std::uint32_t baton_cap) {
-    return static_cast<int>(syscall(53, tcb_cap, baton_cap, 0, 0, 0, 0));
+    return static_cast<int>(syscall(Syscall::TcbBindBaton, tcb_cap, baton_cap, 0, 0, 0, 0));
 }
 
 int sys_baton_bind_notification(std::uint32_t baton_cap, std::uint32_t notif_cap, std::uint64_t badge) {
-    return static_cast<int>(syscall(54, baton_cap, notif_cap, badge, 0, 0, 0));
+    return static_cast<int>(syscall(Syscall::BatonSetTimeoutNotification, baton_cap, notif_cap, badge, 0, 0, 0));
 }
 
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wreturn-type-c-linkage"
 SchedResult sys_baton_switch(std::uint32_t target_baton_cap, std::uint64_t quantum_us) {
-    register std::uint64_t rax __asm__("rax") = 42;
+    register std::uint64_t rax __asm__("rax") = static_cast<std::uint64_t>(Syscall::BatonSwitch);
     register std::uint64_t rdi __asm__("rdi") = target_baton_cap;
     register std::uint64_t rsi __asm__("rsi") = quantum_us;
     register std::uint64_t rdx __asm__("rdx") = 0;
@@ -520,31 +518,31 @@ SchedResult sys_donate_time(std::uint32_t target_tcb_cap, std::uint64_t time_bud
 #pragma GCC diagnostic pop
 
 int sys_baton_inject(std::uint32_t target_baton_cap, std::uint64_t budget_us) {
-    return static_cast<int>(syscall(43, target_baton_cap, budget_us, 0, 0, 0, 0));
+    return static_cast<int>(syscall(Syscall::BatonInject, target_baton_cap, budget_us, 0, 0, 0, 0));
 }
 
 int sys_baton_set_budget(std::uint32_t baton_cap, std::uint64_t budget_us) {
-    return static_cast<int>(syscall(57, baton_cap, budget_us, 0, 0, 0, 0));
+    return static_cast<int>(syscall(Syscall::BatonSetBudget, baton_cap, budget_us, 0, 0, 0, 0));
 }
 
 int sys_baton_create_irq(std::uint32_t irq_control_cap, std::uint32_t untyped_cap, std::uint64_t initial_budget_us, std::uint32_t target_cspace, std::uint32_t target_slot) {
-    return static_cast<int>(syscall(56, irq_control_cap, untyped_cap, initial_budget_us, target_cspace, target_slot, 0));
+    return static_cast<int>(syscall(Syscall::BatonCreateIrq, irq_control_cap, untyped_cap, initial_budget_us, target_cspace, target_slot, 0));
 }
 
 int sys_thread_set_notification(std::uint32_t thread_cap, std::uint32_t notif_cap, std::uint64_t badge) {
-    return static_cast<int>(syscall(46, thread_cap, notif_cap, badge, 0, 0, 0));
+    return static_cast<int>(syscall(Syscall::TcbSetTimeoutNotification, thread_cap, notif_cap, badge, 0, 0, 0));
 }
 
 int sys_irq_wait(std::uint32_t irq_handler_cap, std::uint32_t irq_baton_cap) {
-    return static_cast<int>(syscall(50, irq_handler_cap, irq_baton_cap, 0, 0, 0, 0));
+    return static_cast<int>(syscall(Syscall::IrqWait, irq_handler_cap, irq_baton_cap, 0, 0, 0, 0));
 }
 
 int sys_irq_handler_set_notification(std::uint32_t irq_handler_cap, std::uint32_t notif_cap, std::uint64_t badge) {
-    return static_cast<int>(syscall(48, irq_handler_cap, notif_cap, badge, 0, 0, 0));
+    return static_cast<int>(syscall(Syscall::IrqBindNotification, irq_handler_cap, notif_cap, badge, 0, 0, 0));
 }
 
 int sys_tcb_get_id(std::uint32_t tcb_cap, std::uint64_t* out_id) {
-    return static_cast<int>(syscall(45, tcb_cap, reinterpret_cast<std::uint64_t>(out_id), 0, 0, 0, 0));
+    return static_cast<int>(syscall(Syscall::TcbGetId, tcb_cap, reinterpret_cast<std::uint64_t>(out_id), 0, 0, 0, 0));
 }
 
 } // extern "C"

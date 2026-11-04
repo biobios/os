@@ -1,5 +1,6 @@
 #pragma once
 
+#include <oz/CapabilityTypes.hpp>
 #include <cstdint>
 #include <cstddef>
 
@@ -9,150 +10,12 @@ class PageTableObject;
 struct Capability;
 void relocate_pagetable_links_on_move(Capability* dest, Capability* src);
 
-enum class CapRights : std::uint32_t {
-    NONE        = 0,
-
-    // Common Rights (bit 0..15)
-    DUPLICATE   = 1U << 0,
-    TRANSFER    = 1U << 1,
-    DERIVE      = 1U << 2,
-    REVOKE      = 1U << 3,
-
-    // Type Rights (bit 16..31)
-    READ        = 1U << 16,
-    RECEIVE     = 1U << 16,
-    WAIT        = 1U << 16,
-    CONFIGURE   = 1U << 16,
-    SWITCH      = 1U << 16,
-    IN          = 1U << 16,
-    INSERT      = 1U << 16,
-
-    WRITE       = 1U << 17,
-    SEND        = 1U << 17,
-    SIGNAL      = 1U << 17,
-    CONTROL     = 1U << 17,
-    OUT         = 1U << 17,
-    ACK_WAIT    = 1U << 17,
-    DELETE      = 1U << 17,
-
-    EXEC        = 1U << 18,
-    GRANT       = 1U << 18,
-    BIND        = 1U << 18,
-    SET_BUDGET  = 1U << 18,
-
-    NOCACHE     = 1U << 19,
-    GRANT_REPLY = 1U << 19,
-    DEBUG       = 1U << 19,
-
-    USE         = 1U << 4, // 互換用
-
-    ALL         = 0xFFFFFFFFU,
-};
-
-inline constexpr CapRights operator|(CapRights a, CapRights b) {
-    return static_cast<CapRights>(static_cast<std::uint32_t>(a) | static_cast<std::uint32_t>(b));
-}
-
-inline constexpr CapRights operator&(CapRights a, CapRights b) {
-    return static_cast<CapRights>(static_cast<std::uint32_t>(a) & static_cast<std::uint32_t>(b));
-}
-
-inline constexpr CapRights operator~(CapRights a) {
-    return static_cast<CapRights>(~static_cast<std::uint32_t>(a));
-}
-
-enum class CapType : std::uint8_t {
-    Null            = 0,
-    // カテゴリ A: インライン型 / KernelObject 不要型
-    UntypedMemory   = 1,
-    IOPort          = 2,
-    IRQBatonControl = 3,
-    IRQHandler      = 4,
-    Frame           = 5,
-    PageTable       = 6,
-    // カテゴリ B: KernelObject 参照型 (すべてデフォルト構築)
-    ChannelEndpoint = 7,
-    Notification    = 8,
-    Baton           = 9,
-    TCB             = 10,
-    CSpaceCap       = 11,
-    VSpace          = 12,
-};
-
-enum class ObjectType : std::uint8_t {
-    Unknown         = 0,
-    ChannelEndpoint = 1,
-    Frame           = 2,
-    UntypedMemory   = 3,
-    VSpace          = 4,
-    TCB             = 5,
-    CSpaceCap       = 6,
-    IRQHandler      = 7,
-    IOPort          = 8,
-    PageTable       = 9,
-    Notification    = 10,
-    Baton           = 11,
-    IRQBatonControl = 12,
-};
-
-inline constexpr CapType to_cap_type(ObjectType t) {
-    switch (t) {
-        case ObjectType::UntypedMemory:   return CapType::UntypedMemory;
-        case ObjectType::IOPort:          return CapType::IOPort;
-        case ObjectType::IRQBatonControl: return CapType::IRQBatonControl;
-        case ObjectType::IRQHandler:      return CapType::IRQHandler;
-        case ObjectType::Frame:           return CapType::Frame;
-        case ObjectType::PageTable:       return CapType::PageTable;
-        case ObjectType::ChannelEndpoint: return CapType::ChannelEndpoint;
-        case ObjectType::Notification:    return CapType::Notification;
-        case ObjectType::Baton:           return CapType::Baton;
-        case ObjectType::TCB:             return CapType::TCB;
-        case ObjectType::CSpaceCap:       return CapType::CSpaceCap;
-        case ObjectType::VSpace:          return CapType::VSpace;
-        default:                          return CapType::Null;
-    }
-}
-
-inline constexpr ObjectType to_object_type(CapType t) {
-    switch (t) {
-        case CapType::UntypedMemory:   return ObjectType::UntypedMemory;
-        case CapType::IOPort:          return ObjectType::IOPort;
-        case CapType::IRQBatonControl: return ObjectType::IRQBatonControl;
-        case CapType::IRQHandler:      return ObjectType::IRQHandler;
-        case CapType::Frame:           return ObjectType::Frame;
-        case CapType::PageTable:       return ObjectType::PageTable;
-        case CapType::ChannelEndpoint: return ObjectType::ChannelEndpoint;
-        case CapType::Notification:    return ObjectType::Notification;
-        case CapType::Baton:           return ObjectType::Baton;
-        case CapType::TCB:             return ObjectType::TCB;
-        case CapType::CSpaceCap:       return ObjectType::CSpaceCap;
-        case CapType::VSpace:          return ObjectType::VSpace;
-        default:                       return ObjectType::Unknown;
-    }
-}
-
-inline constexpr CapType to_cap_type(std::uint32_t val) {
-    if (val >= 1 && val <= 12) {
-        return to_cap_type(static_cast<ObjectType>(val));
-    }
-    return CapType::Null;
-}
-
 constexpr std::uint8_t SLOT_FLAG_HAS_KERNEL_OBJECT = 1 << 0;
 constexpr std::uint8_t SLOT_FLAG_IN_REVOKE         = 1 << 1;
 constexpr std::uint8_t SLOT_FLAG_PENDING_DELETE    = 1 << 2;
 constexpr std::uint8_t SLOT_FLAG_IS_MAPPED         = 1 << 3;
 constexpr std::uint8_t SLOT_FLAG_PT_BACKING        = 1 << 4;
 constexpr std::uint8_t SLOT_FLAG_ORIGINAL          = 1 << 5;
-
-struct CapInfo {
-    std::uint8_t  type{0};
-    std::uint8_t  level{0};
-    std::uint8_t  is_mapped{0};
-    std::uint8_t  padding{0};
-    std::uint32_t rights{0};
-    std::uint64_t size{0};
-};
 
 class KernelObject {
 protected:
@@ -361,138 +224,10 @@ public:
     bool has_rights(CapRights r) const { return slot_->has_rights(r); }
 };
 
-inline void cdt_insert_child(Capability* parent, Capability* child) {
-    if (!parent || !child) return;
-    child->cdt_parent       = parent;
-    child->cdt_next_child   = nullptr;
-    child->cdt_next_sibling = parent->cdt_next_child;
-    parent->cdt_next_child  = child;
-}
-
-inline bool cdt_move_slot(Capability* dest, Capability* src) {
-    if (!dest || !src || dest == src || !dest->is_null() || src->is_null()) {
-        return false;
-    }
-
-    for (int i = 0; i < 4; ++i) dest->data[i] = src->data[i];
-    dest->flags            = src->flags;
-    dest->cdt_parent       = src->cdt_parent;
-    dest->cdt_next_child   = src->cdt_next_child;
-    dest->cdt_next_sibling = src->cdt_next_sibling;
-
-    if (Capability* parent = dest->cdt_parent) {
-        if (parent->cdt_next_child == src) {
-            parent->cdt_next_child = dest;
-        } else {
-            Capability* prev = parent->cdt_next_child;
-            while (prev && prev->cdt_next_sibling != src) {
-                prev = prev->cdt_next_sibling;
-            }
-            if (prev) {
-                prev->cdt_next_sibling = dest;
-            }
-        }
-    }
-
-    for (Capability* c = dest->cdt_next_child; c != nullptr; c = c->cdt_next_sibling) {
-        c->cdt_parent = dest;
-    }
-
-    relocate_pagetable_links_on_move(dest, src);
-
-    src->clear_without_release();
-    return true;
-}
-
+void cdt_insert_child(Capability* parent, Capability* child);
+bool cdt_move_slot(Capability* dest, Capability* src);
+void cdt_remove_and_reparent(Capability* target);
 void cdt_revoke_subtree(Capability* root);
-
-inline void cdt_remove_and_reparent(Capability* target) {
-    if (!target || target->is_null()) return;
-
-    if (target->has_slot_flag(SLOT_FLAG_IN_REVOKE)) {
-        target->set_slot_flag(SLOT_FLAG_PENDING_DELETE);
-        return;
-    }
-
-    if (target->type() == CapType::UntypedMemory && target->cdt_next_child != nullptr) {
-        cdt_revoke_subtree(target);
-        if (target->is_null()) return;
-    }
-
-    Capability* parent = target->cdt_parent;
-    Capability* first_child = target->cdt_next_child;
-    Capability* last_child = nullptr;
-    for (Capability* c = first_child; c != nullptr; c = c->cdt_next_sibling) {
-        c->cdt_parent = parent;
-        last_child = c;
-    }
-
-    if (parent) {
-        if (parent->cdt_next_child == target) {
-            if (last_child) {
-                last_child->cdt_next_sibling = target->cdt_next_sibling;
-                parent->cdt_next_child = first_child;
-            } else {
-                parent->cdt_next_child = target->cdt_next_sibling;
-            }
-        } else {
-            Capability* prev = parent->cdt_next_child;
-            while (prev && prev->cdt_next_sibling != target) {
-                prev = prev->cdt_next_sibling;
-            }
-            if (prev) {
-                if (last_child) {
-                    last_child->cdt_next_sibling = target->cdt_next_sibling;
-                    prev->cdt_next_sibling = first_child;
-                } else {
-                    prev->cdt_next_sibling = target->cdt_next_sibling;
-                }
-            }
-        }
-    }
-
-    target->cdt_parent       = nullptr;
-    target->cdt_next_child   = nullptr;
-    target->cdt_next_sibling = nullptr;
-    target->release_and_clear();
-
-    if (parent && parent->type() == CapType::UntypedMemory && parent->cdt_next_child == nullptr) {
-        parent->set_untyped_watermark(0);
-    }
-}
-
-inline void cdt_revoke_subtree(Capability* root) {
-    if (!root || root->is_null()) return;
-
-    root->set_slot_flag(SLOT_FLAG_IN_REVOKE);
-
-    while (Capability* curr = root->cdt_next_child) {
-        while (curr->cdt_next_child != nullptr) {
-            curr = curr->cdt_next_child;
-        }
-        Capability* p = curr->cdt_parent;
-        p->cdt_next_child = curr->cdt_next_sibling;
-
-        curr->cdt_parent       = nullptr;
-        curr->cdt_next_sibling = nullptr;
-        if (curr->has_slot_flag(SLOT_FLAG_IN_REVOKE)) {
-            curr->set_slot_flag(SLOT_FLAG_PENDING_DELETE);
-        } else {
-            curr->release_and_clear();
-        }
-    }
-
-    if (root->type() == CapType::UntypedMemory) {
-        root->set_untyped_watermark(0);
-    }
-
-    root->clear_slot_flag(SLOT_FLAG_IN_REVOKE);
-
-    if (root->has_slot_flag(SLOT_FLAG_PENDING_DELETE)) {
-        root->clear_slot_flag(SLOT_FLAG_PENDING_DELETE);
-        cdt_remove_and_reparent(root);
-    }
-}
 
 // Helper functions to initialize capability slots
 inline void init_kernel_object_slot(Capability* slot, KernelObject* obj, CapRights rights, std::uint64_t badge = 0) {
@@ -576,20 +311,6 @@ inline void init_irq_handler_slot(Capability* slot, std::uint8_t vector, void* e
     CapRights r = CapRights::TRANSFER | CapRights::REVOKE | CapRights::BIND | CapRights::ACK_WAIT;
     slot->flags = static_cast<std::uint8_t>(CapType::IRQHandler)
                 | (static_cast<std::uint64_t>(r) << 32);
-}
-
-using CapID = std::uint32_t;
-constexpr CapID INVALID_CAP_ID = 0xFFFFFFFF;
-
-// Reserved slot range (slots 200..249: 50 slots):
-// Reserved for system use: slots 200..239 are reserved for system UntypedMemory pools and internal buffers,
-// and slots 240..249 are well-known capabilities (CAP_UNTYPED, CAP_BOOTINFO, CAP_SELF_CSPACE, etc.).
-// Dynamic user allocations avoid this range to prevent collision with system initialization.
-constexpr CapID CAP_RESERVED_SYSTEM_START = 200;
-constexpr CapID CAP_RESERVED_SYSTEM_END   = 249;
-
-inline bool is_reserved_system_slot(CapID slot) {
-    return (slot >= CAP_RESERVED_SYSTEM_START && slot <= CAP_RESERVED_SYSTEM_END);
 }
 
 class CSpace {

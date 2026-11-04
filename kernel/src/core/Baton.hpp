@@ -1,6 +1,7 @@
 #pragma once
 
 #include "core/Capability.hpp"
+#include <oz/SchedTypes.hpp>
 #include <cstdint>
 
 namespace oz {
@@ -10,14 +11,6 @@ class Notification;
 class IRQHandler;
 
 enum class ThreadState;
-
-enum class BatonState : std::uint8_t {
-    READY,        // アイドル状態。チェーン未所属
-    RUNNING,      // 現在 CPU を実行中 (委譲チェーンの末尾ノード)
-    WAIT_RETURN,  // 子へ委譲して待機中
-    WAIT_START,   // 上位タイムアウトにより分断・一時停止中 (フォワーディング対象)
-    BLOCKED       // IPCやI/O待機中
-};
 
 class Baton : public KernelObject {
 public:

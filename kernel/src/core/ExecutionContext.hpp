@@ -1,5 +1,7 @@
 #pragma once
 #include <cstdint>
+#include <oz/SchedTypes.hpp>
+#include <oz/ErrorCodes.hpp>
 #include "memory/IFrameManager.hpp"
 #include "memory/PageTable.hpp"
 #include "memory/Address.hpp"
@@ -33,31 +35,6 @@ enum class ThreadState {
     BlockedOnCall,
     BlockedOnReply,
     Dead
-};
-
-enum class SchedReason : std::uint64_t {
-    NONE      = 0,
-    TIMEOUT   = 1,
-    YIELD     = 2,
-    BLOCKED   = 3,
-    EXIT      = 4,
-    PREEMPTED = 5,
-    FAULT     = 6,
-    ORPHANED  = 7
-};
-
-constexpr SchedReason SYS_BATON_SWITCH_TIMEOUT = SchedReason::TIMEOUT;
-
-constexpr std::int64_t SYS_ERR_INVALID      = -1;
-constexpr std::int64_t SYS_ERR_WOULDBLOCK   = -2;
-constexpr std::int64_t SYS_ERR_CANCELLED    = -3;
-constexpr std::int64_t SYS_ERR_DEADLK       = -4;
-constexpr std::int64_t SYS_ERR_INVALID_TYPE = -5;
-constexpr std::int64_t SYS_ERR_BUSY         = -6;
-
-struct SchedResult {
-    SchedReason reason{SchedReason::NONE};
-    std::uint64_t consumed_cycles{0};
 };
 
 class ExecutionContext : public PhysicalAddressProvider {

@@ -11,13 +11,13 @@ namespace oz::io {
 class FileHandle {
 public:
     FileHandle() = default;
-    FileHandle(std::uint32_t slot, CapType type = CapType::STREAM)
+    FileHandle(std::uint32_t slot, StartupNodeType type = StartupNodeType::STREAM)
         : cap_slot_(slot), type_(type) {}
 
     static FileHandle from_role(CapRole role) {
         std::uint32_t slot = LocalNamespace::get_cap(role);
         if (slot == 0) return FileHandle{};
-        CapType type = LocalNamespace::get_cap_type(slot);
+        StartupNodeType type = LocalNamespace::get_cap_type(slot);
         return FileHandle{slot, type};
     }
 
@@ -25,11 +25,11 @@ public:
         if (!name) return FileHandle{};
         std::uint32_t slot = LocalNamespace::get_cap(name);
         if (slot == 0) return FileHandle{};
-        CapType type = LocalNamespace::get_cap_type(slot);
+        StartupNodeType type = LocalNamespace::get_cap_type(slot);
         return FileHandle{slot, type};
     }
 
-    static FileHandle from_slot(std::uint32_t slot, CapType type = CapType::STREAM) {
+    static FileHandle from_slot(std::uint32_t slot, StartupNodeType type = StartupNodeType::STREAM) {
         return FileHandle{slot, type};
     }
 
@@ -41,7 +41,7 @@ public:
         return cap_slot_;
     }
 
-    CapType type() const {
+    StartupNodeType type() const {
         return type_;
     }
 
@@ -51,7 +51,7 @@ public:
         char* dst = static_cast<char*>(buf);
         std::size_t total_read = 0;
 
-        if (type_ == CapType::FILE) {
+        if (type_ == StartupNodeType::FILE) {
             while (total_read < size) {
                 std::size_t want = size - total_read;
                 if (want > 24) want = 24;
@@ -114,7 +114,7 @@ public:
         const char* src = static_cast<const char*>(buf);
         std::size_t total_written = 0;
 
-        if (type_ == CapType::FILE) {
+        if (type_ == StartupNodeType::FILE) {
             while (total_written < size) {
                 std::size_t chunk = size - total_written;
                 if (chunk > 16) chunk = 16;
@@ -176,7 +176,7 @@ public:
     }
 
     std::size_t size() const {
-        if (!is_valid() || type_ != CapType::FILE) return 0;
+        if (!is_valid() || type_ != StartupNodeType::FILE) return 0;
         IPCMessage req{};
         req.data[0] = ipc::file_make_cmd(ipc::FileCmd::GET_SIZE);
         IPCMessage resp{};
@@ -186,7 +186,7 @@ public:
 
     void close() {
         if (!is_valid()) return;
-        if (type_ == CapType::FILE) {
+        if (type_ == StartupNodeType::FILE) {
             IPCMessage req{};
             req.data[0] = ipc::file_make_cmd(ipc::FileCmd::CLOSE);
             IPCMessage resp{};
@@ -197,19 +197,19 @@ public:
     }
 
 private:
-    std::uint32_t cap_slot_{0};
-    CapType       type_{CapType::STREAM};
+    std::uint32_t   cap_slot_{0};
+    StartupNodeType type_{StartupNodeType::STREAM};
 };
 
 // C-style helper functions
 inline std::size_t read_cap(std::uint32_t cap_slot, void* buf, std::size_t size) {
-    CapType type = LocalNamespace::get_cap_type(cap_slot);
+    StartupNodeType type = LocalNamespace::get_cap_type(cap_slot);
     FileHandle h(cap_slot, type);
     return h.read(buf, size);
 }
 
 inline std::size_t write_cap(std::uint32_t cap_slot, const void* buf, std::size_t size) {
-    CapType type = LocalNamespace::get_cap_type(cap_slot);
+    StartupNodeType type = LocalNamespace::get_cap_type(cap_slot);
     FileHandle h(cap_slot, type);
     return h.write(buf, size);
 }

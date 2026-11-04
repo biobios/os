@@ -12,6 +12,7 @@
 #include "core/Channel.hpp"
 #include "core/SavedInterruptFrame.hpp"
 #include "core/Scheduler.hpp"
+#include "core/KernelUtils.hpp"
 #include "utils/utils.hpp"
 
 namespace {
@@ -144,8 +145,8 @@ namespace{
         std::uint64_t rsp = regs[19];
 
         // If page fault from user space
-        if ((cs & 3) != 0 && oz::g_get_current_thread_func) {
-            Thread* current = oz::g_get_current_thread_func();
+        if ((cs & 3) != 0) {
+            Thread* current = oz::get_current_thread();
             if (current && current->fault_ep) {
                 ChannelEndpoint* ep = current->fault_ep;
                 ChannelEndpoint* peer = ep->get_peer();
@@ -185,9 +186,7 @@ namespace{
 
                         pager->state = ThreadState::Ready;
                         pager->is_blocked = false;
-                        if (oz::g_unblock_thread_func) {
-                            oz::g_unblock_thread_func(pager);
-                        }
+                        oz::unblock_thread(pager);
 
                         std::uint64_t now = oz::x86_64::rdtsc();
                         if (oz::g_scheduler_ptr) {
@@ -205,9 +204,7 @@ namespace{
                             peer->get_bound_notification()->signal(peer->get_bound_badge());
                         }
 
-                        if (oz::g_block_thread_func) {
-                            oz::g_block_thread_func();
-                        }
+                        oz::block_current_thread();
                         return;
                     }
                 }

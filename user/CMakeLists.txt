@@ -12,105 +12,104 @@ set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} ${COMMON_FLAGS}")
 set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} ${COMMON_FLAGS} -fno-exceptions -fno-rtti")
 
 include_directories(lib)
+if(DEFINED ozlib_SOURCE_DIR)
+    include_directories(${ozlib_SOURCE_DIR}/include)
+endif()
 
-# Syscall library
-add_library(oz_syscall STATIC lib/syscall.cpp)
+# Syscall & Slot Allocator library
+add_library(oz_syscall STATIC
+    lib/syscall.cpp
+    lib/malloc.cpp
+    lib/cspace_allocator.cpp
+)
+
+# Common font asset library
+add_library(oz_font STATIC
+    ${CMAKE_SOURCE_DIR}/common/src/Font.cpp
+)
+
+# Common user-space linker script and target helper
+set(USER_COMMON_LD "${CMAKE_CURRENT_SOURCE_DIR}/common.ld")
+
+function(oz_add_user_executable TARGET)
+    cmake_parse_arguments(ARG "" "" "SOURCES;LIBS" ${ARGN})
+    add_executable(${TARGET} ${ARG_SOURCES} "${USER_COMMON_LD}")
+    target_link_libraries(${TARGET} PRIVATE oz_syscall ${ARG_LIBS})
+    target_link_options(${TARGET} PRIVATE "-T${USER_COMMON_LD}" "-nostdlib" "-static")
+endfunction()
+
+# =============================================================================
+# User-space Daemons and Commands
+# =============================================================================
 
 # init process
-set(INIT_SRCS src/init/main.cpp src/init/linker.ld)
-
-add_executable(init ${INIT_SRCS})
-target_link_libraries(init oz_syscall)
-target_link_options(init PRIVATE "-T${CMAKE_CURRENT_SOURCE_DIR}/src/init/linker.ld" "-nostdlib" "-static")
-
-# Copy the built init.elf to assets so it will be included in the disk image
-
+oz_add_user_executable(init SOURCES src/init/main.cpp)
 
 # console process
-add_executable(console src/console/main.cpp src/console/linker.ld)
-target_link_libraries(console oz_syscall)
-target_link_options(console PRIVATE "-T${CMAKE_CURRENT_SOURCE_DIR}/src/console/linker.ld" "-nostdlib" "-static")
-
-
-
+oz_add_user_executable(console SOURCES src/console/main.cpp)
 
 # vfs process
-add_executable(vfs src/vfs/main.cpp src/vfs/VFS.cpp src/vfs/FAT32.cpp src/vfs/BufferCache.cpp src/vfs/linker.ld)
-target_link_libraries(vfs oz_syscall ozstd)
-target_include_directories(vfs PRIVATE ${CMAKE_SOURCE_DIR}/build/_deps/ozlib-src/include)
-target_link_options(vfs PRIVATE "-T${CMAKE_CURRENT_SOURCE_DIR}/src/vfs/linker.ld" "-nostdlib" "-static")
+oz_add_user_executable(vfs
+    SOURCES src/vfs/main.cpp src/vfs/VFS.cpp src/vfs/FAT32.cpp src/vfs/BufferCache.cpp
+    LIBS ozstd
+)
 
 # ahci process
-add_executable(ahci src/ahci/main.cpp src/ahci/AHCI.cpp src/ahci/linker.ld)
-target_link_libraries(ahci oz_syscall ozstd)
-target_include_directories(ahci PRIVATE ${CMAKE_SOURCE_DIR}/build/_deps/ozlib-src/include)
-target_link_options(ahci PRIVATE "-T${CMAKE_CURRENT_SOURCE_DIR}/src/ahci/linker.ld" "-nostdlib" "-static")
+oz_add_user_executable(ahci
+    SOURCES src/ahci/main.cpp src/ahci/AHCI.cpp
+    LIBS ozstd
+)
 
 # xhci process (USB host controller + keyboard driver)
-add_executable(xhci src/xhci/main.cpp src/xhci/xHCIDriver.cpp src/xhci/HIDKeyboard.cpp src/xhci/linker.ld)
-target_link_libraries(xhci oz_syscall)
-target_link_options(xhci PRIVATE "-T${CMAKE_CURRENT_SOURCE_DIR}/src/xhci/linker.ld" "-nostdlib" "-static")
+oz_add_user_executable(xhci
+    SOURCES src/xhci/main.cpp src/xhci/xHCIDriver.cpp src/xhci/HIDKeyboard.cpp
+)
 
 # display process (Display server / GUI compositor)
-add_executable(display src/display/main.cpp src/display/Font.cpp src/display/linker.ld)
-target_link_libraries(display oz_syscall)
-target_link_options(display PRIVATE "-T${CMAKE_CURRENT_SOURCE_DIR}/src/display/linker.ld" "-nostdlib" "-static")
+oz_add_user_executable(display
+    SOURCES src/display/main.cpp
+    LIBS oz_font
+)
 
 # shell process (Interactive shell)
-add_executable(shell src/shell/main.cpp src/display/Font.cpp src/shell/linker.ld)
-target_link_libraries(shell oz_syscall)
-target_link_options(shell PRIVATE "-T${CMAKE_CURRENT_SOURCE_DIR}/src/shell/linker.ld" "-nostdlib" "-static")
+oz_add_user_executable(shell
+    SOURCES src/shell/main.cpp
+    LIBS oz_font
+)
 
-# manifest_test process (Verification of Step 2: Local Namespace & Manifest Sandboxing)
-add_executable(manifest_test src/manifest_test/main.cpp src/manifest_test/linker.ld)
-target_link_libraries(manifest_test oz_syscall)
-target_link_options(manifest_test PRIVATE "-T${CMAKE_CURRENT_SOURCE_DIR}/src/manifest_test/linker.ld" "-nostdlib" "-static")
+# manifest_test process (Local Namespace & Manifest Sandboxing)
+oz_add_user_executable(manifest_test SOURCES src/manifest_test/main.cpp)
 
 # cat process (Sandboxed CLI reader)
-add_executable(cat src/cat/main.cpp src/cat/linker.ld)
-target_link_libraries(cat oz_syscall)
-target_link_options(cat PRIVATE "-T${CMAKE_CURRENT_SOURCE_DIR}/src/cat/linker.ld" "-nostdlib" "-static")
+oz_add_user_executable(cat SOURCES src/cat/main.cpp)
 
 # head process (Sandboxed CLI head)
-add_executable(head src/head/main.cpp src/head/linker.ld)
-target_link_libraries(head oz_syscall)
-target_link_options(head PRIVATE "-T${CMAKE_CURRENT_SOURCE_DIR}/src/head/linker.ld" "-nostdlib" "-static")
+oz_add_user_executable(head SOURCES src/head/main.cpp)
 
 # memman process (Memory Manager)
-add_executable(memman src/memman/main.cpp src/memman/linker.ld)
-target_link_libraries(memman oz_syscall)
-target_link_options(memman PRIVATE "-T${CMAKE_CURRENT_SOURCE_DIR}/src/memman/linker.ld" "-nostdlib" "-static")
+oz_add_user_executable(memman SOURCES src/memman/main.cpp)
 
 # drivman process (Device Manager)
-add_executable(drivman src/drivman/main.cpp src/drivman/linker.ld)
-target_link_libraries(drivman oz_syscall)
-target_link_options(drivman PRIVATE "-T${CMAKE_CURRENT_SOURCE_DIR}/src/drivman/linker.ld" "-nostdlib" "-static")
+oz_add_user_executable(drivman SOURCES src/drivman/main.cpp)
 
 # procman process (Process Manager)
-add_executable(procman src/procman/main.cpp src/procman/linker.ld)
-target_link_libraries(procman oz_syscall)
-target_link_options(procman PRIVATE "-T${CMAKE_CURRENT_SOURCE_DIR}/src/procman/linker.ld" "-nostdlib" "-static")
+oz_add_user_executable(procman SOURCES src/procman/main.cpp)
 
 # wm process (Tiling Window Manager)
-add_executable(wm src/wm/main.cpp src/display/Font.cpp src/wm/linker.ld)
-target_link_libraries(wm oz_syscall)
-target_link_options(wm PRIVATE "-T${CMAKE_CURRENT_SOURCE_DIR}/src/wm/linker.ld" "-nostdlib" "-static")
+oz_add_user_executable(wm
+    SOURCES src/wm/main.cpp
+    LIBS oz_font
+)
 
 # sched process (User-space Scheduler Daemon)
-add_executable(sched src/sched/main.cpp src/sched/linker.ld)
-target_link_libraries(sched oz_syscall)
-target_link_options(sched PRIVATE "-T${CMAKE_CURRENT_SOURCE_DIR}/src/sched/linker.ld" "-nostdlib" "-static")
+oz_add_user_executable(sched SOURCES src/sched/main.cpp)
 
 # =============================================================================
 # Standalone Subsystem Test Runners
 # =============================================================================
-set(TEST_LINKER_SCRIPT "${CMAKE_CURRENT_SOURCE_DIR}/tests/common/linker.ld")
 
 # 1. ktest (Kernel Core Tests)
-add_executable(ktest tests/ktest/main.cpp tests/common/linker.ld)
-target_link_libraries(ktest oz_syscall)
-target_link_options(ktest PRIVATE "-T${TEST_LINKER_SCRIPT}" "-nostdlib" "-static")
-
+oz_add_user_executable(ktest SOURCES tests/ktest/main.cpp)
 add_custom_target(initrd_ktest
     COMMAND ${CMAKE_COMMAND} -E make_directory ${CMAKE_CURRENT_BINARY_DIR}/pack_ktest
     COMMAND ${CMAKE_COMMAND} -E copy $<TARGET_FILE:ktest> ${CMAKE_CURRENT_BINARY_DIR}/pack_ktest/init
@@ -121,10 +120,7 @@ add_custom_target(initrd_ktest
 )
 
 # 2. stest (Scheduler & Radix-64 Notification Tests)
-add_executable(stest tests/stest/main.cpp tests/common/linker.ld)
-target_link_libraries(stest oz_syscall)
-target_link_options(stest PRIVATE "-T${TEST_LINKER_SCRIPT}" "-nostdlib" "-static")
-
+oz_add_user_executable(stest SOURCES tests/stest/main.cpp)
 add_custom_target(initrd_stest
     COMMAND ${CMAKE_COMMAND} -E make_directory ${CMAKE_CURRENT_BINARY_DIR}/pack_stest
     COMMAND ${CMAKE_COMMAND} -E copy $<TARGET_FILE:stest> ${CMAKE_CURRENT_BINARY_DIR}/pack_stest/init
@@ -136,10 +132,7 @@ add_custom_target(initrd_stest
 )
 
 # 3. vtest (VFS & Storage Tests)
-add_executable(vtest tests/vtest/main.cpp tests/common/linker.ld)
-target_link_libraries(vtest oz_syscall)
-target_link_options(vtest PRIVATE "-T${TEST_LINKER_SCRIPT}" "-nostdlib" "-static")
-
+oz_add_user_executable(vtest SOURCES tests/vtest/main.cpp)
 add_custom_target(initrd_vtest
     COMMAND ${CMAKE_COMMAND} -E make_directory ${CMAKE_CURRENT_BINARY_DIR}/pack_vtest
     COMMAND ${CMAKE_COMMAND} -E copy $<TARGET_FILE:vtest> ${CMAKE_CURRENT_BINARY_DIR}/pack_vtest/init
@@ -152,10 +145,7 @@ add_custom_target(initrd_vtest
 )
 
 # 4. guitest (Display & WM GUI Tests)
-add_executable(guitest tests/guitest/main.cpp tests/common/linker.ld)
-target_link_libraries(guitest oz_syscall)
-target_link_options(guitest PRIVATE "-T${TEST_LINKER_SCRIPT}" "-nostdlib" "-static")
-
+oz_add_user_executable(guitest SOURCES tests/guitest/main.cpp)
 add_custom_target(initrd_guitest
     COMMAND ${CMAKE_COMMAND} -E make_directory ${CMAKE_CURRENT_BINARY_DIR}/pack_guitest
     COMMAND ${CMAKE_COMMAND} -E copy $<TARGET_FILE:guitest> ${CMAKE_CURRENT_BINARY_DIR}/pack_guitest/init
@@ -168,10 +158,7 @@ add_custom_target(initrd_guitest
 )
 
 # 5. xhcitest (xHCI Driver & Keyboard Tests)
-add_executable(xhcitest tests/xhcitest/main.cpp tests/common/linker.ld)
-target_link_libraries(xhcitest oz_syscall)
-target_link_options(xhcitest PRIVATE "-T${TEST_LINKER_SCRIPT}" "-nostdlib" "-static")
-
+oz_add_user_executable(xhcitest SOURCES tests/xhcitest/main.cpp)
 add_custom_target(initrd_xhcitest
     COMMAND ${CMAKE_COMMAND} -E make_directory ${CMAKE_CURRENT_BINARY_DIR}/pack_xhcitest
     COMMAND ${CMAKE_COMMAND} -E copy $<TARGET_FILE:xhcitest> ${CMAKE_CURRENT_BINARY_DIR}/pack_xhcitest/init
@@ -183,10 +170,7 @@ add_custom_target(initrd_xhcitest
 )
 
 # 6. sandboxtest (Manifest & Sandboxing Tests)
-add_executable(sandboxtest tests/sandboxtest/main.cpp tests/common/linker.ld)
-target_link_libraries(sandboxtest oz_syscall)
-target_link_options(sandboxtest PRIVATE "-T${TEST_LINKER_SCRIPT}" "-nostdlib" "-static")
-
+oz_add_user_executable(sandboxtest SOURCES tests/sandboxtest/main.cpp)
 add_custom_target(initrd_sandboxtest
     COMMAND ${CMAKE_COMMAND} -E make_directory ${CMAKE_CURRENT_BINARY_DIR}/pack_sandboxtest
     COMMAND ${CMAKE_COMMAND} -E copy $<TARGET_FILE:sandboxtest> ${CMAKE_CURRENT_BINARY_DIR}/pack_sandboxtest/init
@@ -199,10 +183,7 @@ add_custom_target(initrd_sandboxtest
 )
 
 # 7. ptest (Process & Memory Manager Tests)
-add_executable(ptest tests/ptest/main.cpp tests/common/linker.ld)
-target_link_libraries(ptest oz_syscall)
-target_link_options(ptest PRIVATE "-T${TEST_LINKER_SCRIPT}" "-nostdlib" "-static")
-
+oz_add_user_executable(ptest SOURCES tests/ptest/main.cpp)
 add_custom_target(initrd_ptest
     COMMAND ${CMAKE_COMMAND} -E make_directory ${CMAKE_CURRENT_BINARY_DIR}/pack_ptest
     COMMAND ${CMAKE_COMMAND} -E copy $<TARGET_FILE:ptest> ${CMAKE_CURRENT_BINARY_DIR}/pack_ptest/init
@@ -214,11 +195,11 @@ add_custom_target(initrd_ptest
     VERBATIM
 )
 
+# =============================================================================
+# Full Distribution InitRD Image
+# =============================================================================
 add_custom_target(initrd ALL
     COMMAND tar -cvf ${CMAKE_SOURCE_DIR}/assets/initrd.tar -C ${CMAKE_CURRENT_BINARY_DIR} init console vfs ahci xhci display shell manifest_test cat head memman drivman procman wm sched
     COMMAND cp ${CMAKE_CURRENT_BINARY_DIR}/shell ${CMAKE_CURRENT_BINARY_DIR}/manifest_test ${CMAKE_CURRENT_BINARY_DIR}/cat ${CMAKE_CURRENT_BINARY_DIR}/head ${CMAKE_SOURCE_DIR}/assets/
     DEPENDS init console vfs ahci xhci display shell manifest_test cat head memman drivman procman wm sched
 )
-target_sources(oz_syscall PRIVATE lib/malloc.cpp)
-
-

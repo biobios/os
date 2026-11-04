@@ -1,5 +1,7 @@
 #pragma once
 #include <cstdint>
+#include <oz/CapabilityTypes.hpp>
+#include <oz/IPCProtocol.hpp>
 
 namespace oz {
 namespace ipc {
@@ -273,6 +275,225 @@ enum class SchedCmd : std::uint64_t {
                               // Resp: data[0] = status
     CREATE_BATON         = 6, // data[1] = priority, data[2] = budget_us
                               // Resp: data[0] = status, transferred_cap = Baton Cap
+};
+
+// ===== Type-safe IPC Marshalling Helpers (Refactoring Proposal 11) =====
+
+// Block Device
+struct BlockReadReq {
+    std::uint64_t lba;
+    std::uint64_t count;
+    std::uint64_t phys_buf;
+
+    IPCMessage encode() const {
+        IPCMessage msg{};
+        msg.data[0] = static_cast<std::uint64_t>(BlockCmd::READ);
+        msg.data[1] = lba;
+        msg.data[2] = count;
+        msg.data[3] = phys_buf;
+        return msg;
+    }
+    static BlockReadReq decode(const IPCMessage& msg) {
+        return {msg.data[1], msg.data[2], msg.data[3]};
+    }
+};
+
+struct BlockWriteReq {
+    std::uint64_t lba;
+    std::uint64_t count;
+    std::uint64_t phys_buf;
+
+    IPCMessage encode() const {
+        IPCMessage msg{};
+        msg.data[0] = static_cast<std::uint64_t>(BlockCmd::WRITE);
+        msg.data[1] = lba;
+        msg.data[2] = count;
+        msg.data[3] = phys_buf;
+        return msg;
+    }
+    static BlockWriteReq decode(const IPCMessage& msg) {
+        return {msg.data[1], msg.data[2], msg.data[3]};
+    }
+};
+
+struct BlockResponse {
+    std::uint64_t status;
+    std::uint64_t info;
+
+    IPCMessage encode() const {
+        IPCMessage msg{};
+        msg.data[0] = status;
+        msg.data[1] = info;
+        return msg;
+    }
+    static BlockResponse decode(const IPCMessage& msg) {
+        return {msg.data[0], msg.data[1]};
+    }
+};
+
+// Memory Manager
+struct MemAllocReq {
+    std::uint64_t size_bytes;
+
+    IPCMessage encode() const {
+        IPCMessage msg{};
+        msg.data[0] = static_cast<std::uint64_t>(MemCmd::ALLOC_UNTYPED);
+        msg.data[1] = size_bytes;
+        return msg;
+    }
+    static MemAllocReq decode(const IPCMessage& msg) {
+        return {msg.data[1]};
+    }
+};
+
+struct MemAllocResp {
+    std::uint64_t status;
+    CapID untyped_cap;
+
+    IPCMessage encode() const {
+        IPCMessage msg{};
+        msg.data[0] = status;
+        msg.has_cap = (untyped_cap != 0 && untyped_cap != INVALID_CAP_ID);
+        msg.transferred_cap = untyped_cap;
+        return msg;
+    }
+    static MemAllocResp decode(const IPCMessage& msg) {
+        return {msg.data[0], msg.has_cap ? msg.transferred_cap : 0};
+    }
+};
+
+struct MemRevokeReq {
+    CapID untyped_cap;
+
+    IPCMessage encode() const {
+        IPCMessage msg{};
+        msg.data[0] = static_cast<std::uint64_t>(MemCmd::REVOKE_UNTYPED);
+        msg.has_cap = (untyped_cap != 0 && untyped_cap != INVALID_CAP_ID);
+        msg.transferred_cap = untyped_cap;
+        return msg;
+    }
+    static MemRevokeReq decode(const IPCMessage& msg) {
+        return {msg.has_cap ? msg.transferred_cap : 0};
+    }
+};
+
+struct MemInfoResp {
+    std::uint64_t total_bytes;
+    std::uint64_t free_bytes;
+
+    IPCMessage encode() const {
+        IPCMessage msg{};
+        msg.data[0] = 0;
+        msg.data[1] = total_bytes;
+        msg.data[2] = free_bytes;
+        return msg;
+    }
+    static MemInfoResp decode(const IPCMessage& msg) {
+        return {msg.data[1], msg.data[2]};
+    }
+};
+
+// Process Manager
+struct ProcCreatePipeResp {
+    std::uint64_t status;
+    CapID write_cap;
+    CapID read_cap;
+
+    IPCMessage encode() const {
+        IPCMessage msg{};
+        msg.data[0] = status;
+        msg.data[1] = write_cap;
+        msg.has_cap = (read_cap != 0 && read_cap != INVALID_CAP_ID);
+        msg.transferred_cap = read_cap;
+        return msg;
+    }
+    static ProcCreatePipeResp decode(const IPCMessage& msg) {
+        return {msg.data[0], static_cast<CapID>(msg.data[1]), msg.has_cap ? msg.transferred_cap : 0};
+    }
+};
+
+struct ProcWaitReq {
+    std::uint64_t pid;
+
+    IPCMessage encode() const {
+        IPCMessage msg{};
+        msg.data[0] = static_cast<std::uint64_t>(ProcCmd::WAIT);
+        msg.data[1] = pid;
+        return msg;
+    }
+    static ProcWaitReq decode(const IPCMessage& msg) {
+        return {msg.data[1]};
+    }
+};
+
+struct ProcWaitResp {
+    std::uint64_t status;
+    std::uint64_t exit_code;
+
+    IPCMessage encode() const {
+        IPCMessage msg{};
+        msg.data[0] = status;
+        msg.data[1] = exit_code;
+        return msg;
+    }
+    static ProcWaitResp decode(const IPCMessage& msg) {
+        return {msg.data[0], msg.data[1]};
+    }
+};
+
+// Window Manager Events
+struct WMEventMsg {
+    WMEventType type;
+    std::uint64_t arg1;
+    std::uint64_t arg2;
+    std::uint64_t arg3;
+
+    IPCMessage encode() const {
+        IPCMessage msg{};
+        msg.data[0] = static_cast<std::uint64_t>(type);
+        msg.data[1] = arg1;
+        msg.data[2] = arg2;
+        msg.data[3] = arg3;
+        return msg;
+    }
+    static WMEventMsg decode(const IPCMessage& msg) {
+        return {static_cast<WMEventType>(msg.data[0]), msg.data[1], msg.data[2], msg.data[3]};
+    }
+};
+
+// File Protocol
+struct FileReadReq {
+    std::uint32_t size;
+    std::uint64_t offset;
+
+    IPCMessage encode() const {
+        IPCMessage msg{};
+        msg.data[0] = file_make_cmd(FileCmd::READ, size);
+        msg.data[1] = offset;
+        return msg;
+    }
+    static FileReadReq decode(const IPCMessage& msg) {
+        return {file_get_len(msg.data[0]), msg.data[1]};
+    }
+};
+
+struct FileWriteReq {
+    std::uint32_t size;
+    std::uint64_t offset;
+    std::uint64_t payload0;
+    std::uint64_t payload1;
+
+    IPCMessage encode() const {
+        IPCMessage msg{};
+        msg.data[0] = file_make_cmd(FileCmd::WRITE, size);
+        msg.data[1] = offset;
+        msg.data[2] = payload0;
+        msg.data[3] = payload1;
+        return msg;
+    }
+    static FileWriteReq decode(const IPCMessage& msg) {
+        return {file_get_len(msg.data[0]), msg.data[1], msg.data[2], msg.data[3]};
+    }
 };
 
 } // namespace ipc

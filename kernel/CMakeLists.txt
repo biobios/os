@@ -22,6 +22,7 @@ file(GLOB_RECURSE KERNEL_SOURCES CONFIGURE_DEPENDS
 
 add_executable(kernel
     ${KERNEL_SOURCES}
+    ${CMAKE_SOURCE_DIR}/common/src/Font.cpp
 )
 
 set_target_properties(kernel PROPERTIES

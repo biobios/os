@@ -6,13 +6,12 @@
 #include "core/IRQHandler.hpp"
 #include "core/Scheduler.hpp"
 #include "core/CartesianTree.hpp"
+#include "core/KernelUtils.hpp"
 #include "utils/utils.hpp"
 
 namespace oz {
 
 Thread* g_current_irq_thread = nullptr;
-
-extern void (*g_unblock_thread_func)(Thread*);
 
 static constexpr std::size_t MAX_GLOBAL_THREADS = 512;
 static Thread* s_thread_registry[MAX_GLOBAL_THREADS]{};
@@ -221,9 +220,7 @@ bool Thread::cancel_ipc() {
     }
     ipc_cancelled = true;
     state = ThreadState::Ready;
-    if (g_unblock_thread_func) {
-        g_unblock_thread_func(this);
-    }
+    oz::unblock_thread(this);
     return true;
 }
 

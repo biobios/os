@@ -297,16 +297,16 @@ static void check_dag_spawn() {
             oz::ProcessStartupInfo startup_info{};
 
             if (has_manifest && manifest.requires_service(oz::ServiceId::CONSOLE)) {
-                startup_info.alloc_and_add_cap(oz::CapRole::STDOUT, "stdout", oz::CapType::STREAM);
+                startup_info.alloc_and_add_cap(oz::CapRole::STDOUT, "stdout", oz::StartupNodeType::STREAM);
             }
             if (has_manifest && manifest.requires_service(oz::ServiceId::DISPLAY)) {
-                startup_info.alloc_and_add_cap(oz::CapRole::DISPLAY, "display", oz::CapType::STREAM);
+                startup_info.alloc_and_add_cap(oz::CapRole::DISPLAY, "display", oz::StartupNodeType::STREAM);
             }
             if (has_manifest && manifest.requires_service(oz::ServiceId::WM)) {
-                startup_info.alloc_and_add_cap(oz::CapRole::WM, "wm", oz::CapType::STREAM);
+                startup_info.alloc_and_add_cap(oz::CapRole::WM, "wm", oz::StartupNodeType::STREAM);
             }
             if (has_manifest && manifest.requires_service(oz::ServiceId::VFS_ROOT)) {
-                startup_info.alloc_and_add_cap(oz::CapRole::ROOT_DIR, "/", oz::CapType::DIR);
+                startup_info.alloc_and_add_cap(oz::CapRole::ROOT_DIR, "/", oz::StartupNodeType::DIR);
             }
 
             auto proc = oz::loader::spawn_process(
@@ -377,7 +377,7 @@ static void check_dag_spawn() {
             if (tcb_copy_slot != oz::INVALID_CAP_ID) {
                 if (oz::sys_cap_copy(tcb_copy_slot, proc.tcb_cap, static_cast<std::uint32_t>(oz::CapRights::ALL)) == 0) {
                     oz::IPCMessage reg_msg{};
-                    reg_msg.data[0] = static_cast<uint64_t>(oz::ipc::SchedCmd::REGISTER_THREAD);
+                    reg_msg.data[0] = static_cast<std::uint64_t>(oz::ipc::SchedCmd::REGISTER_THREAD);
                     reg_msg.data[1] = 1;
                     reg_msg.data[2] = 10000;
                     reg_msg.has_cap = true;
@@ -455,19 +455,19 @@ static int handle_spawn_driver(const char* raw_path, std::uint32_t dev_id, std::
 
     oz::ProcessStartupInfo startup_info{};
 
-    std::uint32_t dm_slot = startup_info.alloc_and_add_cap(oz::CapRole::DRIVMAN, "drivman", oz::CapType::STREAM);
+    std::uint32_t dm_slot = startup_info.alloc_and_add_cap(oz::CapRole::DRIVMAN, "drivman", oz::StartupNodeType::STREAM);
 
     if (has_manifest && manifest.requires_service(oz::ServiceId::CONSOLE)) {
-        startup_info.alloc_and_add_cap(oz::CapRole::STDOUT, "stdout", oz::CapType::STREAM);
+        startup_info.alloc_and_add_cap(oz::CapRole::STDOUT, "stdout", oz::StartupNodeType::STREAM);
     }
     if (has_manifest && manifest.requires_service(oz::ServiceId::DISPLAY)) {
-        startup_info.alloc_and_add_cap(oz::CapRole::DISPLAY, "display", oz::CapType::STREAM);
+        startup_info.alloc_and_add_cap(oz::CapRole::DISPLAY, "display", oz::StartupNodeType::STREAM);
     }
     if (has_manifest && manifest.requires_service(oz::ServiceId::WM)) {
-        startup_info.alloc_and_add_cap(oz::CapRole::WM, "wm", oz::CapType::STREAM);
+        startup_info.alloc_and_add_cap(oz::CapRole::WM, "wm", oz::StartupNodeType::STREAM);
     }
     if (has_manifest && manifest.requires_service(oz::ServiceId::VFS_ROOT)) {
-        startup_info.alloc_and_add_cap(oz::CapRole::ROOT_DIR, "/", oz::CapType::DIR);
+        startup_info.alloc_and_add_cap(oz::CapRole::ROOT_DIR, "/", oz::StartupNodeType::DIR);
     }
 
     auto proc = oz::loader::spawn_process(
@@ -556,7 +556,7 @@ static int handle_spawn_driver(const char* raw_path, std::uint32_t dev_id, std::
         if (tcb_copy_slot != oz::INVALID_CAP_ID) {
             if (oz::sys_cap_copy(tcb_copy_slot, proc.tcb_cap, static_cast<std::uint32_t>(oz::CapRights::ALL)) == 0) {
                 oz::IPCMessage reg_msg{};
-                reg_msg.data[0] = static_cast<uint64_t>(oz::ipc::SchedCmd::REGISTER_THREAD);
+                reg_msg.data[0] = static_cast<std::uint64_t>(oz::ipc::SchedCmd::REGISTER_THREAD);
                 reg_msg.data[1] = 1;
                 reg_msg.data[2] = 10000;
                 reg_msg.has_cap = true;
@@ -821,7 +821,7 @@ OZ_PROCESS_ENTRY() {
             std::uint32_t child_stdin_slot = 0;
             if (g_session.stdin_cap != 0) {
                 child_stdin_slot = next_slot++;
-                g_session.startup_info.add_cap(child_stdin_slot, oz::CapRole::STDIN, "stdin", oz::CapType::STREAM);
+                g_session.startup_info.add_cap(child_stdin_slot, oz::CapRole::STDIN, "stdin", oz::StartupNodeType::STREAM);
             }
 
             // STDOUT
@@ -830,38 +830,38 @@ OZ_PROCESS_ENTRY() {
             if (g_session.stdout_cap != 0) {
                 child_stdout_slot = next_slot++;
                 actual_stdout_cap = g_session.stdout_cap;
-                g_session.startup_info.add_cap(child_stdout_slot, oz::CapRole::STDOUT, "stdout", oz::CapType::STREAM);
+                g_session.startup_info.add_cap(child_stdout_slot, oz::CapRole::STDOUT, "stdout", oz::StartupNodeType::STREAM);
             } else if (has_manifest && manifest.requires_service(oz::ServiceId::CONSOLE)) {
                 child_stdout_slot = next_slot++;
                 actual_stdout_cap = CAP_CONSOLE_WRITE;
-                g_session.startup_info.add_cap(child_stdout_slot, oz::CapRole::STDOUT, "stdout", oz::CapType::STREAM);
+                g_session.startup_info.add_cap(child_stdout_slot, oz::CapRole::STDOUT, "stdout", oz::StartupNodeType::STREAM);
             }
 
             // WM
             std::uint32_t child_wm_slot = 0;
             if (has_manifest && manifest.requires_service(oz::ServiceId::WM)) {
                 child_wm_slot = next_slot++;
-                g_session.startup_info.add_cap(child_wm_slot, oz::CapRole::WM, "wm", oz::CapType::STREAM);
+                g_session.startup_info.add_cap(child_wm_slot, oz::CapRole::WM, "wm", oz::StartupNodeType::STREAM);
             }
 
             // Display
             std::uint32_t child_display_slot = 0;
             if (has_manifest && manifest.requires_service(oz::ServiceId::DISPLAY)) {
                 child_display_slot = next_slot++;
-                g_session.startup_info.add_cap(child_display_slot, oz::CapRole::DISPLAY, "display", oz::CapType::STREAM);
+                g_session.startup_info.add_cap(child_display_slot, oz::CapRole::DISPLAY, "display", oz::StartupNodeType::STREAM);
             }
 
             // VFS Root
             std::uint32_t child_vfs_slot = 0;
             if (has_manifest && manifest.requires_service(oz::ServiceId::VFS_ROOT)) {
                 child_vfs_slot = next_slot++;
-                g_session.startup_info.add_cap(child_vfs_slot, oz::CapRole::ROOT_DIR, "/", oz::CapType::DIR);
+                g_session.startup_info.add_cap(child_vfs_slot, oz::CapRole::ROOT_DIR, "/", oz::StartupNodeType::DIR);
             }
 
             // Delegated Caps
             for (std::size_t d = 0; d < g_session.num_delegated; ++d) {
                 std::uint32_t slot = next_slot++;
-                g_session.startup_info.add_cap(slot, oz::CapRole::CUSTOM, g_session.delegated[d].name, oz::CapType::FILE);
+                g_session.startup_info.add_cap(slot, oz::CapRole::CUSTOM, g_session.delegated[d].name, oz::StartupNodeType::FILE);
             }
 
             // 5. Spawn Process
@@ -949,7 +949,7 @@ OZ_PROCESS_ENTRY() {
                 if (s_tcb_slot != oz::INVALID_CAP_ID) {
                     if (oz::sys_cap_copy(s_tcb_slot, proc.tcb_cap, static_cast<std::uint32_t>(oz::CapRights::ALL)) == 0) {
                         oz::IPCMessage reg_msg{};
-                        reg_msg.data[0] = static_cast<uint64_t>(oz::ipc::SchedCmd::REGISTER_THREAD);
+                        reg_msg.data[0] = static_cast<std::uint64_t>(oz::ipc::SchedCmd::REGISTER_THREAD);
                         reg_msg.data[1] = 1;
                         reg_msg.data[2] = 10000;
                         reg_msg.has_cap = true;

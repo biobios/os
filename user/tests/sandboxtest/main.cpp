@@ -103,8 +103,8 @@ static void run_cat_sandboxing_tests(const std::uint8_t* initrd_ptr, std::uint64
     oz::sys_channel_create(oz::CAP_UNTYPED, &dummy_file_send, &dummy_file_recv);
 
     oz::ProcessStartupInfo cat_startup{};
-    cat_startup.add_cap(1, oz::CapRole::STDOUT, "stdout", oz::CapType::STREAM);
-    cat_startup.add_cap(2, oz::CapRole::CUSTOM, "test.txt", oz::CapType::FILE);
+    cat_startup.add_cap(1, oz::CapRole::STDOUT, "stdout", oz::StartupNodeType::STREAM);
+    cat_startup.add_cap(2, oz::CapRole::CUSTOM, "test.txt", oz::StartupNodeType::FILE);
     cat_startup.add_arg("cat");
     cat_startup.add_arg("test.txt");
 

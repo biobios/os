@@ -183,9 +183,9 @@ extern "C" void _start() {
     }
 
     oz::ProcessStartupInfo procman_startup_info{};
-    procman_startup_info.add_cap(6, oz::CapRole::ROOT_DIR, "/", oz::CapType::DIR);
-    procman_startup_info.add_cap(11, oz::CapRole::DRIVMAN, "drivman", oz::CapType::STREAM);
-    procman_startup_info.add_cap(12, oz::CapRole::CUSTOM, "sched", oz::CapType::STREAM);
+    procman_startup_info.add_cap(6, oz::CapRole::ROOT_DIR, "/", oz::StartupNodeType::DIR);
+    procman_startup_info.add_cap(11, oz::CapRole::DRIVMAN, "drivman", oz::StartupNodeType::STREAM);
+    procman_startup_info.add_cap(12, oz::CapRole::CUSTOM, "sched", oz::StartupNodeType::STREAM);
 
     auto procman_proc = oz::loader::spawn_process(
         oz::CAP_UNTYPED, oz::CAP_SELF_VSPACE,

@@ -1,4 +1,4 @@
-#include "graphics/Font.hpp"
+#include <oz/Font.hpp>
 
 const unsigned char font_bitmap[][FONT_HEIGHT][FONT_WIDTH] =
 {
