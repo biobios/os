@@ -453,7 +453,6 @@ int sys_channel_bind_notification(std::uint32_t ep_cap, std::uint32_t notif_cap,
 int sys_notification_poll(std::uint32_t notif_cap, std::uint64_t* out_badge);
 int sys_notification_bind_parent(std::uint32_t child_notif_cap, std::uint32_t parent_notif_cap, std::uint64_t badge);
 int sys_notification_unbind_parent(std::uint32_t child_notif_cap);
-int sys_sched_set_root(std::uint32_t target_tcb_cap);
 
 } // extern "C"
 

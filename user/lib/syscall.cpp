@@ -547,10 +547,6 @@ int sys_tcb_get_id(std::uint32_t tcb_cap, std::uint64_t* out_id) {
     return static_cast<int>(syscall(45, tcb_cap, reinterpret_cast<std::uint64_t>(out_id), 0, 0, 0, 0));
 }
 
-int sys_sched_set_root(std::uint32_t target_tcb_cap) {
-    return static_cast<int>(syscall(49, target_tcb_cap, 0, 0, 0, 0, 0));
-}
-
 } // extern "C"
 
 } // namespace oz

@@ -17,8 +17,6 @@
 #include "core/SavedInterruptFrame.hpp"
 
 namespace oz {
-constexpr int ERR_WOULDBLOCK = -2;
-constexpr int ERR_CANCELLED = -3;
 constexpr int SYS_ERR_INVALID_STATE = -7;
 constexpr int SYS_ERR_PERM          = -8;
 constexpr int SYS_ERR_NO_MEMORY     = -9;
@@ -30,16 +28,6 @@ ExecutionContext* (*g_get_current_context_func)() = nullptr;
 void (*g_block_thread_func)() = nullptr;
 void (*g_unblock_thread_func)(Thread*) = nullptr;
 void (*g_queue_thread_func)(Thread* t) = nullptr;
-void (*g_register_irq_handler_fn)(std::uint8_t, IRQHandler*) = nullptr;
-void (*g_unregister_irq_handler_fn)(std::uint8_t, IRQHandler*) = nullptr;
-void (*g_eoi_fn)() = nullptr;
-std::uint8_t (*g_read_io8_fn)(std::uint16_t) = nullptr;
-std::uint16_t (*g_read_io16_fn)(std::uint16_t) = nullptr;
-std::uint32_t (*g_read_io32_fn)(std::uint16_t) = nullptr;
-void (*g_write_io8_fn)(std::uint16_t, std::uint8_t) = nullptr;
-void (*g_write_io16_fn)(std::uint16_t, std::uint16_t) = nullptr;
-void (*g_write_io32_fn)(std::uint16_t, std::uint32_t) = nullptr;
-
 
 SyscallContext g_syscall_context;
 
@@ -493,13 +481,7 @@ extern "C" SyscallResult handleSyscall(std::uint64_t rdi, std::uint64_t rsi, std
         }
     } tlb_flusher;
 
-    if (syscall_number == 1) {
-        // channel_send is removed in Baton Scheduling v2 (use sys_call / sys_reply_recv)
-        return -1;
-    } else if (syscall_number == 2) {
-        // channel_recv (abolished)
-        return SyscallResult(SYS_ERR_INVALID, 0);
-    } else if (syscall_number == 3) {
+    if (syscall_number == 3) {
         // channel_create(untyped_cap, target_cs0, slot0, target_cs1, slot1, modes)
         CSpace* current_cs = get_cspace();
         if (!current_cs) return SyscallResult(SYS_ERR_INVALID, 0);
@@ -580,9 +562,6 @@ extern "C" SyscallResult handleSyscall(std::uint64_t rdi, std::uint64_t rsi, std
 
         int res = pt_obj->map_frame(rsi, frame_slot, r10);
         return res;
-    } else if (syscall_number == 5) {
-        // sys_frame_alloc (kernel-internal slot allocation abolished; use syscall 59 / userlib wrapper)
-        return SyscallResult(SYS_ERR_INVALID, 0);
     } else if (syscall_number == 60) {
         // exit
         if (g_get_current_thread_func) {
@@ -756,9 +735,6 @@ extern "C" SyscallResult handleSyscall(std::uint64_t rdi, std::uint64_t rsi, std
         
         target->is_blocked = true;
         return 0;
-    } else if (syscall_number == 15) {
-        // cspace_create (abolished; use syscall 59 / userlib wrapper)
-        return SyscallResult(SYS_ERR_INVALID, 0);
     } else if (syscall_number == 16) {
         // cspace_cap_insert(target_cspace_cap, target_slot, src_cap_in_current_cspace, rights)
         CSpace* cspace = get_cspace();
@@ -984,9 +960,6 @@ extern "C" SyscallResult handleSyscall(std::uint64_t rdi, std::uint64_t rsi, std
             return -1;
         }
         return 0;
-    } else if (syscall_number == 23) {
-        // untyped_retype (abolished; use syscall 59 / userlib wrapper)
-        return SyscallResult(SYS_ERR_INVALID, 0);
     } else if (syscall_number == 24) {
         // untyped_revoke(untyped_cap)
         CSpace* cspace = get_cspace();
@@ -1592,12 +1565,6 @@ extern "C" SyscallResult handleSyscall(std::uint64_t rdi, std::uint64_t rsi, std
         CapRights rights = static_cast<CapRights>(rdx);
         if (!cap_copy(cspace, dest, src, rights)) return -1;
         return 0;
-    } else if (syscall_number == 33) {
-        // channel_create_ext (abolished; use sys_channel_create)
-        return SyscallResult(SYS_ERR_INVALID, 0);
-    } else if (syscall_number == 34) {
-        // notification_create (abolished; use sys_untyped_retype_bulk / userlib sys_notification_create)
-        return SyscallResult(SYS_ERR_INVALID, 0);
     } else if (syscall_number == 35) {
         // notification_signal(notif_cap, badge)
         CSpace* cspace = get_cspace();
@@ -2080,9 +2047,6 @@ extern "C" SyscallResult handleSyscall(std::uint64_t rdi, std::uint64_t rsi, std
 
         handler->setNotification(notif, rdx);
         return SyscallResult(0, 0);
-    } else if (syscall_number == 49) {
-        // sys_sched_set_root: Abolished in v2!
-        return SyscallResult(static_cast<std::uint64_t>(SYS_ERR_INVALID), 0);
     } else if (syscall_number == 50) {
         // sys_irq_wait(irq_handler_cap, irq_baton_cap)
         // rdi: irq_handler_cap, rsi: irq_baton_cap

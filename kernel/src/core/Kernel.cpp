@@ -86,12 +86,6 @@ void Kernel::initSyscallAndStubs() {
             t->sched_notif->signal(t->sched_badge);
         }
     };
-    oz::g_register_irq_handler_fn = [](std::uint8_t vector, IRQHandler* handler) {
-        oz::irq::registerHandler(vector, handler);
-    };
-    oz::g_unregister_irq_handler_fn = [](std::uint8_t vector, IRQHandler* handler) {
-        oz::irq::unregisterHandler(vector, handler);
-    };
     oz::irq::setUnblockFn([](Thread* t) {
         if (!t) return;
         t->is_blocked = false;
@@ -106,15 +100,6 @@ void Kernel::initSyscallAndStubs() {
     oz::irq::setTimerTickFn([]() {
         Kernel::instance().scheduler.tick();
     });
-    oz::g_eoi_fn = []() {
-        oz::x86_64::notifyEndOfInterrupt();
-    };
-    oz::g_read_io8_fn = oz::x86_64::readIO8;
-    oz::g_read_io16_fn = oz::x86_64::readIO16;
-    oz::g_read_io32_fn = oz::x86_64::readIO32;
-    oz::g_write_io8_fn = oz::x86_64::writeIO8;
-    oz::g_write_io16_fn = oz::x86_64::writeIO16;
-    oz::g_write_io32_fn = oz::x86_64::writeIO32;
 
     dprint("[Kernel] Finish init\n\r[Kernel] Start Kernel in Higher-Half!\n\r");
 }
