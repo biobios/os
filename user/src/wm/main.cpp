@@ -2,7 +2,7 @@
 #include "ring_buffer.hpp"
 #include "Layout.hpp"
 #include "WindowManager.hpp"
-#include "../display/Font.hpp"
+#include <oz/Font.hpp>
 #include "../common/ipc/Protocol.hpp"
 #include "../common/ipc/StartupInfo.hpp"
 #include "../common/utils/utils.hpp"

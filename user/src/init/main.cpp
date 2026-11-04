@@ -1,6 +1,6 @@
 #include "syscall.hpp"
 #include "loader.hpp"
-#include "../common/utils/BootInfo.hpp"
+#include <oz/BootInfo.hpp>
 #include "../common/ipc/Protocol.hpp"
 #include "../common/ipc/StartupInfo.hpp"
 

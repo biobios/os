@@ -2,7 +2,7 @@
 #include "loader.hpp"
 #include "../common/test_harness.hpp"
 #include "../../src/common/ipc/Protocol.hpp"
-#include "../../src/common/utils/BootInfo.hpp"
+#include <oz/BootInfo.hpp>
 
 namespace oz::stest {
 

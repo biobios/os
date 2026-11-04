@@ -1,5 +1,5 @@
 #include "shell/Shell.hpp"
-#include "graphics/Font.hpp"
+#include <oz/Font.hpp>
 
 oz::Shell::Shell(Graphics* graphics)
 {

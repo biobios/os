@@ -3,7 +3,7 @@
 #include "../common/test_harness.hpp"
 #include "../../src/common/ipc/Protocol.hpp"
 #include "../../src/common/ipc/StartupInfo.hpp"
-#include "../../src/common/utils/BootInfo.hpp"
+#include <oz/BootInfo.hpp>
 
 namespace oz::ptest {
 

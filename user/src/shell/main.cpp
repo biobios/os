@@ -2,7 +2,7 @@
 #include "../common/ipc/Protocol.hpp"
 #include "../common/ipc/StartupInfo.hpp"
 #include "../common/utils/utils.hpp"
-#include "../display/Font.hpp"
+#include <oz/Font.hpp>
 #include "../../lib/io.hpp"
 
 struct Pixel {

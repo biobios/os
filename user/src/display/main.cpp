@@ -1,5 +1,5 @@
 #include "syscall.hpp"
-#include "Font.hpp"
+#include <oz/Font.hpp>
 #include "../common/ipc/Protocol.hpp"
 #include "../common/ipc/StartupInfo.hpp"
 #include "../common/utils/utils.hpp"

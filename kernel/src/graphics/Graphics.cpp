@@ -1,6 +1,6 @@
 #include "graphics/Graphics.hpp"
 
-#include "graphics/Font.hpp"
+#include <oz/Font.hpp>
 
 oz::Graphics::Graphics(Pixel* frame_buffer_base,
                        std::uint64_t frame_buffer_size,

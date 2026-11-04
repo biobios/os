@@ -1,7 +1,7 @@
 #include "syscall.hpp"
 #include "../common/ipc/Protocol.hpp"
 #include "../common/ipc/StartupInfo.hpp"
-#include "../common/utils/BootInfo.hpp"
+#include <oz/BootInfo.hpp>
 #include "../common/utils/utils.hpp"
 
 // DrivMan (Device Manager): Supervisor for hardware capabilities & driver lifecycle

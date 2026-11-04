@@ -3,11 +3,6 @@
 
 namespace oz {
 
-class CSpace;
-class ExecutionContext;
-class Thread;
-class UntypedMemory;
-
 // ユーザースレッドとカーネルのスタックを切り替えるためのコンテキスト
 struct SyscallContext {
     std::uint64_t user_rsp;
