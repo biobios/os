@@ -641,7 +641,7 @@ static int handle_reap_driver(std::uint32_t pid) {
     return 0;
 }
 
-OZ_PROCESS_ENTRY() {
+extern "C" void oz_main(const oz::ProcessStartupInfo* info) {
     oz::LocalNamespace::init(info);
     oz::sys_write("[ProcMan] Process Manager server started (Ring 3)!\n\r");
 

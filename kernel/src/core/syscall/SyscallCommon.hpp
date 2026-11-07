@@ -76,19 +76,14 @@ inline bool is_user_buffer(std::uintptr_t addr, std::size_t size) {
 template <typename T>
 struct CapTraits;
 
-#define OZ_DECLARE_CAP_TRAITS(Type, EnumVal) \
-template <> struct CapTraits<Type> { static constexpr CapType type = EnumVal; }
-
-OZ_DECLARE_CAP_TRAITS(UntypedMemory, CapType::UntypedMemory);
-OZ_DECLARE_CAP_TRAITS(ChannelEndpoint, CapType::ChannelEndpoint);
-OZ_DECLARE_CAP_TRAITS(Notification, CapType::Notification);
-OZ_DECLARE_CAP_TRAITS(TCB, CapType::TCB);
-OZ_DECLARE_CAP_TRAITS(CSpaceCap, CapType::CSpaceCap);
-OZ_DECLARE_CAP_TRAITS(Baton, CapType::Baton);
-OZ_DECLARE_CAP_TRAITS(PageTableObject, CapType::PageTable);
-OZ_DECLARE_CAP_TRAITS(IRQHandler, CapType::IRQHandler);
-
-#undef OZ_DECLARE_CAP_TRAITS
+template <> struct CapTraits<UntypedMemory>   { static constexpr CapType type = CapType::UntypedMemory; };
+template <> struct CapTraits<ChannelEndpoint> { static constexpr CapType type = CapType::ChannelEndpoint; };
+template <> struct CapTraits<Notification>    { static constexpr CapType type = CapType::Notification; };
+template <> struct CapTraits<TCB>             { static constexpr CapType type = CapType::TCB; };
+template <> struct CapTraits<CSpaceCap>       { static constexpr CapType type = CapType::CSpaceCap; };
+template <> struct CapTraits<Baton>           { static constexpr CapType type = CapType::Baton; };
+template <> struct CapTraits<PageTableObject> { static constexpr CapType type = CapType::PageTable; };
+template <> struct CapTraits<IRQHandler>      { static constexpr CapType type = CapType::IRQHandler; };
 
 template <typename T>
 struct CapResult {

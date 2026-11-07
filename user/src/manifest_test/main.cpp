@@ -12,7 +12,7 @@ OZ_MANIFEST((oz::ProcessManifest{
     .default_data_dir = {}
 }));
 
-OZ_PROCESS_ENTRY() {
+extern "C" void oz_main(const oz::ProcessStartupInfo* info) {
     oz::LocalNamespace::init(info);
 
     oz::sys_debug_print("[ManifestTest] Process started with Local Namespace!\n\r");

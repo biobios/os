@@ -204,7 +204,7 @@ static void print_dec(std::uint64_t val) {
     oz::sys_debug_print(buf);
 }
 
-OZ_PROCESS_ENTRY() {
+extern "C" void oz_main(const oz::ProcessStartupInfo* info) {
     oz::sys_write("VFS Server started!\n\r");
     
     oz::VFS vfs;

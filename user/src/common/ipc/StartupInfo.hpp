@@ -264,28 +264,8 @@ public:
 extern "C" void sys_exit(int status);
 
 // ============================================================================
-// 4. Standard entry point macro for capability-aware processes
+// 4. Standard entry point function for capability-aware processes
+//    Implemented by user processes (separated CRT in crt0.cpp)
 // ============================================================================
-#define OZ_PROCESS_ENTRY() \
-    static void _oz_user_main(const oz::ProcessStartupInfo* info); \
-    extern "C" void _start_main(const oz::ProcessStartupInfo* info) { \
-        oz::g_slot_allocator.reset(); \
-        if (info && info->magic == oz::ProcessStartupInfo::MAGIC) { \
-            for (std::size_t _i = 0; _i < info->num_caps; ++_i) { \
-                oz::g_slot_allocator.reserve_slot(info->caps[_i].slot); \
-            } \
-        } \
-        _oz_user_main(info); \
-    } \
-    extern "C" __attribute__((naked)) void _start() { \
-        __asm__ volatile ( \
-            "movq (%%rsp), %%rdi\n" \
-            "andq $-16, %%rsp\n" \
-            "call _start_main\n" \
-            "movq $0, %%rdi\n" \
-            "call sys_exit\n" \
-            ::: "memory" \
-        ); \
-    } \
-    static void _oz_user_main(const oz::ProcessStartupInfo* info)
+extern "C" void oz_main(const oz::ProcessStartupInfo* info);
 

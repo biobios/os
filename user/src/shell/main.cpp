@@ -919,7 +919,7 @@ static void process_input_char(char c, char* line_buf, std::size_t& line_len, st
     }
 }
 
-OZ_PROCESS_ENTRY() {
+extern "C" void oz_main(const oz::ProcessStartupInfo* info) {
     oz::sys_debug_print("[Shell] Process started in OZ_PROCESS_ENTRY!\n\r");
     oz::LocalNamespace::init(info);
 

@@ -97,7 +97,7 @@ static void xhci_irq_worker() {
     }
 }
 
-OZ_PROCESS_ENTRY() {
+extern "C" void oz_main(const oz::ProcessStartupInfo* info) {
     oz::LocalNamespace::init(info);
     oz::sys_debug_print("xHCI Server started (Normal Thread)!\n\r");
 

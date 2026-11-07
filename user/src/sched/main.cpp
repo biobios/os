@@ -336,7 +336,7 @@ static void process_woken_mask(std::uint64_t woken_mask) {
     }
 }
 
-OZ_PROCESS_ENTRY() {
+extern "C" void oz_main(const oz::ProcessStartupInfo* info) {
     oz::LocalNamespace::init(info);
     oz::sys_debug_print("[Sched] User-space Scheduler Daemon started (Pure Baton Scheduling Context Model)!\n\r");
 

@@ -620,7 +620,7 @@ static void display_console_worker() {
     }
 }
 
-OZ_PROCESS_ENTRY() {
+extern "C" void oz_main(const oz::ProcessStartupInfo* info) {
     oz::LocalNamespace::init(info);
     oz::sys_debug_print("[Display] Minimal Display Server started (Ring 3)!\n\r");
 

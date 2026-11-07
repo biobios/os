@@ -13,7 +13,7 @@ OZ_MANIFEST((oz::ProcessManifest{
     .default_data_dir = {}
 }));
 
-OZ_PROCESS_ENTRY() {
+extern "C" void oz_main(const oz::ProcessStartupInfo* info) {
     oz::LocalNamespace::init(info);
 
     auto stdout_h = oz::io::FileHandle::from_role(oz::CapRole::STDOUT);

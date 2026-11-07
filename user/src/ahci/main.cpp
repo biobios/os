@@ -24,7 +24,7 @@ static void to_hex_str(std::uint64_t val, char* out) {
     out[16] = '\0';
 }
 
-OZ_PROCESS_ENTRY() {
+extern "C" void oz_main(const oz::ProcessStartupInfo* info) {
     oz::LocalNamespace::init(info);
     oz::sys_write("AHCI Server started!\n\r");
 

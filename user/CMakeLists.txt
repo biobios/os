@@ -21,6 +21,7 @@ add_library(oz_syscall STATIC
     lib/syscall.cpp
     lib/malloc.cpp
     lib/cspace_allocator.cpp
+    lib/crt0.cpp
 )
 
 # Common font asset library

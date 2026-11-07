@@ -1,17 +1,20 @@
 #pragma once
 
 #include <cstdint>
+#include <cstddef>
 
 #include "graphics/Graphics.hpp"
-
-#define LETTERS_NUM 20000
-#define LINE_SPACING 5
-#define LETTER_SPACING 3
 
 namespace oz
 {
     class Shell
     {
+    public:
+        static constexpr std::size_t LETTERS_NUM = 20000;
+        static constexpr std::uint32_t LINE_SPACING = 5;
+        static constexpr std::uint32_t LETTER_SPACING = 3;
+
+    private:
         Graphics* gc;
         std::uint8_t string[LETTERS_NUM];
         std::uint32_t nextIndex;
